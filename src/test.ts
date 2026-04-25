@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 type AgentMode = "primary" | "subagent" | "all";
@@ -285,6 +286,27 @@ runTest("bounded stdout capture prevents unbounded growth", () => {
   appendToBoundedTextCapture(capture, "a".repeat(SUBAGENT_STDOUT_CAPTURE_MAX_CHARS + 1234), SUBAGENT_STDOUT_CAPTURE_MAX_CHARS);
   assert.equal(capture.value.length, SUBAGENT_STDOUT_CAPTURE_MAX_CHARS);
   assert.equal(capture.droppedChars, 1234);
+});
+
+runTest("delegated subagents forward the supported optional extension set", () => {
+  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const match = routerSource.match(/const SUBAGENT_OPTIONAL_EXTENSION_NAMES = \[(.*?)\] as const;/s);
+  assert.notEqual(match, null);
+
+  const extensionNames = [...(match?.[1] ?? "").matchAll(/"([^"]+)"/g)].map(([, extensionName]) => extensionName);
+  assert.deepEqual(extensionNames, [
+    "pi-factory-auth",
+    "pi-multi-auth",
+    "multi-auth",
+    "pi-find-robustness",
+    "pi-fast-mode",
+    "pi-tool-display",
+  ]);
+});
+
+runTest("delegated subagents disable automatic extension discovery before applying the curated extension set", () => {
+  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  assert.equal(routerSource.includes('"--no-extensions"'), true);
 });
 
 runTest("windows command-shell invocation truncates multiline args while direct invocation preserves them", () => {

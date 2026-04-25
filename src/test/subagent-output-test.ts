@@ -7,6 +7,7 @@ import {
   getLatestSubagentToolCallLabel,
   getSubagentLiveOutputFromMessages,
   getSubagentToolInvocationsFromState,
+  normalizeInputText,
   processSubagentJsonEventLine,
   summarizeSubagentToolInvocations,
 } from "../subagent/subagent-output";
@@ -19,6 +20,11 @@ function runTest(name: string, testFn: () => void): void {
   testFn();
   console.log(`[PASS] ${name}`);
 }
+
+runTest("normalizeInputText trims strings and rejects non-strings", () => {
+  assert.equal(normalizeInputText("  hello  "), "hello");
+  assert.equal(normalizeInputText(42), "");
+});
 
 runTest("processSubagentJsonEventLine accepts assistant messages with string content", () => {
   const state = createSubagentJsonEventState();
@@ -136,6 +142,159 @@ runTest("getLatestSubagentToolCallLabel safely skips assistant messages with str
 runTest("appendBoundedOutputSection keeps the most recent derived output within the limit", () => {
   assert.equal(appendBoundedOutputSection("abcd", "efgh", 6), "d\nefgh");
   assert.equal(appendBoundedOutputSection("abcdef", "", 4), "cdef");
+});
+
+runTest("processSubagentJsonEventLine surfaces live assistant message updates without duplicating final output", () => {
+  const state = createSubagentJsonEventState();
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_start",
+      message: {
+        role: "assistant",
+        content: "",
+      },
+    }),
+    state,
+  );
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: "Partial answer",
+      },
+    }),
+    state,
+  );
+
+  assert.equal(state.messages.length, 0);
+  assert.equal(state.outputText, "Partial answer");
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: "Partial answer",
+        usage: {
+          input: 3,
+          output: 5,
+        },
+      },
+    }),
+    state,
+  );
+
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.outputText, "Partial answer");
+  assert.equal(state.liveOutputText, "");
+  assert.equal(state.usage.turns, 1);
+  assert.equal(state.usage.input, 3);
+  assert.equal(state.usage.output, 5);
+});
+
+runTest("processSubagentJsonEventLine surfaces live tool call previews from assistant updates", () => {
+  const state = createSubagentJsonEventState();
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: {
+              path: "docs/research/report.md",
+            },
+          },
+        ],
+      },
+    }),
+    state,
+  );
+
+  assert.equal(state.outputText, "→ write docs/research/report.md");
+  assert.equal(state.latestToolCall, "[write] docs/research/report.md");
+  assert.equal(state.toolInvocationTotalCount, 0);
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: {
+              path: "docs/research/report.md",
+            },
+          },
+        ],
+      },
+    }),
+    state,
+  );
+
+  assert.equal(state.outputText, "→ write docs/research/report.md");
+  assert.equal(state.latestToolCall, "[write] docs/research/report.md");
+  assert.equal(state.toolInvocationTotalCount, 1);
+  assert.deepEqual(getSubagentToolInvocationsFromState(state), [
+    {
+      name: "write",
+      argumentsPreview: "docs/research/report.md",
+      count: 1,
+    },
+  ]);
+});
+
+runTest("processSubagentJsonEventLine preserves multipart assistant section ordering on commit", () => {
+  const state = createSubagentJsonEventState();
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "Investigating issue",
+          },
+          {
+            type: "toolCall",
+            name: "read",
+            arguments: {
+              path: "src/index.ts",
+            },
+          },
+          {
+            type: "text",
+            text: "Ready to summarize",
+          },
+        ],
+      },
+    }),
+    state,
+  );
+
+  assert.equal(
+    state.outputText,
+    "Investigating issue\n→ read src/index.ts\nReady to summarize",
+  );
+  assert.equal(state.latestToolCall, "[read] src/index.ts");
+  assert.equal(state.toolInvocationTotalCount, 1);
+  assert.deepEqual(getSubagentToolInvocationsFromState(state), [
+    {
+      name: "read",
+      argumentsPreview: "src/index.ts",
+      count: 1,
+    },
+  ]);
 });
 
 runTest("processSubagentJsonEventLine keeps bounded message history while preserving incremental output", () => {

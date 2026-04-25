@@ -66,7 +66,13 @@ runTest(
       ),
       true,
     );
-    assert.equal(prompt.includes("Expected Output Schema (JSON):"), true);
+    assert.equal(prompt.includes("Optional Structured Output Schema (JSON, submit_result only):"), true);
+    assert.equal(
+      prompt.includes(
+        "Keep the normal human-facing TASK COMPLETION REPORT unless the assignment explicitly requires machine-readable output.",
+      ),
+      true,
+    );
     assert.equal(prompt.includes("Assignment:"), true);
   },
 );

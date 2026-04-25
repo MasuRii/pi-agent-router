@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
 
-import { getCircularSpinnerFrame } from "../progress-spinner";
 import { renderSubagentWidgetLines } from "../subagent/subagent-widget-renderer";
+
+const widgetIcons = {
+  running: "",
+  queued: "",
+} as const;
 
 function runTest(name: string, testFn: () => void): void {
   testFn();
   console.log(`[PASS] ${name}`);
 }
 
-runTest("renderSubagentWidgetLines shows aggregate progress with live running details", () => {
+runTest("renderSubagentWidgetLines shows aggregate progress with live running and queued details", () => {
   const now = 24_000;
-  const spinnerFrame = getCircularSpinnerFrame(now);
   const line = renderSubagentWidgetLines({
     sessions: [
       {
@@ -20,8 +23,14 @@ runTest("renderSubagentWidgetLines shows aggregate progress with live running de
         startedAt: 0,
       },
       {
-        id: "a7a720ec-1111-2222-3333-444444444444",
+        id: "b8c831fd-1111-2222-3333-444444444444",
         agent: "ask",
+        status: "queued",
+        startedAt: 0,
+      },
+      {
+        id: "a7a720ec-1111-2222-3333-444444444444",
+        agent: "ui",
         status: "finished",
         startedAt: 0,
         finishedAt: 82_000,
@@ -34,30 +43,36 @@ runTest("renderSubagentWidgetLines shows aggregate progress with live running de
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
     getStatusDisplay: (status) => {
       if (status === "running") {
-        return { label: "⏳ Executing...", color: "warning" as const };
+        return { label: "Running", color: "warning" as const };
       }
 
-      return { label: "✓ COMPLETED", color: "success" as const };
+      if (status === "queued") {
+        return { label: "Queued", color: "warning" as const };
+      }
+
+      return { label: "Completed", color: "success" as const };
     },
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(`${spinnerFrame} 1 running`), true);
+  assert.equal(line[0].includes(" 1 running"), true);
+  assert.equal(line[0].includes(" 1 queued"), true);
   assert.equal(line[0].includes("✓ 1 completed"), true);
-  assert.equal(line[0].includes(`${spinnerFrame} code 24s`), true);
+  assert.equal(line[0].includes(" code 24s"), true);
+  assert.equal(line[0].includes(" ask"), true);
   assert.equal(line[0].includes("63db3446"), false);
+  assert.equal(line[0].includes("b8c831fd"), false);
   assert.equal(line[0].includes("a7a720ec"), false);
-  assert.equal(line[0].includes("COMPLETED"), false);
   assert.equal(line[0].includes(" | "), false);
   assert.equal(line[0].includes(" · "), true);
 });
 
 runTest("renderSubagentWidgetLines uses available width before collapsing running details", () => {
   const now = 24_000;
-  const spinnerFrame = getCircularSpinnerFrame(now);
   const line = renderSubagentWidgetLines({
     sessions: [
       { id: "11111111-aaaa", agent: "alpha", status: "running", startedAt: 0 },
@@ -69,16 +84,17 @@ runTest("renderSubagentWidgetLines uses available width before collapsing runnin
       fg: (_color, text) => text,
     },
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
-    getStatusDisplay: () => ({ label: "⏳ Executing...", color: "warning" as const }),
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(`${spinnerFrame} alpha 24s`), true);
-  assert.equal(line[0].includes(`${spinnerFrame} beta 24s`), true);
-  assert.equal(line[0].includes(`${spinnerFrame} gamma 24s`), true);
+  assert.equal(line[0].includes(" alpha 24s"), true);
+  assert.equal(line[0].includes(" beta 24s"), true);
+  assert.equal(line[0].includes(" gamma 24s"), true);
   assert.equal(line[0].includes("+1 more"), false);
 });
 
@@ -94,10 +110,11 @@ runTest("renderSubagentWidgetLines collapses all-success sessions into a single 
       fg: (_color, text) => text,
     },
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
-    getStatusDisplay: () => ({ label: "✓ COMPLETED", color: "success" as const }),
+    getStatusDisplay: () => ({ label: "Completed", color: "success" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 5_000,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
@@ -121,18 +138,19 @@ runTest("renderSubagentWidgetLines summarizes mixed terminal outcomes without pi
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
     getStatusDisplay: (status) => {
       if (status === "aborted") {
-        return { label: "✗ ABORTED", color: "warning" as const };
+        return { label: "Aborted", color: "warning" as const };
       }
 
       if (status === "failed") {
-        return { label: "✗ FAILED", color: "error" as const };
+        return { label: "Failed", color: "error" as const };
       }
 
-      return { label: "✓ COMPLETED", color: "success" as const };
+      return { label: "Completed", color: "success" as const };
     },
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 5_000,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
@@ -156,10 +174,11 @@ runTest("renderSubagentWidgetLines keeps aggregate status on narrow widths", () 
       fg: (_color, text) => text,
     },
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
-    getStatusDisplay: () => ({ label: "✓ COMPLETED", color: "success" as const }),
+    getStatusDisplay: () => ({ label: "Completed", color: "success" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 8_000,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
@@ -185,10 +204,11 @@ runTest("renderSubagentWidgetLines retains bright custom agent colors without ba
       fg: (_color, text) => text,
     },
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
-    getStatusDisplay: () => ({ label: "⏳ Executing...", color: "warning" as const }),
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 42_000,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
@@ -213,10 +233,11 @@ runTest("renderSubagentWidgetLines falls back to status styling for invalid agen
       fg: (color, text) => `<${color}>${text}</${color}>`,
     },
     formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
-    getStatusDisplay: () => ({ label: "⏳ Executing...", color: "warning" as const }),
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 42_000,
+    icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);

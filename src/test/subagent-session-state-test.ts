@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 
+import { SUBAGENT_SESSION_RETENTION_MAX_COMPLETED } from "../constants";
 import {
   clearStaleSubagentSessionsForNewSession,
   clearSubagentSessionsForParentShutdown,
+  enforceBoundedSubagentSessionRetention,
+  getSubagentSessionRetentionSnapshot,
   listVisibleSubagentSessions,
+  resetSubagentSessionRetentionState,
 } from "../subagent/subagent-session-state";
 import type { SubagentSession } from "../types";
 
@@ -101,6 +105,18 @@ runTest("new session visibility excludes other-parent sessions without deleting 
   );
 });
 
+runTest("cleanup failures leave completed sessions registered for later retry", () => {
+  const staleFinished = createSession({ id: "stale-finished", parentSessionId: "old", status: "finished", startedAt: 10 });
+  const sessionsById = new Map<string, SubagentSession>([[staleFinished.id, staleFinished]]);
+
+  const result = clearStaleSubagentSessionsForNewSession(sessionsById, "current", {
+    cleanupSessionArtifacts: () => false,
+  });
+
+  assert.deepEqual(result, { removedCount: 0, retainedActiveCount: 0 });
+  assert.equal(sessionsById.has(staleFinished.id), true);
+});
+
 runTest("clearSubagentSessionsForParentShutdown only targets the shutting-down parent session", () => {
   const currentRunning = createSession({ id: "current-running", parentSessionId: "current", status: "running", startedAt: 100 });
   const currentFinished = createSession({ id: "current-finished", parentSessionId: "current", status: "finished", startedAt: 80 });
@@ -134,6 +150,48 @@ runTest("clearSubagentSessionsForParentShutdown only targets the shutting-down p
     listVisibleSubagentSessions(sessionsById.values(), "other").map((session) => session.id),
     ["other-running", "other-finished"],
   );
+});
+
+runTest("enforceBoundedSubagentSessionRetention evicts oldest completed sessions and preserves active ones", () => {
+  resetSubagentSessionRetentionState();
+  const sessionsById = new Map<string, SubagentSession>();
+  const cleaned: string[] = [];
+
+  for (let index = 0; index < SUBAGENT_SESSION_RETENTION_MAX_COMPLETED + 3; index += 1) {
+    const finishedSession = createSession({
+      id: `finished-${index}`,
+      parentSessionId: `parent-${index % 2}`,
+      status: "finished",
+      startedAt: index,
+      finishedAt: index,
+    });
+    sessionsById.set(finishedSession.id, finishedSession);
+  }
+
+  const runningSession = createSession({
+    id: "running-session",
+    status: "running",
+    startedAt: 10_000,
+  });
+  sessionsById.set(runningSession.id, runningSession);
+
+  const result = enforceBoundedSubagentSessionRetention(sessionsById, {
+    cleanupSessionArtifacts: (session) => {
+      cleaned.push(session.id);
+    },
+  });
+
+  assert.equal(result.evictedCount, 3);
+  assert.equal(result.retainedCompletedCount, SUBAGENT_SESSION_RETENTION_MAX_COMPLETED);
+  assert.deepEqual(cleaned, ["finished-2", "finished-1", "finished-0"]);
+  assert.equal(sessionsById.has("running-session"), true);
+  assert.equal(sessionsById.has("finished-0"), false);
+  assert.equal(sessionsById.has(`finished-${SUBAGENT_SESSION_RETENTION_MAX_COMPLETED + 2}`), true);
+
+  const snapshot = getSubagentSessionRetentionSnapshot(sessionsById.values());
+  assert.equal(snapshot.evictions, 3);
+  assert.equal(snapshot.retainedCompletedCount, SUBAGENT_SESSION_RETENTION_MAX_COMPLETED);
+  assert.equal(snapshot.maxCompletedSessions, SUBAGENT_SESSION_RETENTION_MAX_COMPLETED);
 });
 
 console.log("All subagent session state tests passed.");
