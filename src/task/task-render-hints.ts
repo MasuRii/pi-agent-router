@@ -1,11 +1,9 @@
-function normalizeSessionId(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
+import { normalizeInputText } from "../input-normalization";
 
 export function formatAttachSubagentOutputHint(
   sessionId: string | undefined,
 ): string | undefined {
-  const normalized = normalizeSessionId(sessionId);
+  const normalized = normalizeInputText(sessionId);
   if (!normalized) {
     return undefined;
   }

@@ -1,5 +1,8 @@
 import { Text } from "@mariozechner/pi-tui";
 
+import { normalizeInputText } from "../input-normalization";
+import { asRecord } from "../record-utils";
+
 type TaskCallTheme = {
   fg(color: string, text: string): string;
   bold?: (text: string) => string;
@@ -12,17 +15,6 @@ type TaskCallItem = {
   agent: string;
 };
 
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function toRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-
-  return value as Record<string, unknown>;
-}
 
 function pluralize(count: number, singular: string, plural: string): string {
   return `${count} ${count === 1 ? singular : plural}`;
@@ -38,7 +30,7 @@ function extractTaskItems(args: Record<string, unknown>): TaskCallItem[] {
   const rawTasks = Array.isArray(args.tasks) ? args.tasks : [];
 
   return rawTasks
-    .map((item) => toRecord(item))
+    .map((item) => asRecord(item))
     .filter((item): item is Record<string, unknown> => Boolean(item))
     .map((item) => ({
       id: normalizeInputText(item.id),

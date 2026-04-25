@@ -7,7 +7,8 @@
 // External imports
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -18,16 +19,18 @@ import {
   type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import {
+  defineTool,
   type AgentToolUpdateCallback,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 // Existing internal imports
 import { sanitizeSubagentResultForDisplay } from "./output-sanitizer";
 import { renderSubagentWidgetLines } from "./subagent/subagent-widget-renderer";
+import { resolveSubagentWidgetIcons } from "./subagent/subagent-widget-icons";
 import { SubagentOutputOverlay } from "./subagent/subagent-overlays";
 import {
   isTaskBatchItem,
@@ -71,14 +74,17 @@ import {
   SUBAGENT_STDERR_CAPTURE_MAX_CHARS,
   SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS,
   SUBAGENT_TASK_REGISTRY_TTL_MS,
+  SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS,
   SUBAGENT_WIDGET_KEY,
 } from "./constants";
 import {
-  discoverAgents,
+  discoverAgentsAsync,
   getAgentEmoji,
   getCyclablePrimaryAgents,
   getPersistedActiveAgentName,
+  invalidateAgentDiscoveryCaches,
   loadAgents,
+  loadAgentsAsync,
   normalizeThinkingLevel,
 } from "./agent/agent-discovery";
 import {
@@ -87,11 +93,12 @@ import {
 } from "./agent/agent-command-ui";
 import {
   isDirectory,
-  isFile,
-  prepareIsolatedAgentDirectory,
-  resolveExistingWorkingDirectory,
-  resolveSubagentSessionDirectory,
-  resolveSubagentWorkingDirectory,
+  isDirectoryAsync,
+  isFileAsync,
+  prepareIsolatedAgentDirectoryAsync,
+  resolveExistingWorkingDirectoryAsync,
+  resolveSubagentSessionDirectoryAsync,
+  resolveSubagentWorkingDirectoryAsync,
 } from "./subagent/session-paths";
 import { resolveAgentModel, toModelReference } from "./model-resolution";
 import {
@@ -102,7 +109,6 @@ import {
   appendBoundedOutputSection,
   countSubagentToolInvocations,
   getLatestSubagentToolCallLabel,
-  getSubagentOutputFromMessages,
   getSubagentToolInvocationsFromState,
   normalizeInputText,
   processSubagentJsonEventLine,
@@ -113,6 +119,7 @@ import { createOutputSink } from "./subagent/subagent-output-sink";
 import {
   clearStaleSubagentSessionsForNewSession,
   clearSubagentSessionsForParentShutdown,
+  enforceBoundedSubagentSessionRetention,
   listVisibleSubagentSessions,
 } from "./subagent/subagent-session-state";
 import {
@@ -133,6 +140,7 @@ import {
 import {
   aggregateUsageFromResults,
   createSubagentExecutionDetails,
+  createSubagentProcessLifecycle,
   formatDuration,
   generateUniqueTaskId,
   getSubagentStatusDisplay,
@@ -147,35 +155,42 @@ import { mapWithAbortAwareConcurrency } from "./task/parallel-control";
 import { SPINNER_RENDER_INTERVAL_MS } from "./progress-spinner";
 import { createAnimatedRenderSurface } from "./ui/animated-render-surface";
 import { createUiRenderScheduler } from "./ui/render-scheduler";
-import { resolveTaskControls } from "./task/task-controls";
+import { resolveTaskControlsAsync } from "./task/task-controls";
 import {
   buildTaskToolPartialUpdateFingerprint,
   createTaskToolPartialUpdateGate,
   resolveTaskToolUpdateCadence,
 } from "./task/task-update-dedupe";
-import { validateSubagentOutputContract } from "./output-contract";
+import { normalizeDelegatedOutput } from "./output-contract";
 import { piAgentRouterDebugLogger } from "./debug-logger";
+import { getErrorMessage } from "./error-utils";
 import {
   clearSubagentTransientKeyError,
-  detectSubagentProviderId,
+  detectSubagentProviderIdAsync,
   isQuotaOrRateLimitError,
+  resolveProviderEnvKeyAsync,
   isRetryableModelAvailabilityError,
   isTransientCredentialError,
   releaseKeyForSubagent,
+  releaseKeyLeasesForParentSession,
   reportSubagentKeyError,
   reportSubagentTransientKeyError,
+  shouldSkipDelegatedMultiAuthForProviderAsync,
   tryAcquireKeyForSubagent,
 } from "./subagent/subagent-key-distribution";
+import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env.js";
 import { buildSystemPromptForActiveAgent } from "./agent/active-agent-prompt";
 
 // Re-export shared types for external consumers
 export type {
   ActiveAgentEntryData,
   Agent,
+  AgentDiscoveryCacheSnapshot,
   AgentMode,
   AgentScope,
   AgentThinkingLevel,
   BoundedTextCapture,
+  CacheDebugCounters,
   ContextWithOptionalAppendEntry,
   GlobalWithAgentRouterBaseApiStreams,
   OutputCaptureSummary,
@@ -185,11 +200,13 @@ export type {
   SubagentOutputDigest,
   SubagentRunResult,
   SubagentSession,
+  SubagentSessionRetentionSnapshot,
   SubagentTaskItemInput,
   SubagentTaskRegistryEntry,
   SubagentToolInvocation,
   SubagentUsage,
   TailTextBuffer,
+  TaskControlsCacheSnapshot,
   TaskStyleDelegationItem,
 } from "./types";
 
@@ -224,11 +241,15 @@ const SUBAGENT_REQUIRED_EXTENSION_CANDIDATES = [
   ["pi-system-prompt-sanitizer"],
 ] as const;
 
+const PI_FAST_MODE_EXTENSION_NAME = "pi-fast-mode";
+const PI_FAST_MODE_FLAG = "fast";
+
 const SUBAGENT_OPTIONAL_EXTENSION_NAMES = [
   "pi-factory-auth",
   "pi-multi-auth",
   "multi-auth",
   "pi-find-robustness",
+  "pi-fast-mode",
   "pi-tool-display",
 ] as const;
 
@@ -238,6 +259,19 @@ const resolveExtensionDirectory = (
   for (const extensionName of extensionCandidates) {
     const extensionDir = join(AGENT_DIR, "extensions", extensionName);
     if (isDirectory(extensionDir)) {
+      return extensionDir;
+    }
+  }
+
+  return undefined;
+};
+
+const resolveExtensionDirectoryAsync = async (
+  extensionCandidates: readonly string[],
+): Promise<string | undefined> => {
+  for (const extensionName of extensionCandidates) {
+    const extensionDir = join(AGENT_DIR, "extensions", extensionName);
+    if (await isDirectoryAsync(extensionDir)) {
       return extensionDir;
     }
   }
@@ -259,6 +293,19 @@ const formatExtensionCandidatePaths = (
   return `${extensionPaths[0]} (or ${extensionPaths.slice(1).join(", ")})`;
 };
 
+const shouldForwardFastModeFlag = (
+  pi: ExtensionAPI,
+  delegatedExtensionDirs: readonly string[],
+): boolean => {
+  if (pi.getFlag(PI_FAST_MODE_FLAG) !== true) {
+    return false;
+  }
+
+  return delegatedExtensionDirs.includes(
+    join(AGENT_DIR, "extensions", PI_FAST_MODE_EXTENSION_NAME),
+  );
+};
+
 export default function agentRouterExtension(pi: ExtensionAPI) {
   let activeAgent: string | null = DEFAULT_AGENT;
   const subagentSessions = new Map<string, SubagentSession>();
@@ -277,7 +324,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   const manualThinkingOverrideByAgent = new Map<string, AgentThinkingLevel>();
   let suppressManualModelOverrideCapture = false;
   let activeSubagentDelegations = 0;
-  const queuedSubagentDelegations: Array<() => void> = [];
+  const queuedSubagentDelegations: Array<{
+    resume: () => void;
+    reject: (error: Error) => void;
+  }> = [];
   const pendingDelegationJobs = new Set<Promise<void>>();
   let dispatchReminderQueued = false;
   let autoCompletionWaitJob: Promise<void> | null = null;
@@ -285,6 +335,14 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   let tabCycleInputContext: ExtensionContext | undefined;
   let lastTabCycleAtMs = 0;
   let activeParentSessionId = "";
+  let gracefulShutdownInProgress = false;
+
+  const routerShutdownAbortMessage =
+    "Delegation was aborted because pi-agent-router is shutting down.";
+  const routerDelegationResetMessage =
+    "Delegation was aborted because pi-agent-router reset its delegation state.";
+  const routerShutdownTerminationReason =
+    "Terminated because pi-agent-router is shutting down.";
 
   const tabCycleDebounceMs = process.platform === "linux" ? LINUX_TAB_CYCLE_DEBOUNCE_MS : 0;
 
@@ -343,8 +401,22 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
   };
 
+  const enforceSubagentSessionRetentionLimit = (): void => {
+    const { evictedCount } = enforceBoundedSubagentSessionRetention(
+      subagentSessions,
+      {
+        cleanupSessionArtifacts,
+      },
+    );
+
+    if (evictedCount > 0) {
+      requestSubagentUiRender();
+    }
+  };
+
   const shutdownParentScopedSubagentSessions = (
     parentSessionId: string,
+    terminationReason = routerShutdownTerminationReason,
   ): boolean => {
     const { removedCount, terminatedSessionIds } =
       clearSubagentSessionsForParentShutdown(
@@ -356,10 +428,76 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       );
 
     for (const sessionId of terminatedSessionIds) {
-      killSubagentSession(sessionId, "Terminated on session shutdown.");
+      killSubagentSession(sessionId, terminationReason);
     }
 
     return removedCount > 0 || terminatedSessionIds.length > 0;
+  };
+
+  const cancelQueuedSubagentDelegations = (reason: string): number => {
+    if (queuedSubagentDelegations.length === 0) {
+      return 0;
+    }
+
+    const queuedRequests = queuedSubagentDelegations.splice(
+      0,
+      queuedSubagentDelegations.length,
+    );
+
+    for (const queuedRequest of queuedRequests) {
+      queuedRequest.reject(new Error(reason));
+    }
+
+    return queuedRequests.length;
+  };
+
+  const shutdownTrackedSubagentSessions = (ctx: ExtensionContext): boolean => {
+    const parentSessionIds = new Set<string>();
+    const currentSessionId = normalizeInputText(ctx.sessionManager.getSessionId());
+
+    if (currentSessionId) {
+      parentSessionIds.add(currentSessionId);
+    }
+
+    if (activeParentSessionId) {
+      parentSessionIds.add(activeParentSessionId);
+    }
+
+    for (const session of subagentSessions.values()) {
+      const parentSessionId = normalizeInputText(session.parentSessionId);
+      if (parentSessionId) {
+        parentSessionIds.add(parentSessionId);
+      }
+    }
+
+    let shutdownChangedState = false;
+
+    for (const parentSessionId of parentSessionIds) {
+      shutdownChangedState =
+        shutdownParentScopedSubagentSessions(parentSessionId) ||
+        shutdownChangedState;
+      releaseKeyLeasesForParentSession(parentSessionId);
+    }
+
+    for (const [sessionId, session] of subagentSessions.entries()) {
+      if (normalizeInputText(session.parentSessionId)) {
+        continue;
+      }
+
+      if (session.status === "running") {
+        shutdownChangedState =
+          killSubagentSession(sessionId, routerShutdownTerminationReason) ||
+          shutdownChangedState;
+        continue;
+      }
+
+      if (cleanupSessionArtifacts(session)) {
+        subagentSessions.delete(sessionId);
+        shutdownChangedState = true;
+      }
+    }
+
+    return shutdownChangedState;
   };
 
   const queueDispatchReminderTurn = (): void => {
@@ -447,29 +585,64 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     signal: AbortSignal | undefined,
     maxConcurrency: number,
   ): Promise<{ queued: boolean }> => {
+    if (gracefulShutdownInProgress) {
+      throw new Error(routerShutdownAbortMessage);
+    }
+
     if (activeSubagentDelegations < maxConcurrency) {
       activeSubagentDelegations += 1;
       return { queued: false };
     }
 
     return new Promise<{ queued: boolean }>((resolve, reject) => {
-      const resume = (): void => {
+      let settled = false;
+
+      const rejectRequest = (error: Error): void => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
         signal?.removeEventListener("abort", onAbort);
-        activeSubagentDelegations += 1;
-        resolve({ queued: true });
+        reject(error);
       };
 
-      const onAbort = (): void => {
-        const queueIndex = queuedSubagentDelegations.indexOf(resume);
+      const removeQueuedRequest = (): void => {
+        const queueIndex = queuedSubagentDelegations.indexOf(queuedRequest);
         if (queueIndex >= 0) {
           queuedSubagentDelegations.splice(queueIndex, 1);
         }
-        signal?.removeEventListener("abort", onAbort);
-        reject(
+      };
+
+      const onAbort = (): void => {
+        removeQueuedRequest();
+        rejectRequest(
           new Error(
             "Delegation request was aborted while waiting for an available slot.",
           ),
         );
+      };
+
+      const queuedRequest = {
+        resume: (): void => {
+          if (settled) {
+            return;
+          }
+
+          signal?.removeEventListener("abort", onAbort);
+          if (gracefulShutdownInProgress) {
+            rejectRequest(new Error(routerShutdownAbortMessage));
+            return;
+          }
+
+          settled = true;
+          activeSubagentDelegations += 1;
+          resolve({ queued: true });
+        },
+        reject: (error: Error): void => {
+          removeQueuedRequest();
+          rejectRequest(error);
+        },
       };
 
       if (signal?.aborted) {
@@ -477,11 +650,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (gracefulShutdownInProgress) {
+        queuedRequest.reject(new Error(routerShutdownAbortMessage));
+        return;
+      }
+
       if (signal) {
         signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      queuedSubagentDelegations.push(resume);
+      queuedSubagentDelegations.push(queuedRequest);
     });
   };
 
@@ -490,36 +668,97 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       activeSubagentDelegations -= 1;
     }
 
+    if (gracefulShutdownInProgress) {
+      return;
+    }
+
     const next = queuedSubagentDelegations.shift();
     if (next) {
-      next();
+      next.resume();
     }
   };
 
-  const cleanupSessionRuntimeArtifacts = (session: SubagentSession): void => {
+  const appendSessionOutputNotice = (
+    session: SubagentSession,
+    notice: string,
+  ): void => {
+    const normalizedNotice = normalizeInputText(notice);
+    if (!normalizedNotice) {
+      return;
+    }
+
+    const existingNotice = session.outputNotice || "";
+    if (existingNotice.includes(normalizedNotice)) {
+      return;
+    }
+
+    session.outputNotice = existingNotice
+      ? `${existingNotice}\n${normalizedNotice}`
+      : normalizedNotice;
+  };
+
+  const cleanupRuntimeArtifact = (options: {
+    session: SubagentSession;
+    artifactType: "isolated_agent_dir" | "temp_dir";
+    artifactPath: string;
+    onSuccess: () => void;
+  }): boolean => {
+    try {
+      rmSync(options.artifactPath, { recursive: true, force: true });
+      options.onSuccess();
+      return true;
+    } catch (error) {
+      const message = getErrorMessage(error);
+      appendSessionOutputNotice(
+        options.session,
+        `Runtime cleanup pending: failed to remove ${options.artifactType === "isolated_agent_dir" ? "isolated agent directory" : "temporary runtime directory"} '${options.artifactPath}': ${message}`,
+      );
+      void piAgentRouterDebugLogger.warn("subagent.runtime_artifact_cleanup_failed", {
+        sessionId: options.session.id,
+        taskId: options.session.taskId,
+        artifactType: options.artifactType,
+        artifactPath: options.artifactPath,
+        message,
+      });
+      return false;
+    }
+  };
+
+  const cleanupSessionRuntimeArtifacts = (session: SubagentSession): boolean => {
+    let cleaned = true;
+
     if (session.isolatedAgentDir) {
-      try {
-        rmSync(session.isolatedAgentDir, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup failures
-      }
-      isolatedAgentDirs.delete(session.isolatedAgentDir);
-      session.isolatedAgentDir = undefined;
+      const isolatedAgentDir = session.isolatedAgentDir;
+      cleaned =
+        cleanupRuntimeArtifact({
+          session,
+          artifactType: "isolated_agent_dir",
+          artifactPath: isolatedAgentDir,
+          onSuccess: () => {
+            isolatedAgentDirs.delete(isolatedAgentDir);
+            session.isolatedAgentDir = undefined;
+          },
+        }) && cleaned;
     }
 
     if (session.tmpDir) {
-      try {
-        rmSync(session.tmpDir, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup failures
-      }
-      session.tmpDir = undefined;
+      const tmpDir = session.tmpDir;
+      cleaned =
+        cleanupRuntimeArtifact({
+          session,
+          artifactType: "temp_dir",
+          artifactPath: tmpDir,
+          onSuccess: () => {
+            session.tmpDir = undefined;
+          },
+        }) && cleaned;
     }
+
+    return cleaned;
   };
 
-  const cleanupSessionArtifacts = (session: SubagentSession): void => {
+  const cleanupSessionArtifacts = (session: SubagentSession): boolean =>
     cleanupSessionRuntimeArtifacts(session);
-  };
 
   const pruneFinishedSessions = (): number => {
     const now = Date.now();
@@ -535,9 +774,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       }
 
       if (now - session.finishedAt > FINISHED_SUBAGENT_TTL_MS) {
-        cleanupSessionArtifacts(session);
-        subagentSessions.delete(sessionId);
-        removed += 1;
+        if (cleanupSessionArtifacts(session)) {
+          subagentSessions.delete(sessionId);
+          removed += 1;
+        }
       }
     }
 
@@ -633,7 +873,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       wrappedTemperatureApis.add(api);
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = getErrorMessage(error);
       notify(
         `Failed to enable runtime temperature override for api '${api}': ${message}`,
         "warning",
@@ -789,7 +1029,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     } catch (error) {
       activeRuntimeTemperature = undefined;
       suppressManualModelOverrideCapture = false;
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = getErrorMessage(error);
       notify(
         `Failed to apply runtime profile for agent '${agent.name}': ${message}`,
         "warning",
@@ -870,11 +1110,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         : run.stderr;
     }
 
-    const parsedOutput =
-      run.outputText?.trim() ||
-      getSubagentOutputFromMessages(run.messages || []);
-    if (parsedOutput) {
-      appendSessionOutput(session, parsedOutput);
+    const normalizedRunOutput = normalizeDelegatedOutput({
+      messages: run.messages || [],
+      fallbackOutputText:
+        session.fullOutput || session.lastOutput || run.outputText,
+    });
+    if (normalizedRunOutput.outputText.trim()) {
+      appendSessionOutput(session, normalizedRunOutput.outputText);
     } else {
       const fallbackOutput = run.stdout.trim();
       if (fallbackOutput) {
@@ -916,7 +1158,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
 
     const retainedCompletedOutput = buildRetainedHistoryText(
-      session.fullOutput || session.lastOutput || run.outputText || run.stdout,
+      normalizedRunOutput.outputText || session.fullOutput || session.lastOutput || run.stdout,
     );
     if (retainedCompletedOutput.excerpt) {
       session.fullOutput = retainedCompletedOutput.excerpt;
@@ -956,8 +1198,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       options.emitFollowUp ?? session.notifyCompletion ?? true;
 
     if (session.dismissed) {
-      cleanupSessionArtifacts(session);
-      subagentSessions.delete(session.id);
+      if (cleanupSessionArtifacts(session)) {
+        subagentSessions.delete(session.id);
+      }
       session.resolveCompletion?.(run);
       session.resolveCompletion = undefined;
       session.completionPromise = undefined;
@@ -997,6 +1240,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     session.resolveCompletion = undefined;
     session.completionPromise = undefined;
 
+    enforceSubagentSessionRetentionLimit();
     pruneFinishedSessions();
     requestSubagentUiRender();
   };
@@ -1054,13 +1298,14 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return true;
     }
 
-    cleanupSessionArtifacts(session);
-    subagentSessions.delete(sessionId);
+    if (cleanupSessionArtifacts(session)) {
+      subagentSessions.delete(sessionId);
+    }
     requestSubagentUiRender();
     return true;
   };
 
-  const startBackgroundSubagent = (
+  const startBackgroundSubagent = async (
     ctx: ExtensionContext,
     delegatedBy: string,
     agent: Agent,
@@ -1086,7 +1331,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         parentSessionId: string;
       }) => void;
     } = {},
-  ): SubagentSession => {
+  ): Promise<SubagentSession> => {
     const sessionId = randomUUID();
     const taskId =
       normalizeInputText(options.taskId) ||
@@ -1149,7 +1394,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       resolveCompletion,
     };
 
-    if (!isDirectory(cwd)) {
+    if (!(await isDirectoryAsync(cwd))) {
       session.status = "failed";
       session.finishedAt = Date.now();
       session.stderr = `Invalid working directory: ${cwd}`;
@@ -1167,11 +1412,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       session.resolveCompletion = undefined;
       session.completionPromise = undefined;
       subagentSessions.set(session.id, session);
+      enforceSubagentSessionRetentionLimit();
       requestSubagentUiRender();
       return session;
     }
 
-    const resolvedSessionDir = resolveSubagentSessionDirectory(
+    const resolvedSessionDir = await resolveSubagentSessionDirectoryAsync(
       cwd,
       options.sessionPath,
     );
@@ -1193,6 +1439,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       session.resolveCompletion = undefined;
       session.completionPromise = undefined;
       subagentSessions.set(session.id, session);
+      enforceSubagentSessionRetentionLimit();
       requestSubagentUiRender();
       return session;
     }
@@ -1201,6 +1448,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     session.sessionDir = subagentSessionDir;
 
     subagentSessions.set(session.id, session);
+    enforceSubagentSessionRetentionLimit();
     requestSubagentUiRender();
 
     const args: string[] = [
@@ -1221,17 +1469,18 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       args.push("--thinking", agent.thinkingLevel);
     }
 
-    const subagentProviderId = detectSubagentProviderId({
+    const subagentProviderId = await detectSubagentProviderIdAsync({
       requestedModel: agent.model,
       activeProviderId: ctx.model?.provider,
       parentEnv: process.env,
     });
+    const subagentProviderEnvKey = await resolveProviderEnvKeyAsync(subagentProviderId);
 
     try {
-      const tempDir = mkdtempSync(join(tmpdir(), "pi-agent-router-"));
+      const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-router-"));
       session.tmpDir = tempDir;
 
-      const isolatedAgentDirResult = prepareIsolatedAgentDirectory(tempDir);
+      const isolatedAgentDirResult = await prepareIsolatedAgentDirectoryAsync(tempDir);
       if ("error" in isolatedAgentDirResult) {
         throw new Error(isolatedAgentDirResult.error);
       }
@@ -1239,20 +1488,18 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       session.isolatedAgentDir = isolatedAgentDirResult.agentDir;
       isolatedAgentDirs.add(isolatedAgentDirResult.agentDir);
 
-      const requiredExtensionDirs: string[] = [];
-      const missingRequiredExtensions: string[] = [];
-
-      for (const extensionCandidates of SUBAGENT_REQUIRED_EXTENSION_CANDIDATES) {
-        const resolvedExtensionDir = resolveExtensionDirectory(extensionCandidates);
-        if (resolvedExtensionDir) {
-          requiredExtensionDirs.push(resolvedExtensionDir);
-          continue;
-        }
-
-        missingRequiredExtensions.push(
-          formatExtensionCandidatePaths(extensionCandidates),
-        );
-      }
+      const resolvedRequiredExtensions = await Promise.all(
+        SUBAGENT_REQUIRED_EXTENSION_CANDIDATES.map(async (extensionCandidates) => ({
+          extensionCandidates,
+          resolvedExtensionDir: await resolveExtensionDirectoryAsync(extensionCandidates),
+        })),
+      );
+      const requiredExtensionDirs = resolvedRequiredExtensions
+        .map((entry) => entry.resolvedExtensionDir)
+        .filter((extensionDir): extensionDir is string => Boolean(extensionDir));
+      const missingRequiredExtensions = resolvedRequiredExtensions
+        .filter((entry) => !entry.resolvedExtensionDir)
+        .map((entry) => formatExtensionCandidatePaths(entry.extensionCandidates));
 
       if (missingRequiredExtensions.length > 0) {
         throw new Error(
@@ -1260,9 +1507,23 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         );
       }
 
-      const optionalExtensionDirs = SUBAGENT_OPTIONAL_EXTENSION_NAMES.map(
-        (extensionName) => join(AGENT_DIR, "extensions", extensionName),
-      ).filter((extensionDir) => isDirectory(extensionDir));
+      const shouldSkipDelegatedMultiAuth = await shouldSkipDelegatedMultiAuthForProviderAsync(
+        subagentProviderId,
+      );
+      const optionalExtensionDirs = (
+        await Promise.all(
+          SUBAGENT_OPTIONAL_EXTENSION_NAMES.map(async (extensionName) => {
+            const isDelegatedMultiAuthExtension =
+              extensionName === "pi-multi-auth" || extensionName === "multi-auth";
+            if (shouldSkipDelegatedMultiAuth && isDelegatedMultiAuthExtension) {
+              return null;
+            }
+
+            const extensionDir = join(AGENT_DIR, "extensions", extensionName);
+            return (await isDirectoryAsync(extensionDir)) ? extensionDir : null;
+          }),
+        )
+      ).filter((extensionDir): extensionDir is string => Boolean(extensionDir));
 
       const delegatedExtensionDirs = [
         ...requiredExtensionDirs,
@@ -1273,6 +1534,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         args.push("-e", extensionDir);
       }
 
+      if (shouldForwardFastModeFlag(pi, delegatedExtensionDirs)) {
+        args.push(`--${PI_FAST_MODE_FLAG}`);
+      }
+
       const tempPrompt = join(tempDir, "system.md");
       const delegatedSystemPrompt = [
         `<active_agent name="${agent.name}">`,
@@ -1280,7 +1545,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         "</active_agent>",
         "You MUST follow the active_agent instructions for this turn.",
       ].join("\n");
-      writeFileSync(tempPrompt, delegatedSystemPrompt, "utf-8");
 
       const delegatedCopilotInitiatorExtension = join(
         tempDir,
@@ -1288,24 +1552,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       );
       const copilotInitiatorExtensionSource =
         buildDelegatedCopilotInitiatorExtensionSource();
-      writeFileSync(
-        delegatedCopilotInitiatorExtension,
-        copilotInitiatorExtensionSource,
-        "utf-8",
-      );
-      args.push("-e", delegatedCopilotInitiatorExtension);
-
-      if (typeof agent.temperature === "number") {
-        const delegatedRuntimeExtension = join(
-          tempDir,
-          "delegated-runtime-temperature.ts",
-        );
-        const extensionSource = buildDelegatedTemperatureExtensionSource(
-          agent.temperature,
-        );
-        writeFileSync(delegatedRuntimeExtension, extensionSource, "utf-8");
-        args.push("-e", delegatedRuntimeExtension);
-      }
 
       const delegatedIdentityExtension = join(
         tempDir,
@@ -1313,16 +1559,43 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       );
       const delegatedIdentityExtensionSource =
         buildDelegatedActiveAgentIdentityExtensionSource(agent);
-      writeFileSync(
-        delegatedIdentityExtension,
-        delegatedIdentityExtensionSource,
-        "utf-8",
-      );
-      args.push("-e", delegatedIdentityExtension);
 
+      const runtimeFileWrites: Array<Promise<void>> = [
+        writeFile(tempPrompt, delegatedSystemPrompt, "utf-8"),
+        writeFile(
+          delegatedCopilotInitiatorExtension,
+          copilotInitiatorExtensionSource,
+          "utf-8",
+        ),
+        writeFile(
+          delegatedIdentityExtension,
+          delegatedIdentityExtensionSource,
+          "utf-8",
+        ),
+      ];
+
+      let delegatedRuntimeExtension: string | undefined;
+      if (typeof agent.temperature === "number") {
+        delegatedRuntimeExtension = join(
+          tempDir,
+          "delegated-runtime-temperature.ts",
+        );
+        const extensionSource = buildDelegatedTemperatureExtensionSource(
+          agent.temperature,
+        );
+        runtimeFileWrites.push(writeFile(delegatedRuntimeExtension, extensionSource, "utf-8"));
+      }
+
+      await Promise.all(runtimeFileWrites);
+
+      args.push("-e", delegatedCopilotInitiatorExtension);
+      if (delegatedRuntimeExtension) {
+        args.push("-e", delegatedRuntimeExtension);
+      }
+      args.push("-e", delegatedIdentityExtension);
       args.push("--append-system-prompt", tempPrompt, `Task: ${task}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = getErrorMessage(error);
       session.status = "failed";
       session.finishedAt = Date.now();
       session.stderr = `Failed to prepare delegated runtime files: ${message}`;
@@ -1339,9 +1612,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return session;
     }
 
-    const LOCK_RETRY_MAX_RETRIES = 3;
-    const LOCK_RETRY_DELAYS_MS = [200, 600, 1500] as const;
-    const LOCK_RETRY_JITTER_MAX_MS = 100;
     const LOCK_ERROR_PATTERN = /(Lock file is already being held|ELOCKED)/i;
 
     const mergeCapturedText = (current: string, next: string): string => {
@@ -1513,12 +1783,17 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return failureText;
     };
 
-    const hasAssistantResponse = (run: SubagentRunResult): boolean => {
-      const outputText =
-        run.outputText?.trim() ||
-        getSubagentOutputFromMessages(run.messages || []).trim();
-      return Boolean(outputText);
-    };
+    const getNormalizedRunOutputText = (
+      run: SubagentRunResult,
+      fallbackOutputText?: string,
+    ): string =>
+      normalizeDelegatedOutput({
+        messages: run.messages || [],
+        fallbackOutputText: fallbackOutputText ?? run.outputText,
+      }).outputText.trim();
+
+    const hasAssistantResponse = (run: SubagentRunResult): boolean =>
+      Boolean(getNormalizedRunOutputText(run));
 
     const hasMeaningfulOutput = (run: SubagentRunResult): boolean => {
       if (hasAssistantResponse(run)) {
@@ -1552,9 +1827,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     const hasExtensiveDelegatedProgress = (run: SubagentRunResult): boolean => {
       const usage = run.usage;
-      const outputText =
-        run.outputText?.trim() ||
-        getSubagentOutputFromMessages(run.messages || []).trim();
+      const outputText = getNormalizedRunOutputText(run);
       const toolInvocationCount = getRunToolInvocationCount(run);
 
       return (
@@ -1567,9 +1840,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     const getRunQualityScore = (run: SubagentRunResult): number => {
       const usage = run.usage;
-      const outputText =
-        run.outputText?.trim() ||
-        getSubagentOutputFromMessages(run.messages || []).trim();
+      const outputText = getNormalizedRunOutputText(run);
       const toolInvocationCount = getRunToolInvocationCount(run);
       const messageCount = run.messages?.length ?? 0;
 
@@ -1700,91 +1971,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return undefined;
     };
 
-    let finalized = false;
-    let accumulatedStderr = "";
-
-    const finalizeRun = (run: SubagentRunResult): void => {
-      if (finalized) {
-        return;
-      }
-
-      finalized = true;
-      session.proc = undefined;
-      if (run.sessionPath) {
-        session.sessionPath = run.sessionPath;
-      }
-      finalizeSession(session, run, { emitFollowUp: session.notifyCompletion });
-    };
-
-    const effectiveTimeoutMs =
-      typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : undefined;
-
-    const triggerSubagentTimeout = (): void => {
-      if (!effectiveTimeoutMs || session.status !== "running" || session.timedOut) {
-        return;
-      }
-
-      session.timedOut = true;
-
-      if (session.timeoutTimer) {
-        clearTimeout(session.timeoutTimer);
-        session.timeoutTimer = undefined;
-      }
-
-      const timeoutMessage = `Timed out after ${Math.round(effectiveTimeoutMs / 1000)}s`;
-      session.stderr = session.stderr
-        ? `${session.stderr}\n${timeoutMessage}`
-        : timeoutMessage;
-
-      if (session.proc && !session.proc.killed) {
-        try {
-          session.proc.kill("SIGTERM");
-        } catch {
-        }
-
-        setTimeout(() => {
-          if (!session.proc || session.proc.killed) {
-            return;
-          }
-
-          try {
-            session.proc.kill("SIGKILL");
-          } catch {
-          }
-        }, SUBAGENT_HARD_KILL_DELAY_MS);
-      }
-
-      requestSubagentUiRender();
-    };
-
-    const armSubagentTimeout = (): void => {
-      if (!effectiveTimeoutMs) {
-        return;
-      }
-
-      if (session.timeoutTimer) {
-        clearTimeout(session.timeoutTimer);
-      }
-
-      session.timeoutTimer = setTimeout(() => {
-        triggerSubagentTimeout();
-      }, effectiveTimeoutMs);
-    };
-
-    const recordSubagentActivity = (): void => {
-      if (!effectiveTimeoutMs) {
-        return;
-      }
-
-      if (session.status !== "running" || session.timedOut) {
-        return;
-      }
-
-      armSubagentTimeout();
-    };
+    const subagentProcessLifecycle = createSubagentProcessLifecycle({
+      session,
+      timeoutMs,
+      sessionPath: options.sessionPath,
+      hardKillDelayMs: SUBAGENT_HARD_KILL_DELAY_MS,
+      mergeCapturedText,
+      requestUiRender: requestSubagentUiRender,
+      onFinalize: (run) => {
+        finalizeSession(session, run, { emitFollowUp: session.notifyCompletion });
+      },
+    });
 
     const cliEntrypoint = normalizeInputText(process.argv[1]);
-    const canSpawnCurrentCli = Boolean(cliEntrypoint && isFile(cliEntrypoint));
+    const canSpawnCurrentCli = Boolean(cliEntrypoint && (await isFileAsync(cliEntrypoint)));
     const command = canSpawnCurrentCli
       ? process.execPath
       : process.platform === "win32"
@@ -1804,6 +2004,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         subagentProviderId,
         {
           requestedModel: agent.model,
+          parentSessionId: session.parentSessionId,
         },
       );
       lastAcquiredCredentialId = acquiredKeyLease?.credentialId;
@@ -1875,7 +2076,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           }
         }
 
-        recordSubagentActivity();
+        subagentProcessLifecycle.recordActivity();
         requestSubagentUiRender(false);
       };
 
@@ -1885,7 +2086,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         }
 
         stdoutSink.push(piece);
-        recordSubagentActivity();
+        subagentProcessLifecycle.recordActivity();
         stdoutBuffer += piece;
 
         let processedJsonEvent = false;
@@ -1924,10 +2125,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
         stderrSink.push(piece);
         session.stderr = mergeCapturedText(
-          accumulatedStderr,
+          subagentProcessLifecycle.getAccumulatedStderr(),
           stderrSink.summarize().tailText,
         );
-        recordSubagentActivity();
+        subagentProcessLifecycle.recordActivity();
         requestSubagentUiRender(false);
       };
 
@@ -2061,11 +2262,14 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               }
               resolve(run);
             } catch (error) {
-              const message = error instanceof Error ? error.message : "Unknown error";
+              const message = getErrorMessage(error);
               resolve({
                 code,
                 stdout: "",
-                stderr: mergeCapturedText(accumulatedStderr, message),
+                stderr: mergeCapturedText(
+                  subagentProcessLifecycle.getAccumulatedStderr(),
+                  message,
+                ),
                 timedOut: Boolean(session.timedOut),
                 sessionPath: eventState.sessionPath || options.sessionPath,
                 messages: [...eventState.messages],
@@ -2086,233 +2290,95 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           })();
         };
 
-        try {
-          const subagentEnv: NodeJS.ProcessEnv = {
-            ...process.env,
-          };
+        const startSubagentProcess = async (): Promise<void> => {
+          try {
+            const parentSessionId = activeParentSessionId || syncActiveParentSessionId(ctx);
+            const inheritedEnvKeys = subagentProviderEnvKey
+              ? [subagentProviderEnvKey]
+              : undefined;
+            const subagentEnv = buildSubagentSpawnEnv({
+              parentEnv: process.env,
+              parentSessionId,
+              isolatedAgentDir: session.isolatedAgentDir,
+              inheritedEnvKeys,
+              delegatedCredential: acquiredKeyLease
+                ? {
+                    providerId: acquiredKeyLease.providerId,
+                    credentialId: acquiredKeyLease.credentialId,
+                    envKey: acquiredKeyLease.envKey,
+                    apiKey: acquiredKeyLease.apiKey,
+                  }
+                : undefined,
+            });
 
-          if (session.isolatedAgentDir) {
-            subagentEnv.PI_CODING_AGENT_DIR = session.isolatedAgentDir;
-          }
+            const proc = spawn(command, commandArgs, {
+              cwd,
+              shell: false,
+              stdio: ["ignore", "pipe", "pipe"],
+              env: subagentEnv,
+            });
 
-          if (acquiredKeyLease) {
-            subagentEnv[acquiredKeyLease.envKey] = acquiredKeyLease.apiKey;
-          }
+            session.proc = proc as SubagentSession["proc"];
 
-          const proc = spawn(command, commandArgs, {
-            cwd,
-            shell: false,
-            stdio: ["ignore", "pipe", "pipe"],
-            env: subagentEnv,
-          });
+            proc.stdout.on("data", (chunk) => {
+              appendStdoutPiece(stdoutDecoder.decode(chunk, { stream: true }));
+            });
 
-          session.proc = proc as SubagentSession["proc"];
+            proc.stderr.on("data", (chunk) => {
+              appendStderrPiece(stderrDecoder.decode(chunk, { stream: true }));
+            });
 
-          proc.stdout.on("data", (chunk) => {
-            appendStdoutPiece(stdoutDecoder.decode(chunk, { stream: true }));
-          });
+            proc.on("close", (code) => {
+              completeAttempt(code ?? 1);
+            });
 
-          proc.stderr.on("data", (chunk) => {
-            appendStderrPiece(stderrDecoder.decode(chunk, { stream: true }));
-          });
-
-          proc.on("close", (code) => {
-            completeAttempt(code ?? 1);
-          });
-
-          proc.on("error", (error) => {
-            const message =
-              error instanceof Error
-                ? error.message
-                : "Failed to spawn delegated process";
+            proc.on("error", (error) => {
+              const message = getErrorMessage(error, "Failed to spawn delegated process");
+              appendStderrMessage(message);
+              completeAttempt(1);
+            });
+          } catch (error) {
+            const message = getErrorMessage(error);
             appendStderrMessage(message);
             completeAttempt(1);
-          });
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "Unknown error";
-          appendStderrMessage(message);
-          completeAttempt(1);
-        }
+          }
+        };
+
+        void startSubagentProcess();
       });
     };
 
-    if (effectiveTimeoutMs) {
-      armSubagentTimeout();
-    }
-
-    const QUOTA_RETRY_MAX_RETRIES = 3;
-    const QUOTA_RETRY_BASE_DELAY_MS = 1_500;
-    const QUOTA_RETRY_JITTER_MAX_MS = 500;
-    const TRANSIENT_RETRY_MAX_RETRIES = 2;
-    const TRANSIENT_RETRY_BASE_DELAY_MS = 1_000;
-    const TRANSIENT_RETRY_JITTER_MAX_MS = 250;
-
-    const runWithLockRetry = async (): Promise<void> => {
-      let lockRetryCount = 0;
-      let quotaRetryCount = 0;
-      let transientRetryCount = 0;
-      let richestAttemptRun: SubagentRunResult | undefined;
-
-      while (true) {
-        if (session.status !== "running") {
-          finalizeRun({
-            code: 1,
-            stdout: "",
-            stderr: accumulatedStderr || session.stderr,
-            timedOut: Boolean(session.timedOut),
-            sessionPath: session.sessionPath || options.sessionPath,
-          });
-          return;
-        }
-
-        const attemptRun = await runSubagentAttempt();
-        const retryableFailure = getRetryableCredentialFailure(attemptRun);
-        const runFailureText = getRunFailureText(attemptRun);
-        const runWithAccumulatedStderr: SubagentRunResult = {
-          ...attemptRun,
-          stderr: mergeCapturedText(accumulatedStderr, runFailureText),
-        };
-        richestAttemptRun = preferRicherRunResult(
-          richestAttemptRun || runWithAccumulatedStderr,
-          runWithAccumulatedStderr,
-        );
-
-        if (
-          attemptRun.code === 0 &&
-          !attemptRun.timedOut &&
-          !retryableFailure &&
-          lastAcquiredCredentialId
-        ) {
-          clearSubagentTransientKeyError(lastAcquiredCredentialId);
-        }
-
-        // Check lock retry
-        if (
-          lockRetryCount < LOCK_RETRY_MAX_RETRIES &&
-          session.status === "running" &&
-          !session.timedOut &&
-          isLockRetryableFailure(attemptRun)
-        ) {
-          accumulatedStderr = runWithAccumulatedStderr.stderr;
-          const delay =
-            LOCK_RETRY_DELAYS_MS[lockRetryCount] +
-            Math.floor(Math.random() * LOCK_RETRY_JITTER_MAX_MS);
-          const retryMessage =
-            `[pi-agent-router] Lock contention detected for delegated task ${session.id.slice(0, 8)} ` +
-            `(attempt ${lockRetryCount + 1}/${LOCK_RETRY_MAX_RETRIES + 1}). Retrying in ${delay}ms.`;
-
-          accumulatedStderr = mergeCapturedText(accumulatedStderr, retryMessage);
-          session.stderr = accumulatedStderr;
-          void piAgentRouterDebugLogger.warn("subagent.lock_contention_retry", {
-            attempt: lockRetryCount + 1,
-            delayMs: delay,
-            maxAttempts: LOCK_RETRY_MAX_RETRIES + 1,
-            message: retryMessage,
-            sessionId: session.id,
-          });
-          requestSubagentUiRender();
-          lockRetryCount += 1;
-
-          await sleep(delay);
-          continue;
-        }
-
-        // Check quota/rate-limit retry with credential rotation
-        if (
-          retryableFailure?.kind === "quota" &&
-          quotaRetryCount < QUOTA_RETRY_MAX_RETRIES &&
-          session.status === "running" &&
-          !session.timedOut
-        ) {
-          if (lastAcquiredCredentialId) {
-            reportSubagentKeyError(
-              session.id,
-              lastAcquiredCredentialId,
-              retryableFailure.message.slice(0, 500),
-            );
-          }
-          accumulatedStderr = runWithAccumulatedStderr.stderr;
-          quotaRetryCount += 1;
-          const delay =
-            QUOTA_RETRY_BASE_DELAY_MS * quotaRetryCount +
-            Math.floor(Math.random() * QUOTA_RETRY_JITTER_MAX_MS);
-          const retryMessage =
-            `[pi-agent-router] Quota/rate-limit error for delegated task ${session.id.slice(0, 8)} ` +
-            `(quota retry ${quotaRetryCount}/${QUOTA_RETRY_MAX_RETRIES}). Rotating credential and retrying in ${delay}ms.`;
-
-          accumulatedStderr = mergeCapturedText(accumulatedStderr, retryMessage);
-          session.stderr = accumulatedStderr;
-          void piAgentRouterDebugLogger.warn("subagent.quota_retry", {
-            attempt: quotaRetryCount,
-            delayMs: delay,
-            maxAttempts: QUOTA_RETRY_MAX_RETRIES,
-            message: retryMessage,
-            sessionId: session.id,
-          });
-          requestSubagentUiRender();
-
-          await sleep(delay);
-          continue;
-        }
-
-        if (
-          retryableFailure?.kind === "transient" &&
-          transientRetryCount < TRANSIENT_RETRY_MAX_RETRIES &&
-          session.status === "running" &&
-          !session.timedOut
-        ) {
-          if (lastAcquiredCredentialId) {
-            reportSubagentTransientKeyError(
-              session.id,
-              lastAcquiredCredentialId,
-              retryableFailure.message.slice(0, 500),
-            );
-          }
-          accumulatedStderr = runWithAccumulatedStderr.stderr;
-          transientRetryCount += 1;
-          const delay =
-            TRANSIENT_RETRY_BASE_DELAY_MS * transientRetryCount +
-            Math.floor(Math.random() * TRANSIENT_RETRY_JITTER_MAX_MS);
-          const retryMessage =
-            `[pi-agent-router] Transient provider error for delegated task ${session.id.slice(0, 8)} ` +
-            `(retry ${transientRetryCount}/${TRANSIENT_RETRY_MAX_RETRIES}). Retrying with credential rotation in ${delay}ms.`;
-
-          accumulatedStderr = mergeCapturedText(accumulatedStderr, retryMessage);
-          session.stderr = accumulatedStderr;
-          void piAgentRouterDebugLogger.warn("subagent.transient_retry", {
-            attempt: transientRetryCount,
-            delayMs: delay,
-            maxAttempts: TRANSIENT_RETRY_MAX_RETRIES,
-            message: retryMessage,
-            sessionId: session.id,
-          });
-          requestSubagentUiRender();
-
-          await sleep(delay);
-          continue;
-        }
-
-        // Not retryable, finalize
-        const finalRun =
-          retryableFailure && runWithAccumulatedStderr.code === 0
-            ? { ...runWithAccumulatedStderr, code: 1 }
-            : runWithAccumulatedStderr;
-        finalizeRun(preferRicherRunResult(finalRun, richestAttemptRun));
-        return;
-      }
-    };
-
-    void runWithLockRetry().catch((error) => {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      const fallbackRun: SubagentRunResult = {
-        code: 1,
-        stdout: "",
-        stderr: mergeCapturedText(accumulatedStderr || session.stderr, message),
-        timedOut: Boolean(session.timedOut),
-        sessionPath: session.sessionPath || options.sessionPath,
-      };
-      finalizeRun(fallbackRun);
+    void subagentProcessLifecycle.runWithRetry({
+      runAttempt: runSubagentAttempt,
+      getErrorMessage,
+      getRetryableCredentialFailure,
+      getRunFailureText,
+      preferRicherRunResult,
+      isLockRetryableFailure,
+      sleep,
+      getLastAcquiredCredentialId: () => lastAcquiredCredentialId,
+      clearTransientCredentialError: clearSubagentTransientKeyError,
+      reportQuotaCredentialError: (message, credentialId) => {
+        reportSubagentKeyError(session.id, credentialId, message.slice(0, 500));
+      },
+      reportTransientCredentialError: (message, credentialId) => {
+        reportSubagentTransientKeyError(session.id, credentialId, message.slice(0, 500));
+      },
+      onRetry: (event) => {
+        const eventName =
+          event.kind === "lock"
+            ? "subagent.lock_contention_retry"
+            : event.kind === "quota"
+              ? "subagent.quota_retry"
+              : "subagent.transient_retry";
+        void piAgentRouterDebugLogger.warn(eventName, {
+          attempt: event.attempt,
+          delayMs: event.delayMs,
+          maxAttempts: event.maxAttempts,
+          message: event.message,
+          sessionId: event.sessionId,
+        });
+      },
     });
 
     pruneFinishedSessions();
@@ -2324,11 +2390,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return;
     }
 
+    const subagentWidgetIcons = resolveSubagentWidgetIcons().icons;
+
     ctx.ui.setWidget(
       SUBAGENT_WIDGET_KEY,
       (tui, theme) => {
         const animatedSurface = createAnimatedRenderSurface(tui, {
-          intervalMs: SPINNER_RENDER_INTERVAL_MS,
+          intervalMs: SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS,
           shouldRender: hasRunningVisibleSubagentSession,
         });
         subagentWidgetRenderRequest = animatedSurface.requestRender;
@@ -2350,6 +2418,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               getStatusDisplay: (status) =>
                 getSubagentStatusDisplay(parseSubagentExecutionStatus(status)),
               truncate: truncateToWidth,
+              icons: subagentWidgetIcons,
             });
           },
         };
@@ -2461,7 +2530,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       }
       pi.appendEntry<ActiveAgentEntryData>("active_agent", { name: agentName });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = getErrorMessage(error);
       ctx.ui.notify(
         `Failed to persist active agent '${agentName ?? "none"}': ${message}`,
         "warning",
@@ -2477,7 +2546,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const configuredAgent = loadAgents().find(
+    const configuredAgent = loadAgents({ cwd: ctx.cwd, scope: "both" }).find(
       (agent) => agent.name === agentName,
     );
     if (!configuredAgent?.thinkingLevel) {
@@ -2503,7 +2572,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       if (!ctx.hasUI) {
         return;
       }
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = getErrorMessage(error);
       ctx.ui.notify(
         `Failed to capture manual thinking override for agent '${agentName}': ${message}`,
         "warning",
@@ -2548,7 +2617,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const selectedAgent = loadAgents().find(
+    const selectedAgent = loadAgents({ cwd: ctx.cwd, scope: "both" }).find(
       (agent) => agent.name === activeAgent,
     );
     if (!selectedAgent) {
@@ -2561,7 +2630,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   };
 
   const cycleAgent = (ctx: ExtensionContext, direction: 1 | -1): void => {
-    const agents = loadAgents();
+    const agents = loadAgents({ cwd: ctx.cwd, scope: "both" });
     const cyclable = getCyclablePrimaryAgents(agents);
 
     if (cyclable.length === 0) {
@@ -2637,7 +2706,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const agents = loadAgents();
+    const agents = loadAgents({ cwd: ctx.cwd, scope: "both" });
     const persistedAgent = agents.find((agent) => agent.name === persisted);
     if (!persistedAgent) {
       activeAgent = null;
@@ -2652,48 +2721,43 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     setActiveAgent(ctx, persistedAgent.name, { persist: false, notify: false });
   };
 
-  pi.on("session_start", (_event, ctx) => {
-    subagentUiRenderScheduler.cancel();
-    activeSubagentDelegations = 0;
-    queuedSubagentDelegations.length = 0;
-    pendingDelegationJobs.clear();
-    dispatchReminderQueued = false;
-    autoCompletionWaitJob = null;
-    manualModelOverrideForActiveAgent = undefined;
-    manualThinkingOverrideByAgent.clear();
-
-    const nextParentSessionId = syncActiveParentSessionId(ctx);
-    clearStaleSubagentUiSessions(nextParentSessionId);
-
-    setActiveAgent(ctx, DEFAULT_AGENT, {
-      persist: false,
-      notify: false,
-      applyRuntime: false,
-    });
-    restoreActiveAgentFromSession(ctx);
-    persistActiveAgent(ctx, activeAgent);
-
-    if (!ctx.hasUI) {
-      return;
+  pi.on("resources_discover", async (event) => {
+    if (event.reason === "reload") {
+      invalidateAgentDiscoveryCaches();
     }
-
-    pruneFinishedSessions();
-    ensureCleanupTimer();
-    setupSubagentWidget(ctx);
-
-    ensureTabCycleInputHook(ctx);
   });
 
-  pi.on("session_switch", (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
+    gracefulShutdownInProgress = false;
     subagentUiRenderScheduler.cancel();
-    const persistedActiveAgent = getPersistedActiveAgentName(ctx);
     manualModelOverrideForActiveAgent = undefined;
     manualThinkingOverrideByAgent.clear();
 
-    syncActiveParentSessionId(ctx);
-    restoreActiveAgentFromSession(ctx);
+    if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+      const persistedActiveAgent = getPersistedActiveAgentName(ctx);
 
-    if (persistedActiveAgent === undefined) {
+      syncActiveParentSessionId(ctx);
+      restoreActiveAgentFromSession(ctx);
+
+      if (persistedActiveAgent === undefined) {
+        persistActiveAgent(ctx, activeAgent);
+      }
+    } else {
+      activeSubagentDelegations = 0;
+      cancelQueuedSubagentDelegations(routerDelegationResetMessage);
+      pendingDelegationJobs.clear();
+      dispatchReminderQueued = false;
+      autoCompletionWaitJob = null;
+
+      const nextParentSessionId = syncActiveParentSessionId(ctx);
+      clearStaleSubagentUiSessions(nextParentSessionId);
+
+      setActiveAgent(ctx, DEFAULT_AGENT, {
+        persist: false,
+        notify: false,
+        applyRuntime: false,
+      });
+      restoreActiveAgentFromSession(ctx);
       persistActiveAgent(ctx, activeAgent);
     }
 
@@ -2731,20 +2795,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     syncManualThinkingOverrideForAgent(ctx, activeAgent);
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    gracefulShutdownInProgress = true;
     subagentUiRenderScheduler.cancel();
-    const shuttingDownParentSessionId = normalizeInputText(
-      ctx.sessionManager.getSessionId(),
-    );
-    const isActiveParentSession =
-      Boolean(shuttingDownParentSessionId) &&
-      shuttingDownParentSessionId === activeParentSessionId;
-
-    shutdownParentScopedSubagentSessions(shuttingDownParentSessionId);
-
-    if (!isActiveParentSession) {
-      return;
-    }
+    cancelQueuedSubagentDelegations(routerShutdownAbortMessage);
+    shutdownTrackedSubagentSessions(ctx);
 
     activeParentSessionId = "";
     clearCleanupTimer();
@@ -2752,7 +2807,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     manualModelOverrideForActiveAgent = undefined;
     manualThinkingOverrideByAgent.clear();
     activeSubagentDelegations = 0;
-    queuedSubagentDelegations.length = 0;
     pendingDelegationJobs.clear();
     dispatchReminderQueued = false;
     autoCompletionWaitJob = null;
@@ -2774,7 +2828,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   pi.registerCommand("agent", {
     description: "Open the active-agent picker or switch agents in non-interactive mode",
     handler: async (args, ctx) => {
-      const agents = loadAgents();
+      const agents = loadAgents({ cwd: ctx.cwd, scope: "both" });
       const names = agents.map((agent) => agent.name);
       const input = args.trim();
 
@@ -2960,12 +3014,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    if (!activeParentSessionId) {
+      syncActiveParentSessionId(ctx);
+    }
+
     if (!activeAgent) {
       activeRuntimeTemperature = undefined;
       return {};
     }
 
-    const agent = loadAgents().find((item) => item.name === activeAgent);
+    const agent = loadAgents({ cwd: ctx.cwd, scope: "both" }).find((item) => item.name === activeAgent);
     if (!agent) {
       activeRuntimeTemperature = undefined;
       return {};
@@ -3023,11 +3081,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
   });
 
-  const taskToolDefinition = {
+  const taskToolDefinition = defineTool({
     name: "task",
     label: "Task",
     description:
-      'Delegate task batches to local agents using task-style items: tasks[{id,description,assignment,skills?,cwd?,agent}] with optional shared context/schema. Set mode="parallel" (default) or mode="chain" for sequential execution. In chain mode, use {previous} in later assignments to inject the prior step output (safely truncated). Each task must explicitly provide its agent. agentScope: "user" => ~/.pi/agent/agents, "project" => nearest .pi/agents, "both" => merge both. Supports live attach updates and bounded concurrency.',
+      'Delegate task batches to local agents using task-style items: tasks[{id,description,assignment,skills?,cwd?,agent}] with optional shared context/schema. Set mode="parallel" (default) or mode="chain" for sequential execution. In chain mode, use {previous} in later assignments to inject the prior step output (safely truncated). Each task must explicitly provide its agent. agentScope: "user" => the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project" => nearest .pi/agents, "both" => merge both. Supports live attach updates and bounded concurrency.',
+    promptSnippet: "Delegate work to local agents in parallel or chain mode",
+    promptGuidelines: [
+      "Use task when work should be delegated to one or more specialized agents instead of handled entirely in the current session.",
+    ],
+    renderShell: "self",
 
     parameters: Type.Object({
       tasks: Type.Array(TaskBatchItem, {
@@ -3050,7 +3113,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       schema: Type.Optional(
         Type.Unknown({
           description:
-            "Optional expected output schema (forwarded in each delegated prompt).",
+            "Optional structured output schema for explicit submit_result payloads. Human-readable TASK COMPLETION REPORT output remains the default in compat mode.",
         }),
       ),
       agentScope: Type.Optional(
@@ -3058,7 +3121,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           [Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
           {
             description:
-              'Which agent directories to search. "user": ~/.pi/agent/agents, "project": nearest .pi/agents from cwd, "both": merge both (default).',
+              'Which agent directories to search. "user": the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project": nearest .pi/agents from cwd, "both": merge both (default).',
             default: "both",
           },
         ),
@@ -3145,9 +3208,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const hasTaskStyleMode = true;
       const agentScope = normalizeAgentScope(params.agentScope);
       const attachToParent = params.attach !== false;
-      const defaultExecutionCwd = resolveExistingWorkingDirectory(ctx.cwd);
+      const defaultExecutionCwd = await resolveExistingWorkingDirectoryAsync(
+        ctx.cwd,
+      );
       const { controls: taskControls, warnings: controlWarnings } =
-        resolveTaskControls(defaultExecutionCwd);
+        await resolveTaskControlsAsync(defaultExecutionCwd);
       const modeAgentLabel =
         distinctTaskAgents.length === 1
           ? distinctTaskAgents[0]
@@ -3240,7 +3305,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         };
       }
 
-      const resolvedGlobalCwd = resolveSubagentWorkingDirectory(
+      const resolvedGlobalCwd = await resolveSubagentWorkingDirectoryAsync(
         params.cwd,
         defaultExecutionCwd,
       );
@@ -3263,7 +3328,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       }
 
       const executionBaseCwd = resolvedGlobalCwd.cwd;
-      const agentDiscovery = discoverAgents(executionBaseCwd, agentScope);
+      const agentDiscovery = await discoverAgentsAsync(executionBaseCwd, agentScope);
       const availableAgents = agentDiscovery.agents;
 
       const timeout = resolveSubagentTimeoutMs(
@@ -3319,26 +3384,30 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const agentsByName = new Map(
           availableAgents.map((item) => [item.name, item] as const),
         );
-          const builtInAgentColorFallback = new Map<string, string>([
-            ["architect", "#50E3C2"],
-            ["ask", "#9013FE"],
-            ["code", "#4A90E2"],
-            ["debug", "#F5A623"],
-            ["devops", "#6C5CE7"],
-            ["docs", "#417505"],
-            ["git", "#D0021B"],
-            ["orchestrator", "#7ED321"],
-            ["product", "#8B572A"],
-            ["refactor", "#4A4A4A"],
-            ["researcher", "#F8E71C"],
-            ["security", "#B00020"],
-            ["test", "#2D9CDB"],
-            ["ui", "#FF6F61"],
-          ]);
-          const fallbackUserAgentColors = new Map(
-          loadAgents()
-            .filter((agent) => typeof agent.color === "string" && agent.color.trim().length > 0)
-            .map((agent) => [normalizeInputText(agent.name).toLowerCase(), agent.color!] as const),
+        const builtInAgentColorFallback = new Map<string, string>([
+          ["architect", "#50E3C2"],
+          ["ask", "#9013FE"],
+          ["code", "#4A90E2"],
+          ["debug", "#F5A623"],
+          ["devops", "#6C5CE7"],
+          ["docs", "#417505"],
+          ["git", "#D0021B"],
+          ["orchestrator", "#7ED321"],
+          ["product", "#8B572A"],
+          ["refactor", "#4A4A4A"],
+          ["researcher", "#F8E71C"],
+          ["security", "#B00020"],
+          ["test", "#2D9CDB"],
+          ["ui", "#FF6F61"],
+        ]);
+        const fallbackUserAgentColors = new Map(
+          (await loadAgentsAsync())
+            .filter(
+              (agent) => typeof agent.color === "string" && agent.color.trim().length > 0,
+            )
+            .map(
+              (agent) => [normalizeInputText(agent.name).toLowerCase(), agent.color!] as const,
+            ),
         );
         const resolveDelegatedAgentColor = (
           agentName: string,
@@ -3397,9 +3466,14 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             };
           });
 
-        const buildParallelDetails = (
-          liveOutput?: string,
-        ): SubagentExecutionDetails => {
+        type ParallelUpdateSnapshot = {
+          summary: NonNullable<SubagentExecutionDetails["summary"]>;
+          status: SubagentExecutionStatus;
+          summaryDelegationLabel: string;
+          contractWarnings?: string[];
+        };
+
+        const buildParallelUpdateSnapshot = (): ParallelUpdateSnapshot => {
           const summary = summarizeParallelResults(taskResults);
           const status: SubagentExecutionStatus =
             summary.running > 0 || summary.queued > 0
@@ -3419,33 +3493,47 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             ...controlWarnings,
             ...taskResults.flatMap((result) => result.contractWarnings || []),
           ];
+
+          return {
+            summary,
+            status,
+            summaryDelegationLabel,
+            contractWarnings:
+              contractWarnings.length > 0 ? contractWarnings : undefined,
+          };
+        };
+
+        const buildParallelDetails = (
+          liveOutput?: string,
+          snapshot: ParallelUpdateSnapshot = buildParallelUpdateSnapshot(),
+        ): SubagentExecutionDetails => {
           return createSubagentExecutionDetails(
             delegatedBy,
             hasTaskStyleMode
               ? modeAgentLabel
               : requestedMode === "chain"
                 ? "chain"
-                : summary.total === 1
+                : snapshot.summary.total === 1
                   ? "delegation"
                   : "parallel",
-            `${summaryDelegationLabel}: ${summary.total} task${summary.total === 1 ? "" : "s"}`,
-            status,
+            `${snapshot.summaryDelegationLabel}: ${snapshot.summary.total} task${snapshot.summary.total === 1 ? "" : "s"}`,
+            snapshot.status,
             {
               mode: requestedMode,
               attached: attachToParent,
               agentColor:
-                summary.total === 1 ? taskResults[0]?.agentColor : undefined,
-              model: summary.total === 1 ? taskResults[0]?.model : undefined,
+                snapshot.summary.total === 1 ? taskResults[0]?.agentColor : undefined,
+              model:
+                snapshot.summary.total === 1 ? taskResults[0]?.model : undefined,
               thinkingLevel:
-                summary.total === 1 ? taskResults[0]?.thinkingLevel : undefined,
+                snapshot.summary.total === 1 ? taskResults[0]?.thinkingLevel : undefined,
               duration:
-                summary.total === 1 ? taskResults[0]?.duration : undefined,
+                snapshot.summary.total === 1 ? taskResults[0]?.duration : undefined,
               usage: aggregateUsageFromResults(taskResults),
-              summary,
+              summary: snapshot.summary,
               results: taskResults,
-              contractWarnings:
-                contractWarnings.length > 0 ? contractWarnings : undefined,
-              aborted: summary.aborted > 0,
+              contractWarnings: snapshot.contractWarnings,
+              aborted: snapshot.summary.aborted > 0,
               liveOutput,
             },
           );
@@ -3498,21 +3586,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           }
 
           try {
-            const partialDetails = buildParallelDetails(message);
-            const compactResults = buildCompactPartialResults(
-              partialDetails.results || taskResults,
-            );
-            const compactDetails: SubagentExecutionDetails = {
-              ...partialDetails,
-              liveOutput: compactPartialTaskText(partialDetails.liveOutput),
-              results: compactResults,
-            };
+            const snapshot = buildParallelUpdateSnapshot();
             const fingerprint = buildTaskToolPartialUpdateFingerprint({
               message,
-              status: compactDetails.status,
-              summary:
-                compactDetails.summary || summarizeParallelResults(taskResults),
-              results: compactDetails.results || taskResults,
+              status: snapshot.status,
+              summary: snapshot.summary,
+              results: taskResults,
             });
             if (
               !partialUpdateGate.shouldEmit({
@@ -3522,6 +3601,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             ) {
               return;
             }
+
+            const partialDetails = buildParallelDetails(message, snapshot);
+            const compactResults = buildCompactPartialResults(
+              partialDetails.results || taskResults,
+            );
+            const compactDetails: SubagentExecutionDetails = {
+              ...partialDetails,
+              liveOutput: compactPartialTaskText(partialDetails.liveOutput),
+              results: compactResults,
+            };
 
             const compatibilityUpdate = {
               ...compactDetails,
@@ -3641,7 +3730,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               let slotAcquired = false;
 
               try {
-                const resolvedTaskCwd = resolveSubagentWorkingDirectory(
+                const resolvedTaskCwd = await resolveSubagentWorkingDirectoryAsync(
                   task.cwd,
                   executionBaseCwd,
                 );
@@ -3709,7 +3798,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   }
                 }
 
-                const session = startBackgroundSubagent(
+                const session = await startBackgroundSubagent(
                   ctx,
                   delegatedBy,
                   agent,
@@ -3796,25 +3885,21 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 );
                 taskResult.usage = run.usage;
 
-                let finalOutputText =
-                  session.fullOutput ||
-                  session.lastOutput ||
-                  run.outputText ||
-                  getSubagentOutputFromMessages(run.messages || []) ||
-                  run.stderr;
-
-                const contractValidation = validateSubagentOutputContract({
+                const normalizedDelegatedOutput = normalizeDelegatedOutput({
                   messages: run.messages || [],
+                  fallbackOutputText:
+                    session.fullOutput || session.lastOutput || run.outputText,
                   schema: params.schema,
                   strictness: taskControls.outputStrictness,
                 });
-                if (contractValidation.outputText.trim()) {
-                  finalOutputText = contractValidation.outputText;
-                }
-                if (contractValidation.warnings.length > 0) {
+
+                let finalOutputText =
+                  normalizedDelegatedOutput.outputText || run.stderr;
+
+                if (normalizedDelegatedOutput.warnings.length > 0) {
                   taskResult.contractWarnings = [
                     ...(taskResult.contractWarnings || []),
-                    ...contractValidation.warnings,
+                    ...normalizedDelegatedOutput.warnings,
                   ];
                 }
                 if (run.outputNotice?.trim()) {
@@ -3831,13 +3916,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 taskResult.output = retainedTaskOutput.excerpt;
                 taskResult.resultSummary = retainedTaskOutput.summary;
 
-                if (contractValidation.error) {
+                if (normalizedDelegatedOutput.error) {
                   taskResult.status = "failed";
                   const retainedContractError = buildRetainedHistoryText(
-                    contractValidation.error,
+                    normalizedDelegatedOutput.error,
                   );
                   taskResult.error =
-                    retainedContractError.excerpt || contractValidation.error;
+                    retainedContractError.excerpt || normalizedDelegatedOutput.error;
                   taskResult.resultSummary =
                     retainedContractError.summary || taskResult.resultSummary;
                   throw new Error(taskResult.error);
@@ -3885,18 +3970,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   throw error;
                 }
 
-                if (workerSignal.aborted) {
+                if (workerSignal.aborted || gracefulShutdownInProgress) {
                   taskResult.status = "aborted";
                   taskResult.abortReason =
                     taskResult.abortReason ||
-                    "Delegation aborted by parent signal.";
+                    (gracefulShutdownInProgress
+                      ? routerShutdownAbortMessage
+                      : "Delegation aborted by parent signal.");
                   taskResult.error = taskResult.abortReason;
                 } else {
                   taskResult.status = "failed";
                   taskResult.exitCode = taskResult.exitCode ?? 1;
                   taskResult.error =
                     taskResult.error ||
-                    (error instanceof Error ? error.message : "Unknown error");
+                    getErrorMessage(error);
                 }
 
                 const retainedTaskError = buildRetainedHistoryText(
@@ -4079,7 +4166,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         theme,
       });
     },
-  };
+  });
 
-  pi.registerTool(taskToolDefinition as any);
+  pi.registerTool(taskToolDefinition);
 }

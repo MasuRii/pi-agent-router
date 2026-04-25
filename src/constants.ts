@@ -2,12 +2,12 @@
  * Constants and configuration values for pi-agent-router extension.
  */
 
-import { homedir } from "node:os";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { join } from "node:path";
 
 import type { AgentMode, AgentThinkingLevel } from "./types";
 
-export const AGENT_DIR = join(homedir(), ".pi", "agent");
+export const AGENT_DIR = getAgentDir();
 export const AGENTS_DIR = join(AGENT_DIR, "agents");
 export const SESSIONS_DIR = join(AGENT_DIR, "sessions");
 export const SUBAGENT_SESSIONS_DIR = join(AGENT_DIR, "subagent-sessions");
@@ -26,7 +26,12 @@ export const AGENT_EMOJIS: Record<string, string> = {
   orchestrator: "🎯",
 };
 
+export const AGENT_DISCOVERY_CACHE_MAX_ENTRIES = 64;
+export const TASK_CONTROLS_CACHE_MAX_ENTRIES = 64;
+export const SUBAGENT_SESSION_RETENTION_MAX_COMPLETED = 64;
+
 export const SUBAGENT_WIDGET_KEY = "subagent-background-sessions";
+export const SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS = 1_000;
 export const FINISHED_SUBAGENT_TTL_MS = 30 * 60 * 1000;
 export const SUBAGENT_TASK_REGISTRY_TTL_MS = 6 * 60 * 60 * 1000;
 export const SUBAGENT_HARD_KILL_DELAY_MS = 5_000;

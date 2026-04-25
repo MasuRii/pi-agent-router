@@ -3,18 +3,8 @@
  */
 
 import { SUBAGENT_TOOL_ARGUMENT_PREVIEW_MAX_CHARS } from "./constants";
-
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function truncatePreview(text: string, maxLength: number): string {
-  if (text.length <= maxLength) {
-    return text;
-  }
-
-  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
+import { normalizeInputText } from "./input-normalization";
+import { truncatePreview } from "./text-formatting";
 
 export function getToolCallArguments(part: Record<string, unknown>): unknown {
   if ("arguments" in part) {

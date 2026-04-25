@@ -11,6 +11,7 @@ function normalizeSummary(value: string | undefined): string {
 export function buildParallelResultActivity(options: {
   status: string;
   latestToolCall?: string;
+  latestOutputAction?: string;
   output?: string;
   resultSummary?: string;
   isPartial: boolean;
@@ -23,7 +24,9 @@ export function buildParallelResultActivity(options: {
 
   const inferredActivity =
     formatTaskActivityLabel(options.latestToolCall) ||
-    formatTaskActivityLabel(inferLatestActionFromOutput(options.output));
+    formatTaskActivityLabel(
+      options.latestOutputAction ?? inferLatestActionFromOutput(options.output),
+    );
 
   if (running) {
     return inferredActivity || "Delegating structured subtask analysis";

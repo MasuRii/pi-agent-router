@@ -1,4 +1,6 @@
-import { appendFileSync } from "node:fs";
+import { AsyncBufferedLogWriter } from "./async-buffered-log-writer";
+
+import { getErrorMessage } from "./error-utils";
 
 import {
   CONFIG_PATH,
@@ -45,9 +47,24 @@ function safeJsonStringify(value: unknown): string {
 
 export class PiAgentRouterDebugLogger {
   private initialized = false;
-  private enabled = false;
+  private readonly writer: AsyncBufferedLogWriter;
 
-  constructor(private readonly options: PiAgentRouterDebugLoggerOptions = {}) {}
+  constructor(private readonly options: PiAgentRouterDebugLoggerOptions = {}) {
+    this.writer = new AsyncBufferedLogWriter({
+      enabled: false,
+      logPath: this.options.logPath ?? DEBUG_LOG_PATH,
+      ensureDirectory: () =>
+        ensurePiAgentRouterDebugDirectory(this.options.debugDir ?? DEBUG_DIR),
+      createDroppedEntriesLine: (droppedEntries) =>
+        `${safeJsonStringify({
+          timestamp: new Date().toISOString(),
+          level: "warn",
+          extension: PI_AGENT_ROUTER_EXTENSION_ID,
+          event: "debug_log_overflow",
+          droppedEntries,
+        })}\n`,
+    });
+  }
 
   private initialize(): void {
     if (this.initialized) {
@@ -56,7 +73,7 @@ export class PiAgentRouterDebugLogger {
 
     this.initialized = true;
     const configResult = loadPiAgentRouterConfig(this.options.configPath ?? CONFIG_PATH);
-    this.enabled = configResult.config.debug;
+    this.writer.setEnabled(configResult.config.debug);
   }
 
   private write(
@@ -66,30 +83,18 @@ export class PiAgentRouterDebugLogger {
   ): string | undefined {
     try {
       this.initialize();
-      if (!this.enabled) {
-        return undefined;
-      }
-
-      const debugDirectoryError = ensurePiAgentRouterDebugDirectory(
-        this.options.debugDir ?? DEBUG_DIR,
+      return this.writer.writeLine(
+        `${safeJsonStringify({
+          timestamp: new Date().toISOString(),
+          level,
+          extension: PI_AGENT_ROUTER_EXTENSION_ID,
+          event,
+          ...payload,
+        })}\n`,
       );
-      if (debugDirectoryError) {
-        return debugDirectoryError;
-      }
-
-      const logPath = this.options.logPath ?? DEBUG_LOG_PATH;
-      const line = safeJsonStringify({
-        timestamp: new Date().toISOString(),
-        level,
-        extension: PI_AGENT_ROUTER_EXTENSION_ID,
-        event,
-        ...payload,
-      });
-      appendFileSync(logPath, `${line}\n`, "utf-8");
-      return undefined;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return `Failed to write pi-agent-router ${level} debug log '${this.options.logPath ?? DEBUG_LOG_PATH}': ${message}`;
+      const message = getErrorMessage(error);
+      return `Failed to buffer pi-agent-router ${level} debug log '${this.options.logPath ?? DEBUG_LOG_PATH}': ${message}`;
     }
   }
 
@@ -99,6 +104,10 @@ export class PiAgentRouterDebugLogger {
 
   warn(event: string, payload: Record<string, unknown> = {}): string | undefined {
     return this.write("warn", event, payload);
+  }
+
+  flush(): Promise<void> {
+    return this.writer.flush();
   }
 }
 

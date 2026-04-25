@@ -7,14 +7,13 @@ import {
   MODEL_FOOTER_ICON,
 } from "../model-display";
 import {
-  buildSubagentOutputDigest,
+  analyzeSubagentOutput,
   extractTaskDescriptionFromDelegatedPrompt,
   truncatePreview,
 } from "../text-formatting";
 import {
   colorizeWithHex,
   formatUsageWithoutCost,
-  inferToolCallsFromOutput,
   resolveTaskBorderColor,
   toTitleCaseWords,
 } from "./task-display-formatting";
@@ -93,10 +92,8 @@ export function renderParallelDelegationResult(
   const visibleResults = expanded ? results : results.slice(0, 3);
   for (let index = 0; index < visibleResults.length; index += 1) {
     const taskResult = visibleResults[index]!;
-    const toolCalls = Math.max(
-      0,
-      taskResult.toolCalls ?? inferToolCallsFromOutput(taskResult.output),
-    );
+    const outputAnalysis = analyzeSubagentOutput(taskResult.error || taskResult.output);
+    const toolCalls = Math.max(0, taskResult.toolCalls ?? outputAnalysis.toolCalls);
 
     const taskGoal =
       taskResult.taskDescription ||
@@ -107,11 +104,12 @@ export function renderParallelDelegationResult(
 
     const digestSummary = isPartial
       ? undefined
-      : taskResult.resultSummary || buildSubagentOutputDigest(taskResult.error || taskResult.output).summary;
+      : taskResult.resultSummary || outputAnalysis.summary;
 
     const activity = buildParallelResultActivity({
       status: taskResult.status,
       latestToolCall: taskResult.latestToolCall,
+      latestOutputAction: outputAnalysis.latestAction,
       output: taskResult.output,
       isPartial,
       resultSummary: digestSummary,

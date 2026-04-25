@@ -57,6 +57,8 @@ export function createSubagentJsonEventState(options: {
     ),
     droppedMessageCount: 0,
     outputText: "",
+    committedOutputText: "",
+    liveOutputText: "",
     outputTextMaxChars: normalizePositiveLimit(
       options.outputTextMaxChars,
       SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
@@ -65,6 +67,8 @@ export function createSubagentJsonEventState(options: {
     usage: createEmptySubagentUsage(),
     malformedEventCount: 0,
     latestToolCall: undefined,
+    committedLatestToolCall: undefined,
+    liveLatestToolCall: undefined,
     sessionDir: options.sessionDir,
     toolInvocationMap: new Map(),
     toolInvocationRetentionLimit: normalizePositiveLimit(

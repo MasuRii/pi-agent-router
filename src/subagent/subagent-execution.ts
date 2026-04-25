@@ -4,21 +4,24 @@
 
 import { randomUUID } from "node:crypto";
 
-import type { SubagentUsage, SubagentExecutionStatus, SubagentExecutionDetails, SubagentSession } from "../types";
+import type {
+  SubagentUsage,
+  SubagentExecutionStatus,
+  SubagentExecutionDetails,
+  SubagentSession,
+  SubagentRunResult,
+} from "../types";
 import {
   DEFAULT_AGENT,
   SUBAGENT_DEFAULT_TIMEOUT_MS,
   SUBAGENT_MIN_TIMEOUT_MS,
   TASK_HISTORY_SUMMARY_MAX_CHARS,
 } from "../constants";
+import { normalizeInputText } from "../input-normalization";
 import {
   extractTaskDescriptionFromDelegatedPrompt,
   truncatePreview,
 } from "../text-formatting";
-
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
 
 function asFiniteNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -133,6 +136,332 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 
   await Promise.all(workers);
   return results;
+}
+
+type RetryableCredentialFailure = {
+  kind: "quota" | "transient";
+  message: string;
+};
+
+type SubagentProcessLifecycleRetryEvent = {
+  kind: "lock" | "quota" | "transient";
+  attempt: number;
+  delayMs: number;
+  maxAttempts: number;
+  message: string;
+  sessionId: string;
+};
+
+type CreateSubagentProcessLifecycleOptions = {
+  session: SubagentSession;
+  timeoutMs?: number;
+  sessionPath?: string;
+  hardKillDelayMs: number;
+  requestUiRender: () => void;
+  mergeCapturedText: (current: string, next: string) => string;
+  onFinalize: (run: SubagentRunResult) => void;
+};
+
+type RunSubagentProcessLifecycleOptions = {
+  runAttempt: () => Promise<SubagentRunResult>;
+  getErrorMessage: (error: unknown) => string;
+  getRetryableCredentialFailure: (
+    run: SubagentRunResult,
+  ) => RetryableCredentialFailure | undefined;
+  getRunFailureText: (run: SubagentRunResult) => string;
+  preferRicherRunResult: (
+    base: SubagentRunResult,
+    candidate: SubagentRunResult | undefined,
+  ) => SubagentRunResult;
+  isLockRetryableFailure: (run: SubagentRunResult) => boolean;
+  sleep: (delayMs: number) => Promise<void>;
+  getLastAcquiredCredentialId: () => string | undefined;
+  clearTransientCredentialError: (credentialId: string) => void;
+  reportQuotaCredentialError: (message: string, credentialId: string) => void;
+  reportTransientCredentialError: (message: string, credentialId: string) => void;
+  onRetry?: (event: SubagentProcessLifecycleRetryEvent) => void;
+};
+
+const LOCK_RETRY_MAX_RETRIES = 3;
+const LOCK_RETRY_DELAYS_MS = [200, 600, 1_500] as const;
+const LOCK_RETRY_JITTER_MAX_MS = 100;
+const QUOTA_RETRY_MAX_RETRIES = 3;
+const QUOTA_RETRY_BASE_DELAY_MS = 1_500;
+const QUOTA_RETRY_JITTER_MAX_MS = 500;
+const TRANSIENT_RETRY_MAX_RETRIES = 2;
+const TRANSIENT_RETRY_BASE_DELAY_MS = 1_000;
+const TRANSIENT_RETRY_JITTER_MAX_MS = 250;
+
+export function createSubagentProcessLifecycle(
+  options: CreateSubagentProcessLifecycleOptions,
+): {
+  getAccumulatedStderr: () => string;
+  recordActivity: () => void;
+  runWithRetry: (retryOptions: RunSubagentProcessLifecycleOptions) => Promise<void>;
+} {
+  const effectiveTimeoutMs =
+    typeof options.timeoutMs === "number" && options.timeoutMs > 0
+      ? options.timeoutMs
+      : undefined;
+  let finalized = false;
+  let accumulatedStderr = "";
+
+  const finalizeRun = (run: SubagentRunResult): void => {
+    if (finalized) {
+      return;
+    }
+
+    finalized = true;
+    if (options.session.timeoutTimer) {
+      clearTimeout(options.session.timeoutTimer);
+      options.session.timeoutTimer = undefined;
+    }
+    options.session.proc = undefined;
+    if (run.sessionPath) {
+      options.session.sessionPath = run.sessionPath;
+    }
+    options.onFinalize(run);
+  };
+
+  const triggerTimeout = (): void => {
+    if (!effectiveTimeoutMs || options.session.status !== "running" || options.session.timedOut) {
+      return;
+    }
+
+    options.session.timedOut = true;
+    if (options.session.timeoutTimer) {
+      clearTimeout(options.session.timeoutTimer);
+      options.session.timeoutTimer = undefined;
+    }
+
+    const timeoutMessage = `Timed out after ${Math.round(effectiveTimeoutMs / 1000)}s`;
+    options.session.stderr = options.session.stderr
+      ? `${options.session.stderr}\n${timeoutMessage}`
+      : timeoutMessage;
+
+    if (options.session.proc && !options.session.proc.killed) {
+      try {
+        options.session.proc.kill("SIGTERM");
+      } catch {
+      }
+
+      setTimeout(() => {
+        if (!options.session.proc || options.session.proc.killed) {
+          return;
+        }
+
+        try {
+          options.session.proc.kill("SIGKILL");
+        } catch {
+        }
+      }, options.hardKillDelayMs);
+    }
+
+    options.requestUiRender();
+  };
+
+  const armTimeout = (): void => {
+    if (!effectiveTimeoutMs) {
+      return;
+    }
+
+    if (options.session.timeoutTimer) {
+      clearTimeout(options.session.timeoutTimer);
+    }
+
+    options.session.timeoutTimer = setTimeout(() => {
+      triggerTimeout();
+    }, effectiveTimeoutMs);
+  };
+
+  const recordActivity = (): void => {
+    if (!effectiveTimeoutMs) {
+      return;
+    }
+
+    if (options.session.status !== "running" || options.session.timedOut) {
+      return;
+    }
+
+    armTimeout();
+  };
+
+  const runWithRetry = async (
+    retryOptions: RunSubagentProcessLifecycleOptions,
+  ): Promise<void> => {
+    if (effectiveTimeoutMs) {
+      armTimeout();
+    }
+
+    let lockRetryCount = 0;
+    let quotaRetryCount = 0;
+    let transientRetryCount = 0;
+    let richestAttemptRun: SubagentRunResult | undefined;
+
+    try {
+      while (true) {
+        if (options.session.status !== "running") {
+          finalizeRun({
+            code: 1,
+            stdout: "",
+            stderr: accumulatedStderr || options.session.stderr,
+            timedOut: Boolean(options.session.timedOut),
+            sessionPath: options.session.sessionPath || options.sessionPath,
+          });
+          return;
+        }
+
+        const attemptRun = await retryOptions.runAttempt();
+        const retryableFailure = retryOptions.getRetryableCredentialFailure(attemptRun);
+        const runFailureText = retryOptions.getRunFailureText(attemptRun);
+        const runWithAccumulatedStderr: SubagentRunResult = {
+          ...attemptRun,
+          stderr: options.mergeCapturedText(accumulatedStderr, runFailureText),
+        };
+        richestAttemptRun = retryOptions.preferRicherRunResult(
+          richestAttemptRun || runWithAccumulatedStderr,
+          runWithAccumulatedStderr,
+        );
+
+        const lastAcquiredCredentialId = retryOptions.getLastAcquiredCredentialId();
+        if (
+          attemptRun.code === 0 &&
+          !attemptRun.timedOut &&
+          !retryableFailure &&
+          lastAcquiredCredentialId
+        ) {
+          retryOptions.clearTransientCredentialError(lastAcquiredCredentialId);
+        }
+
+        if (
+          lockRetryCount < LOCK_RETRY_MAX_RETRIES &&
+          options.session.status === "running" &&
+          !options.session.timedOut &&
+          retryOptions.isLockRetryableFailure(attemptRun)
+        ) {
+          accumulatedStderr = runWithAccumulatedStderr.stderr;
+          const delay =
+            LOCK_RETRY_DELAYS_MS[lockRetryCount] +
+            Math.floor(Math.random() * LOCK_RETRY_JITTER_MAX_MS);
+          const retryMessage =
+            `[pi-agent-router] Lock contention detected for delegated task ${options.session.id.slice(0, 8)} ` +
+            `(attempt ${lockRetryCount + 1}/${LOCK_RETRY_MAX_RETRIES + 1}). Retrying in ${delay}ms.`;
+
+          accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
+          options.session.stderr = accumulatedStderr;
+          retryOptions.onRetry?.({
+            kind: "lock",
+            attempt: lockRetryCount + 1,
+            delayMs: delay,
+            maxAttempts: LOCK_RETRY_MAX_RETRIES + 1,
+            message: retryMessage,
+            sessionId: options.session.id,
+          });
+          options.requestUiRender();
+          lockRetryCount += 1;
+
+          await retryOptions.sleep(delay);
+          continue;
+        }
+
+        if (
+          retryableFailure?.kind === "quota" &&
+          quotaRetryCount < QUOTA_RETRY_MAX_RETRIES &&
+          options.session.status === "running" &&
+          !options.session.timedOut
+        ) {
+          if (lastAcquiredCredentialId) {
+            retryOptions.reportQuotaCredentialError(
+              retryableFailure.message,
+              lastAcquiredCredentialId,
+            );
+          }
+          accumulatedStderr = runWithAccumulatedStderr.stderr;
+          quotaRetryCount += 1;
+          const delay =
+            QUOTA_RETRY_BASE_DELAY_MS * quotaRetryCount +
+            Math.floor(Math.random() * QUOTA_RETRY_JITTER_MAX_MS);
+          const retryMessage =
+            `[pi-agent-router] Quota/rate-limit error for delegated task ${options.session.id.slice(0, 8)} ` +
+            `(quota retry ${quotaRetryCount}/${QUOTA_RETRY_MAX_RETRIES}). Rotating credential and retrying in ${delay}ms.`;
+
+          accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
+          options.session.stderr = accumulatedStderr;
+          retryOptions.onRetry?.({
+            kind: "quota",
+            attempt: quotaRetryCount,
+            delayMs: delay,
+            maxAttempts: QUOTA_RETRY_MAX_RETRIES,
+            message: retryMessage,
+            sessionId: options.session.id,
+          });
+          options.requestUiRender();
+
+          await retryOptions.sleep(delay);
+          continue;
+        }
+
+        if (
+          retryableFailure?.kind === "transient" &&
+          transientRetryCount < TRANSIENT_RETRY_MAX_RETRIES &&
+          options.session.status === "running" &&
+          !options.session.timedOut
+        ) {
+          if (lastAcquiredCredentialId) {
+            retryOptions.reportTransientCredentialError(
+              retryableFailure.message,
+              lastAcquiredCredentialId,
+            );
+          }
+          accumulatedStderr = runWithAccumulatedStderr.stderr;
+          transientRetryCount += 1;
+          const delay =
+            TRANSIENT_RETRY_BASE_DELAY_MS * transientRetryCount +
+            Math.floor(Math.random() * TRANSIENT_RETRY_JITTER_MAX_MS);
+          const retryMessage =
+            `[pi-agent-router] Transient provider error for delegated task ${options.session.id.slice(0, 8)} ` +
+            `(retry ${transientRetryCount}/${TRANSIENT_RETRY_MAX_RETRIES}). Retrying with credential rotation in ${delay}ms.`;
+
+          accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
+          options.session.stderr = accumulatedStderr;
+          retryOptions.onRetry?.({
+            kind: "transient",
+            attempt: transientRetryCount,
+            delayMs: delay,
+            maxAttempts: TRANSIENT_RETRY_MAX_RETRIES,
+            message: retryMessage,
+            sessionId: options.session.id,
+          });
+          options.requestUiRender();
+
+          await retryOptions.sleep(delay);
+          continue;
+        }
+
+        const finalRun =
+          retryableFailure && runWithAccumulatedStderr.code === 0
+            ? { ...runWithAccumulatedStderr, code: 1 }
+            : runWithAccumulatedStderr;
+        finalizeRun(retryOptions.preferRicherRunResult(finalRun, richestAttemptRun));
+        return;
+      }
+    } catch (error) {
+      const message = retryOptions.getErrorMessage(error);
+      finalizeRun({
+        code: 1,
+        stdout: "",
+        stderr: options.mergeCapturedText(accumulatedStderr || options.session.stderr, message),
+        timedOut: Boolean(options.session.timedOut),
+        sessionPath: options.session.sessionPath || options.sessionPath,
+      });
+    }
+  };
+
+  return {
+    getAccumulatedStderr: () => accumulatedStderr,
+    recordActivity,
+    runWithRetry,
+  };
 }
 
 export function parseSubagentExecutionStatus(value: unknown): SubagentExecutionStatus {

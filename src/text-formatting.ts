@@ -11,11 +11,62 @@ import {
   TASK_HISTORY_SUMMARY_MAX_CHARS,
 } from "./constants";
 import { getPersistedActiveAgentName } from "./agent/agent-discovery";
+import { normalizeInputText } from "./input-normalization";
 import { sanitizeSubagentResultForDisplay } from "./output-sanitizer";
 import type { SubagentOutputDigest, AgentScope } from "./types";
 
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+const SUBAGENT_OUTPUT_ANALYSIS_CACHE_MAX_ENTRIES = 128;
+const subagentOutputAnalysisCache = new Map<string, SubagentOutputAnalysis>();
+
+export type SubagentOutputAnalysis = SubagentOutputDigest & {
+  toolCalls: number;
+  latestAction?: string;
+};
+
+function stripAnsiCodes(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function cacheSubagentOutputAnalysis(
+  cacheKey: string,
+  analysis: SubagentOutputAnalysis,
+): SubagentOutputAnalysis {
+  if (subagentOutputAnalysisCache.has(cacheKey)) {
+    subagentOutputAnalysisCache.delete(cacheKey);
+  }
+
+  subagentOutputAnalysisCache.set(cacheKey, analysis);
+  if (subagentOutputAnalysisCache.size > SUBAGENT_OUTPUT_ANALYSIS_CACHE_MAX_ENTRIES) {
+    const oldestKey = subagentOutputAnalysisCache.keys().next().value;
+    if (typeof oldestKey === "string") {
+      subagentOutputAnalysisCache.delete(oldestKey);
+    }
+  }
+
+  return analysis;
+}
+
+function inferSubagentLatestAction(text: string): string | undefined {
+  const lines = text.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = stripAnsiCodes(lines[index] || "");
+    const toolCallMatch = line.match(/^\s*→\s*(.+)$/);
+    if (!toolCallMatch || !toolCallMatch[1]) {
+      continue;
+    }
+
+    const invocation = normalizeInputText(stripAnsiCodes(toolCallMatch[1]));
+    if (invocation) {
+      return invocation;
+    }
+  }
+
+  return undefined;
+}
+
+function countSubagentToolCalls(text: string): number {
+  const matches = text.match(/^\s*→\s+/gm);
+  return matches ? matches.length : 0;
 }
 
 export function normalizeAgentScope(value: unknown): AgentScope {
@@ -243,21 +294,41 @@ export function extractToolCommandPreviews(text: string, maxCommands = 4): strin
   return commands;
 }
 
-export function buildSubagentOutputDigest(rawText: string | undefined): SubagentOutputDigest {
-  const sanitized = sanitizeSubagentResultForDisplay(rawText || "");
-  if (!sanitized) {
-    return {
-      summary: "(no output yet)",
-      commands: [],
-    };
+export function analyzeSubagentOutput(rawText: string | undefined): SubagentOutputAnalysis {
+  const cacheKey = typeof rawText === "string" ? rawText : "";
+  const cached = subagentOutputAnalysisCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
-  const summaryCandidate = extractSummaryFromMarkdownSections(sanitized) || extractFallbackSummary(sanitized) || sanitized;
+  const sanitized = sanitizeSubagentResultForDisplay(cacheKey);
+  if (!sanitized) {
+    return cacheSubagentOutputAnalysis(cacheKey, {
+      summary: "(no output yet)",
+      commands: [],
+      toolCalls: 0,
+    });
+  }
+
+  const summaryCandidate =
+    extractSummaryFromMarkdownSections(sanitized) ||
+    extractFallbackSummary(sanitized) ||
+    sanitized;
   const summary = summaryCandidate.replace(/\s+/g, " ").trim() || "(no output yet)";
 
-  return {
+  return cacheSubagentOutputAnalysis(cacheKey, {
     summary,
     commands: extractToolCommandPreviews(sanitized),
+    toolCalls: countSubagentToolCalls(sanitized),
+    latestAction: inferSubagentLatestAction(sanitized),
+  });
+}
+
+export function buildSubagentOutputDigest(rawText: string | undefined): SubagentOutputDigest {
+  const { summary, commands } = analyzeSubagentOutput(rawText);
+  return {
+    summary,
+    commands,
   };
 }
 

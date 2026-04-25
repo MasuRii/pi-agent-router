@@ -1,3 +1,9 @@
+/**
+ * Subagent output sanitization and extraction utilities.
+ */
+
+import { asRecord } from "./record-utils";
+
 const THINKING_BLOCK_PATTERN = /<(thinking|analysis|reasoning)>[\s\S]*?<\/\1>|```(?:thinking|analysis|reasoning)[\s\S]*?```/gi;
 const THINKING_LINE_PATTERN = /^\s*(thinking|analysis|reasoning)\s*:\s*/i;
 const WRAPPED_TASK_RESULT_PATTERN = /^<task_result>\s*([\s\S]*?)\s*<\/task_result>$/i;
@@ -6,14 +12,6 @@ const TRAILING_TASK_RESULT_PATTERN = /\s*<\/task_result>$/i;
 const STRUCTURED_VALUE_KEYS = ["result", "output", "value", "data"] as const;
 const DISPLAY_TEXT_KEYS = ["report", "markdown"] as const;
 const MAX_EXTRACTION_DEPTH = 8;
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-
-  return value as Record<string, unknown>;
-}
 
 function unwrapTaskResultEnvelope(rawText: string): string {
   const text = rawText.replace(/\r\n/g, "\n").trim();

@@ -7,7 +7,7 @@ import {
   MODEL_FOOTER_ICON,
 } from "../model-display";
 import {
-  buildSubagentOutputDigest,
+  analyzeSubagentOutput,
   extractTaskDescriptionFromDelegatedPrompt,
   truncatePreview,
 } from "../text-formatting";
@@ -16,8 +16,6 @@ import {
   colorizeWithHex,
   formatTaskActivityLabel,
   formatUsageWithoutCost,
-  inferLatestActionFromOutput,
-  inferToolCallsFromOutput,
   resolveTaskBorderColor,
   toTitleCaseWords,
 } from "./task-display-formatting";
@@ -137,14 +135,12 @@ export function renderSingleDelegationResult(options: {
   const running = status === "running" || status === "queued";
 
   const digestSource = getDigestSource(result, details, isPartial, status);
-  const digest = buildSubagentOutputDigest(digestSource);
+  const outputAnalysis = analyzeSubagentOutput(digestSource);
 
-  const latestAction = formatTaskActivityLabel(
-    inferLatestActionFromOutput(digestSource),
-  );
+  const latestAction = formatTaskActivityLabel(outputAnalysis.latestAction);
 
   const fallbackSummary =
-    (digest.summary || "(no output yet)").replace(/\s+/g, " ").trim() ||
+    (outputAnalysis.summary || "(no output yet)").replace(/\s+/g, " ").trim() ||
     "(no output yet)";
 
   const activity = running
@@ -156,12 +152,11 @@ export function renderSingleDelegationResult(options: {
     details?.delegatedTask ||
     "(none)";
 
-  const inferredToolCalls = inferToolCallsFromOutput(digestSource);
-  const toolCalls = Math.max(inferredToolCalls, digest.commands.length);
+  const toolCalls = Math.max(outputAnalysis.toolCalls, outputAnalysis.commands.length);
 
   const detailLines: string[] = [];
-  if (expanded && digest.commands.length > 0) {
-    for (const command of digest.commands.slice(0, 6)) {
+  if (expanded && outputAnalysis.commands.length > 0) {
+    for (const command of outputAnalysis.commands.slice(0, 6)) {
       detailLines.push(` ${truncatePreview(command, 160)}`);
     }
   }

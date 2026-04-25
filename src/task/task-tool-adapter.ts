@@ -121,11 +121,16 @@ export function renderTaskBatchPrompt(options: {
   }
 
   if (schemaText) {
-    sections.push("Expected Output Schema (JSON):");
+    sections.push("Optional Structured Output Schema (JSON, submit_result only):");
     sections.push("```json");
     sections.push(schemaText);
     sections.push("```");
-    sections.push("Return the final answer as JSON that matches this schema whenever possible.");
+    sections.push(
+      "Keep the normal human-facing TASK COMPLETION REPORT unless the assignment explicitly requires machine-readable output.",
+    );
+    sections.push(
+      "If you choose to return structured data via submit_result, it must match this schema.",
+    );
   }
 
   sections.push("");

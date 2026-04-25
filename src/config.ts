@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { getErrorMessage } from "./error-utils";
+
 export const PI_AGENT_ROUTER_EXTENSION_ID = "pi-agent-router";
 
 export interface PiAgentRouterConfig {
@@ -68,7 +70,7 @@ export function ensurePiAgentRouterConfig(
     writeFileSync(configPath, createDefaultConfigContent(), "utf-8");
     return { created: true };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = getErrorMessage(error);
     return {
       created: false,
       warning: `Failed to initialize pi-agent-router config at '${configPath}': ${message}`,
@@ -88,7 +90,7 @@ export function loadPiAgentRouterConfig(configPath = CONFIG_PATH): PiAgentRouter
       warning: ensureResult.warning,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = getErrorMessage(error);
     return {
       config: cloneDefaultConfig(),
       created: ensureResult.created,
@@ -103,7 +105,7 @@ export function ensurePiAgentRouterDebugDirectory(debugDir = DEBUG_DIR): string 
     mkdirSync(debugDir, { recursive: true });
     return undefined;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = getErrorMessage(error);
     return `Failed to create pi-agent-router debug directory '${debugDir}': ${message}`;
   }
 }

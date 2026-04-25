@@ -5,6 +5,7 @@
 import type { Message } from "@mariozechner/pi-ai";
 
 import type { SubagentJsonEventState, SubagentToolInvocation } from "../types";
+import { normalizeInputText } from "../input-normalization";
 import {
   SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
   SUBAGENT_TOOL_ARGUMENT_PREVIEW_MAX_CHARS,
@@ -12,11 +13,7 @@ import {
 } from "../constants";
 import { stripSubagentThinkingContent } from "../output-sanitizer";
 import { buildSessionPathFromHeader } from "./session-paths";
-import {
-  appendToBoundedTextCapture,
-  createBoundedTextCapture,
-  mergeUsageTotals,
-} from "./subagent-usage";
+import { mergeUsageTotals } from "./subagent-usage";
 import { truncatePreview } from "../text-formatting";
 import {
   formatHumanReadableToolInvocation,
@@ -145,24 +142,59 @@ export function appendBoundedOutputSection(
   section: string,
   maxChars = SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
 ): string {
-  const capture = createBoundedTextCapture();
-  appendToBoundedTextCapture(capture, currentOutput, maxChars);
-  appendToBoundedTextCapture(
-    capture,
-    currentOutput && section ? `\n${section}` : section,
-    maxChars,
-  );
-  return capture.value;
+  if (!Number.isFinite(maxChars) || maxChars <= 0) {
+    return "";
+  }
+
+  const boundedMaxChars = Math.max(1, Math.trunc(maxChars));
+  const nextOutput = currentOutput && section ? `${currentOutput}\n${section}` : currentOutput || section;
+  if (!nextOutput) {
+    return "";
+  }
+
+  return nextOutput.length <= boundedMaxChars
+    ? nextOutput
+    : nextOutput.slice(-boundedMaxChars);
 }
 
-function appendOutputSection(state: SubagentJsonEventState, section: string): void {
-  if (!section) {
+function refreshDerivedOutputState(state: SubagentJsonEventState): void {
+  state.outputText = appendBoundedOutputSection(
+    state.committedOutputText,
+    state.liveOutputText,
+    state.outputTextMaxChars,
+  );
+  state.latestToolCall = state.liveLatestToolCall || state.committedLatestToolCall;
+}
+
+function clearLiveMessageState(state: SubagentJsonEventState): void {
+  state.liveOutputText = "";
+  state.liveLatestToolCall = undefined;
+  refreshDerivedOutputState(state);
+}
+
+function setLiveMessageState(state: SubagentJsonEventState, message: Message): void {
+  const details = parseMessageDetails(message);
+  state.liveOutputText = details.outputSections.join("\n").trim();
+  state.liveLatestToolCall = details.latestToolCall;
+  refreshDerivedOutputState(state);
+}
+
+function appendOutputSections(
+  state: SubagentJsonEventState,
+  sections: readonly string[],
+): void {
+  if (sections.length === 0) {
     return;
   }
 
-  state.outputText = appendBoundedOutputSection(
-    state.outputText,
-    section,
+  const combinedSection = sections.join("\n").trim();
+  if (!combinedSection) {
+    return;
+  }
+
+  state.committedOutputText = appendBoundedOutputSection(
+    state.committedOutputText,
+    combinedSection,
     state.outputTextMaxChars,
   );
 }
@@ -288,17 +320,17 @@ function appendMessageToState(message: Message, state: SubagentJsonEventState): 
   retainBoundedMessage(state, message);
 
   const details = parseMessageDetails(message);
-  for (const section of details.outputSections) {
-    appendOutputSection(state, section);
-  }
+  appendOutputSections(state, details.outputSections);
 
   for (const toolCall of details.toolCalls) {
     recordToolInvocation(state, toolCall);
   }
 
   if (details.latestToolCall) {
-    state.latestToolCall = details.latestToolCall;
+    state.committedLatestToolCall = details.latestToolCall;
   }
+
+  refreshDerivedOutputState(state);
 }
 
 export function getSubagentToolInvocationsFromState(state: SubagentJsonEventState): SubagentToolInvocation[] {
@@ -338,7 +370,12 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     return;
   }
 
-  if (eventType === "message_end" || eventType === "tool_result_end") {
+  if (
+    eventType === "message_start" ||
+    eventType === "message_update" ||
+    eventType === "message_end" ||
+    eventType === "tool_result_end"
+  ) {
     const messageValue = eventRecord.message;
     if (!messageValue || typeof messageValue !== "object" || Array.isArray(messageValue)) {
       return;
@@ -350,6 +387,25 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     }
 
     const message = messageValue as Message;
+
+    if (eventType === "message_start") {
+      if (message.role === "assistant") {
+        setLiveMessageState(state, message);
+      }
+      return;
+    }
+
+    if (eventType === "message_update") {
+      if (message.role === "assistant") {
+        setLiveMessageState(state, message);
+      }
+      return;
+    }
+
+    if (eventType === "message_end" && message.role === "assistant") {
+      clearLiveMessageState(state);
+    }
+
     appendMessageToState(message, state);
 
     if (eventType === "message_end" && message.role === "assistant") {
@@ -516,9 +572,7 @@ export function sameToolInvocations(
   return true;
 }
 
-export function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
+export { normalizeInputText };
 
 export {
   formatHumanReadableToolInvocation,

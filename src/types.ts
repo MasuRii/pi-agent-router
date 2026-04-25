@@ -25,6 +25,28 @@ export type Agent = {
   systemPrompt: string;
 };
 
+export type CacheDebugCounters = {
+  hits: number;
+  misses: number;
+  invalidations: number;
+  evictions: number;
+  size: number;
+  maxEntries: number;
+};
+
+export type AgentDiscoveryCacheSnapshot = {
+  directory: CacheDebugCounters;
+  discovery: CacheDebugCounters;
+};
+
+export type TaskControlsCacheSnapshot = CacheDebugCounters;
+
+export type SubagentSessionRetentionSnapshot = {
+  evictions: number;
+  retainedCompletedCount: number;
+  maxCompletedSessions: number;
+};
+
 export type SubagentTaskItemInput = {
   agent: string;
   task: string;
@@ -151,10 +173,14 @@ export type SubagentJsonEventState = {
   messageRetentionMaxChars: number;
   droppedMessageCount: number;
   outputText: string;
+  committedOutputText: string;
+  liveOutputText: string;
   outputTextMaxChars: number;
   usage: SubagentUsage;
   malformedEventCount: number;
   latestToolCall?: string;
+  committedLatestToolCall?: string;
+  liveLatestToolCall?: string;
   sessionPath?: string;
   sessionDir?: string;
   toolInvocationMap: Map<string, SubagentToolInvocation>;

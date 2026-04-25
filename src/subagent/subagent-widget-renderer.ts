@@ -2,7 +2,7 @@ import {
   colorizeWithHex,
   normalizeHexColor,
 } from "../task/task-display-formatting";
-import { getCircularSpinnerFrame } from "../progress-spinner";
+import type { SubagentWidgetIcons } from "./subagent-widget-icons";
 
 type WidgetTheme = {
   fg(color: string, text: string): string;
@@ -59,13 +59,13 @@ function pluralize(count: number, singular: string, plural = `${singular}s`): st
   return count === 1 ? singular : plural;
 }
 
-function getStatusIcon(status: string, runningIcon: string): string {
+function getStatusIcon(status: string, icons: SubagentWidgetIcons): string {
   if (status === "running") {
-    return runningIcon;
+    return icons.running;
   }
 
   if (status === "queued") {
-    return "⏸";
+    return icons.queued;
   }
 
   if (status === "finished") {
@@ -234,7 +234,7 @@ function formatSummarySegments(
   options: {
     includeFailedNames: boolean;
     includeAbortedNames: boolean;
-    runningIcon: string;
+    icons: SubagentWidgetIcons;
   },
 ): string[] {
   const segments: string[] = [];
@@ -244,7 +244,7 @@ function formatSummarySegments(
       formatStatusSegment(
         theme,
         "warning",
-        options.runningIcon,
+        options.icons.running,
         `${buckets.running.length} running`,
       ),
     );
@@ -294,7 +294,7 @@ function formatSummarySegments(
       formatStatusSegment(
         theme,
         "warning",
-        "⏸",
+        options.icons.queued,
         `${buckets.queued.length} queued`,
       ),
     );
@@ -310,10 +310,10 @@ function formatLiveSessionDetail(
   now: number,
   getStatusDisplay: (status: string) => SubagentWidgetStatusDisplay,
   truncate: (text: string, width: number, overflowMarker: string) => string,
-  options: ActiveDetailStyle & { runningIcon: string },
+  options: ActiveDetailStyle & { icons: SubagentWidgetIcons },
 ): string {
   const statusDisplay = getStatusDisplay(session.status);
-  const icon = getStatusIcon(session.status, options.runningIcon);
+  const icon = getStatusIcon(session.status, options.icons);
   const label = formatAgentLabel(
     session.agent,
     session.agentColor,
@@ -342,7 +342,7 @@ function buildActiveDetailSegments(
   getStatusDisplay: (status: string) => SubagentWidgetStatusDisplay,
   truncate: (text: string, width: number, overflowMarker: string) => string,
   maxShown: number,
-  options: ActiveDetailStyle & { runningIcon: string },
+  options: ActiveDetailStyle & { icons: SubagentWidgetIcons },
 ): string[] {
   if (sessions.length === 0) {
     return [];
@@ -391,7 +391,7 @@ function buildCompletedSummaryCandidates(
 function buildSummaryVariants(
   theme: WidgetTheme,
   buckets: SessionBuckets,
-  runningIcon: string,
+  icons: SubagentWidgetIcons,
 ): string[] {
   const variants: string[] = [];
   const seen = new Set<string>();
@@ -402,7 +402,7 @@ function buildSummaryVariants(
       formatSummarySegments(theme, buckets, {
         includeFailedNames: true,
         includeAbortedNames: true,
-        runningIcon,
+        icons,
       }),
     ),
     joinSegments(
@@ -410,7 +410,7 @@ function buildSummaryVariants(
       formatSummarySegments(theme, buckets, {
         includeFailedNames: false,
         includeAbortedNames: false,
-        runningIcon,
+        icons,
       }),
     ),
   ]) {
@@ -434,6 +434,7 @@ export function renderSubagentWidgetLines(options: {
   truncate: (text: string, width: number, overflowMarker: string) => string;
   maxShown?: number;
   now?: number;
+  icons: SubagentWidgetIcons;
 }): string[] {
   const { sessions, width, theme, formatDuration, getStatusDisplay, truncate } = options;
   if (sessions.length === 0) {
@@ -450,7 +451,7 @@ export function renderSubagentWidgetLines(options: {
     options.maxShown === undefined
       ? sessions.length
       : Math.max(1, Math.trunc(options.maxShown));
-  const runningIcon = getCircularSpinnerFrame(now);
+  const icons = options.icons;
   const buckets = buildSessionBuckets(sessions);
   const activeSessions = [...buckets.running, ...buckets.queued];
   const maxVisibleActiveSessions = Math.min(activeSessions.length, maxShown);
@@ -487,7 +488,7 @@ export function renderSubagentWidgetLines(options: {
       pushCandidate(` ${candidate}`);
     }
   } else {
-    const summaryVariants = buildSummaryVariants(theme, buckets, runningIcon);
+    const summaryVariants = buildSummaryVariants(theme, buckets, icons);
 
     if (summaryVariants.length > 0 && hasActiveSessions && maxVisibleActiveSessions > 0) {
       for (let visibleCount = maxVisibleActiveSessions; visibleCount >= 1; visibleCount -= 1) {
@@ -502,7 +503,7 @@ export function renderSubagentWidgetLines(options: {
             visibleCount,
             {
               ...detailStyle,
-              runningIcon,
+              icons,
             },
           );
 
@@ -524,7 +525,7 @@ export function renderSubagentWidgetLines(options: {
     }
 
     if (hasActiveSessions) {
-      const activeIcon = buckets.running.length > 0 ? runningIcon : "⏸";
+      const activeIcon = buckets.running.length > 0 ? icons.running : icons.queued;
       const activeCount = activeSessions.length;
       pushCandidate(
         ` ${formatStatusSegment(

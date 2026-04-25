@@ -1,6 +1,5 @@
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
+import { normalizeInputText } from "../input-normalization";
+import { analyzeSubagentOutput } from "../text-formatting";
 
 const AGENT_BORDER_COLOR_FALLBACK = new Map<string, string>([
   ["architect", "#50E3C2"],
@@ -181,34 +180,11 @@ export function toTitleCaseWords(value: string): string {
 }
 
 export function inferToolCallsFromOutput(output: string | undefined): number {
-  if (!output) {
-    return 0;
-  }
-
-  const matches = output.match(/^\s*→\s+/gm);
-  return matches ? matches.length : 0;
+  return analyzeSubagentOutput(output).toolCalls;
 }
 
 export function inferLatestActionFromOutput(output: string | undefined): string | undefined {
-  if (!output) {
-    return undefined;
-  }
-
-  const lines = output.replace(/\r\n/g, "\n").split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = stripAnsiCodes(lines[index] || "");
-    const toolCallMatch = line.match(/^\s*→\s*(.+)$/);
-    if (!toolCallMatch || !toolCallMatch[1]) {
-      continue;
-    }
-
-    const invocation = normalizeInputText(stripAnsiCodes(toolCallMatch[1]));
-    if (invocation) {
-      return invocation;
-    }
-  }
-
-  return undefined;
+  return analyzeSubagentOutput(output).latestAction;
 }
 
 export function formatTaskActivityLabel(invocation: string | undefined): string | undefined {

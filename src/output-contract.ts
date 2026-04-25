@@ -1,24 +1,34 @@
 import type { Message } from "@mariozechner/pi-ai";
 
-import { extractHumanReadableSubagentOutput } from "./output-sanitizer";
-import { getSubagentOutputFromMessages, getToolCallArguments, normalizeInputText } from "./subagent/subagent-output";
+import {
+  extractHumanReadableSubagentOutput,
+  sanitizeSubagentResultForDisplay,
+} from "./output-sanitizer";
+import { asRecord } from "./record-utils";
+import {
+  getSubagentOutputFromMessages,
+  getToolCallArguments,
+  normalizeInputText,
+} from "./subagent/subagent-output";
 
 export type OutputContractStrictness = "compat" | "strict";
+
+export type DelegatedOutputSource =
+  | "submit_result"
+  | "streamed_output"
+  | "assistant_output"
+  | "empty";
+
+export type DelegatedOutputFormat = "structured" | "human_text" | "empty";
 
 export type OutputContractValidationResult = {
   outputText: string;
   submitResult?: unknown;
   warnings: string[];
   error?: string;
+  source: DelegatedOutputSource;
+  format: DelegatedOutputFormat;
 };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-
-  return value as Record<string, unknown>;
-}
 
 function parseJsonString(value: string): unknown {
   const trimmed = value.trim();
@@ -37,6 +47,14 @@ function parseJsonString(value: string): unknown {
   return value;
 }
 
+function normalizeSubmitResultValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return parseJsonString(value);
+  }
+
+  return value;
+}
+
 function extractSubmitResultValue(argumentsValue: unknown): unknown {
   if (typeof argumentsValue === "string") {
     return parseJsonString(argumentsValue);
@@ -48,23 +66,23 @@ function extractSubmitResultValue(argumentsValue: unknown): unknown {
   }
 
   if ("result" in record) {
-    return record.result;
+    return normalizeSubmitResultValue(record.result);
   }
 
   if ("output" in record) {
-    return record.output;
+    return normalizeSubmitResultValue(record.output);
   }
 
   if ("value" in record) {
-    return record.value;
+    return normalizeSubmitResultValue(record.value);
   }
 
   if ("data" in record) {
-    return record.data;
+    return normalizeSubmitResultValue(record.data);
   }
 
   if ("report" in record) {
-    return record.report;
+    return normalizeSubmitResultValue(record.report);
   }
 
   return record;
@@ -73,7 +91,7 @@ function extractSubmitResultValue(argumentsValue: unknown): unknown {
 function findLatestSubmitResult(messages: readonly Message[]): unknown {
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const message = messages[messageIndex];
-    if (!message || message.role !== "assistant") {
+    if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
       continue;
     }
 
@@ -112,6 +130,32 @@ function formatOutputValue(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function resolveFallbackOutput(messages: readonly Message[], fallbackOutputText: string | undefined): {
+  outputText: string;
+  source: DelegatedOutputSource;
+} {
+  const sanitizedFallback = sanitizeSubagentResultForDisplay(fallbackOutputText || "").trim();
+  if (sanitizedFallback) {
+    return {
+      outputText: sanitizedFallback,
+      source: "streamed_output",
+    };
+  }
+
+  const assistantOutput = getSubagentOutputFromMessages(messages).trim();
+  if (assistantOutput) {
+    return {
+      outputText: assistantOutput,
+      source: "assistant_output",
+    };
+  }
+
+  return {
+    outputText: "",
+    source: "empty",
+  };
 }
 
 type SchemaValidationIssue = {
@@ -286,57 +330,80 @@ function formatValidationIssues(issues: readonly SchemaValidationIssue[]): strin
   return issues.map((entry) => `${entry.path} ${entry.message}`).join("; ");
 }
 
-export function validateSubagentOutputContract(options: {
-  messages: readonly Message[];
+export function normalizeDelegatedOutput(options: {
+  messages?: readonly Message[];
+  fallbackOutputText?: string;
   schema?: unknown;
   strictness?: OutputContractStrictness;
 }): OutputContractValidationResult {
+  const messages = Array.isArray(options.messages) ? options.messages : [];
   const strictness = options.strictness === "strict" ? "strict" : "compat";
   const warnings: string[] = [];
 
-  const submitResult = findLatestSubmitResult(options.messages);
+  const submitResult = findLatestSubmitResult(messages);
   const hasSubmitResult = submitResult !== undefined;
   const hasSchema = options.schema !== undefined && options.schema !== null;
+  const fallback = resolveFallbackOutput(messages, options.fallbackOutputText);
 
-  if (!hasSubmitResult && hasSchema) {
-    warnings.push("Subagent did not call submit_result; fell back to assistant output text.");
+  let outputText = fallback.outputText;
+  let source = fallback.source;
+  let format: DelegatedOutputFormat = fallback.outputText ? "human_text" : "empty";
+
+  if (hasSubmitResult) {
+    outputText = formatOutputValue(submitResult);
+    source = "submit_result";
+    format = "structured";
   }
 
   if (hasSubmitResult && submitResult === null) {
     warnings.push("Subagent submit_result payload was null.");
   }
 
-  if (hasSubmitResult && hasSchema) {
-    const issues = validateSchemaNode(submitResult, options.schema, "$result");
-    if (issues.length > 0) {
-      warnings.push(`submit_result does not satisfy schema: ${formatValidationIssues(issues)}`);
+  if (hasSchema) {
+    if (!hasSubmitResult) {
+      warnings.push(
+        "Structured output schema was provided, but the subagent returned a human-readable report instead of submit_result. Preserved the report text.",
+      );
       if (strictness === "strict") {
         return {
-          outputText: formatOutputValue(submitResult),
-          submitResult,
+          outputText,
           warnings,
-          error: "Delegated output schema validation failed in strict mode.",
+          error: "Delegated output must call submit_result when schema validation is strict.",
+          source,
+          format,
         };
+      }
+    } else {
+      const issues = validateSchemaNode(submitResult, options.schema, "$result");
+      if (issues.length > 0) {
+        warnings.push(`submit_result does not satisfy schema: ${formatValidationIssues(issues)}`);
+        if (strictness === "strict") {
+          return {
+            outputText,
+            submitResult,
+            warnings,
+            error: "Delegated output schema validation failed in strict mode.",
+            source,
+            format,
+          };
+        }
       }
     }
   }
-
-  if (!hasSubmitResult && hasSchema && strictness === "strict") {
-    return {
-      outputText: getSubagentOutputFromMessages(options.messages),
-      warnings,
-      error: "Delegated output must call submit_result when schema validation is strict.",
-    };
-  }
-
-  const fallbackOutput = getSubagentOutputFromMessages(options.messages);
-  const outputText = hasSubmitResult
-    ? formatOutputValue(submitResult)
-    : fallbackOutput;
 
   return {
     outputText,
     submitResult,
     warnings,
+    source,
+    format,
   };
+}
+
+export function validateSubagentOutputContract(options: {
+  messages: readonly Message[];
+  schema?: unknown;
+  strictness?: OutputContractStrictness;
+}): OutputContractValidationResult {
+  return normalizeDelegatedOutput(options);
 }

@@ -121,8 +121,28 @@ declare module "@mariozechner/pi-coding-agent" {
     on?(...args: any[]): any;
     registerCommand?(...args: any[]): any;
     registerProvider?(...args: any[]): any;
+    registerTool?(tool: any): void;
   }
 
+  export interface ToolDefinition<TParams = any, TDetails = any, TState = any> {
+    name: string;
+    label?: string;
+    description?: string;
+    promptSnippet?: string;
+    promptGuidelines?: string[];
+    renderShell?: string;
+    parameters: TParams;
+    prepareArguments?: (...args: any[]) => any;
+    execute?: (...args: any[]) => any;
+    renderCall?: (...args: any[]) => any;
+    renderResult?: (...args: any[]) => any;
+  }
+
+  export function defineTool<TParams, TDetails = unknown, TState = any>(
+    tool: ToolDefinition<TParams, TDetails, TState>
+  ): ToolDefinition<TParams, TDetails, TState>;
+
+  export function getAgentDir(): string;
   export function getMarkdownTheme(): any;
   export function getSettingsListTheme(theme?: Theme): any;
 }
@@ -167,6 +187,6 @@ declare module "@mariozechner/pi-tui" {
   export function wrapTextWithAnsi(...args: any[]): any;
 }
 
-declare module "@sinclair/typebox" {
+declare module "typebox" {
   export const Type: any;
 }

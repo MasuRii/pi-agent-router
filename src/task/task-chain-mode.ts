@@ -1,12 +1,10 @@
+import { normalizeInputText } from "../input-normalization";
+
 export type TaskExecutionMode = "parallel" | "chain";
 
 const DEFAULT_TASK_EXECUTION_MODE: TaskExecutionMode = "parallel";
 const CHAIN_PREVIOUS_OUTPUT_MAX_CHARS = 8_000;
 const PREVIOUS_PLACEHOLDER_TOKEN = "{previous}";
-
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
 
 export function resolveTaskExecutionMode(value: unknown): {
   mode: TaskExecutionMode;

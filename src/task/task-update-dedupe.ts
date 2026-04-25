@@ -1,5 +1,5 @@
 import { SPINNER_RENDER_INTERVAL_MS } from "../progress-spinner";
-import { truncatePreview } from "../text-formatting";
+import { analyzeSubagentOutput, truncatePreview } from "../text-formatting";
 
 import type { SubagentExecutionDetails, SubagentExecutionStatus } from "../types";
 import { buildParallelResultActivity } from "./parallel-result-activity";
@@ -89,11 +89,13 @@ function getOutputModeFromArgv(argv: readonly string[] | undefined): string | un
 // long write/edit/read bursts only refresh partial task output when the
 // visible activity meaning changes or heartbeat cadence allows a replay.
 function buildRenderedActivityFingerprint(result: ParallelResult): string {
+  const outputAnalysis = analyzeSubagentOutput(result.output);
   const activity = buildParallelResultActivity({
     status: result.status,
     latestToolCall: result.latestToolCall,
+    latestOutputAction: outputAnalysis.latestAction,
     output: result.output,
-    resultSummary: result.resultSummary,
+    resultSummary: result.resultSummary || outputAnalysis.summary,
     isPartial: true,
   });
 

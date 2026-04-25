@@ -3,7 +3,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -11,8 +12,9 @@ import {
   getWeeklyQuotaCooldownMs,
   TRANSIENT_COOLDOWN_BASE_MS,
   TRANSIENT_COOLDOWN_MAX_MS,
-} from "../../../pi-multi-auth/balancer/credential-backoff.js";
+} from "../../../pi-multi-auth/src/balancer/credential-backoff.js";
 import { piAgentRouterDebugLogger } from "../debug-logger";
+import { getErrorMessage } from "../error-utils";
 
 /**
  * Core providers that are always available (hardcoded fallback).
@@ -30,20 +32,44 @@ const CORE_PROVIDER_ENV_KEYS: Record<string, string> = {
  * Undefined means not yet loaded, null means load failed, object means loaded.
  */
 let cachedProviderEnvKeys: Record<string, string> | null | undefined = undefined;
+let providerEnvKeysLoadPromise: Promise<Record<string, string> | null> | undefined;
+let providerEnvKeysCacheRevision = 0;
 
 /**
  * Get the path to models.json file.
- * Resolves ~/.pi/agent/models.json (same logic as pi core).
+ * Resolves the active Pi agent runtime models.json path (default: ~/.pi/agent/models.json; respects PI_CODING_AGENT_DIR).
  */
 function getModelsJsonPath(): string {
-  const agentDir = process.env.PI_CODING_AGENT_DIR
-    ? (process.env.PI_CODING_AGENT_DIR === "~"
-        ? homedir()
-        : process.env.PI_CODING_AGENT_DIR.startsWith("~/")
-          ? join(homedir(), process.env.PI_CODING_AGENT_DIR.slice(2))
-          : process.env.PI_CODING_AGENT_DIR)
-    : join(homedir(), ".pi", "agent");
-  return join(agentDir, "models.json");
+  return join(getAgentDir(), "models.json");
+}
+
+function extractProviderEnvKeys(parsed: unknown): Record<string, string> | null {
+  if (!parsed || typeof parsed !== "object" || !("providers" in parsed)) {
+    return null;
+  }
+
+  const providers = (parsed as { providers: Record<string, unknown> }).providers;
+  if (!providers || typeof providers !== "object") {
+    return null;
+  }
+
+  const envKeys: Record<string, string> = {};
+
+  for (const [providerId, providerConfig] of Object.entries(providers)) {
+    if (
+      providerConfig &&
+      typeof providerConfig === "object" &&
+      "apiKey" in providerConfig &&
+      typeof (providerConfig as { apiKey: unknown }).apiKey === "string"
+    ) {
+      const apiKeyEnv = (providerConfig as { apiKey: string }).apiKey.trim();
+      if (apiKeyEnv) {
+        envKeys[providerId] = apiKeyEnv;
+      }
+    }
+  }
+
+  return Object.keys(envKeys).length > 0 ? envKeys : null;
 }
 
 /**
@@ -59,36 +85,24 @@ function loadProviderEnvKeysFromModelsJson(): Record<string, string> | null {
 
     const content = readFileSync(modelsPath, "utf-8");
     const parsed = JSON.parse(content) as unknown;
-
-    if (!parsed || typeof parsed !== "object" || !("providers" in parsed)) {
-      return null;
-    }
-
-    const providers = (parsed as { providers: Record<string, unknown> }).providers;
-    if (!providers || typeof providers !== "object") {
-      return null;
-    }
-
-    const envKeys: Record<string, string> = {};
-
-    for (const [providerId, providerConfig] of Object.entries(providers)) {
-      if (
-        providerConfig &&
-        typeof providerConfig === "object" &&
-        "apiKey" in providerConfig &&
-        typeof (providerConfig as { apiKey: unknown }).apiKey === "string"
-      ) {
-        const apiKeyEnv = (providerConfig as { apiKey: string }).apiKey.trim();
-        if (apiKeyEnv) {
-          envKeys[providerId] = apiKeyEnv;
-        }
-      }
-    }
-
-    return Object.keys(envKeys).length > 0 ? envKeys : null;
+    return extractProviderEnvKeys(parsed);
   } catch {
     return null;
   }
+}
+
+async function loadProviderEnvKeysFromModelsJsonAsync(): Promise<Record<string, string> | null> {
+  try {
+    const content = await readFile(getModelsJsonPath(), "utf-8");
+    const parsed = JSON.parse(content) as unknown;
+    return extractProviderEnvKeys(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function mergeProviderEnvKeys(dynamicKeys: Record<string, string> | null | undefined): Record<string, string> {
+  return dynamicKeys ? { ...CORE_PROVIDER_ENV_KEYS, ...dynamicKeys } : { ...CORE_PROVIDER_ENV_KEYS };
 }
 
 /**
@@ -101,13 +115,36 @@ function getProviderEnvKeys(): Record<string, string> {
     cachedProviderEnvKeys = dynamicKeys;
   }
 
-  // Merge core (hardcoded fallback) with dynamic (from models.json)
-  // Dynamic keys take precedence for explicitly configured providers
-  if (cachedProviderEnvKeys) {
-    return { ...CORE_PROVIDER_ENV_KEYS, ...cachedProviderEnvKeys };
+  return mergeProviderEnvKeys(cachedProviderEnvKeys);
+}
+
+async function getProviderEnvKeysAsync(): Promise<Record<string, string>> {
+  if (cachedProviderEnvKeys !== undefined) {
+    return mergeProviderEnvKeys(cachedProviderEnvKeys);
   }
 
-  return { ...CORE_PROVIDER_ENV_KEYS };
+  if (!providerEnvKeysLoadPromise) {
+    const cacheRevision = providerEnvKeysCacheRevision;
+    providerEnvKeysLoadPromise = (async () => {
+      const dynamicKeys = await loadProviderEnvKeysFromModelsJsonAsync();
+      if (cacheRevision === providerEnvKeysCacheRevision) {
+        cachedProviderEnvKeys = dynamicKeys;
+      }
+      return dynamicKeys;
+    })();
+  }
+
+  try {
+    return mergeProviderEnvKeys(await providerEnvKeysLoadPromise);
+  } finally {
+    providerEnvKeysLoadPromise = undefined;
+  }
+}
+
+export function resetProviderEnvKeyCacheState(): void {
+  providerEnvKeysCacheRevision += 1;
+  cachedProviderEnvKeys = undefined;
+  providerEnvKeysLoadPromise = undefined;
 }
 
 /**
@@ -141,7 +178,30 @@ const PROVIDER_ID_ALIASES: Record<string, string> = {
   gemini: "google-gemini-cli",
 };
 
+const DIRECT_ENV_DELEGATION_PROVIDER_IDS = new Set([
+  "amazon-bedrock",
+  "anthropic",
+  "azure-openai-responses",
+  "cerebras",
+  "github-copilot",
+  "google",
+  "google-vertex",
+  "groq",
+  "huggingface",
+  "kimi-coding",
+  "minimax",
+  "minimax-cn",
+  "mistral",
+  "openai",
+  "opencode",
+  "opencode-go",
+  "openrouter",
+  "xai",
+  "zai",
+]);
+
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 1_500;
+const FALLBACK_ENV_ACQUIRE_TIMEOUT_MS = 250;
 
 type KeyLease = {
   credentialId: string;
@@ -152,10 +212,27 @@ export type GlobalKeyDistributor = {
   acquireForSubagent: (
     sessionId: string,
     providerId: string,
-    options?: { timeoutMs?: number; modelId?: string },
+    options?: {
+      timeoutMs?: number;
+      modelId?: string;
+      signal?: AbortSignal;
+      parentSessionId?: string;
+    },
   ) => Promise<KeyLease | string | null | undefined>;
   releaseFromSubagent: (sessionId: string) => void;
+  releaseLightweightSessionLeases?: (parentSessionId: string, providerId?: string) => void;
+  getLeaseForSession?: (
+    sessionId: string,
+  ) => Promise<KeyLease | null | undefined> | KeyLease | null | undefined;
   getKeyForSession?: (sessionId: string) => string | null | undefined;
+  getMetrics?: () => unknown;
+  shouldBypassDelegatedSubagentAcquisition?: (
+    providerId: string,
+    options?: {
+      modelId?: string;
+      signal?: AbortSignal;
+    },
+  ) => Promise<boolean> | boolean;
   applyCooldown?: (
     credentialId: string,
     durationMs: number,
@@ -236,6 +313,28 @@ function parseModelIdFromReference(modelReference: string | undefined): string |
   return modelId || undefined;
 }
 
+function hasUsableEnvValue(env: NodeJS.ProcessEnv, envKey: string | undefined): boolean {
+  if (!envKey) {
+    return false;
+  }
+
+  const value = env[envKey];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function resolveAcquireTimeoutMs(
+  requestedTimeoutMs: number | undefined,
+  hasParentFallbackCredential: boolean,
+): number {
+  if (Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0) {
+    return Math.max(1, Math.trunc(requestedTimeoutMs));
+  }
+
+  return hasParentFallbackCredential
+    ? FALLBACK_ENV_ACQUIRE_TIMEOUT_MS
+    : DEFAULT_ACQUIRE_TIMEOUT_MS;
+}
+
 function getGlobalKeyDistributor(): GlobalKeyDistributor | null {
   const globalScope = globalThis as GlobalWithKeyDistributor;
   return globalScope.__piMultiAuthKeyDistributor ?? null;
@@ -313,17 +412,85 @@ export function detectSubagentProviderId(options: {
   return undefined;
 }
 
+export async function detectSubagentProviderIdAsync(options: {
+  requestedModel?: string;
+  activeProviderId?: string;
+  parentEnv?: NodeJS.ProcessEnv;
+}): Promise<string | undefined> {
+  const providerEnvKeys = await getProviderEnvKeysAsync();
+
+  const modelProvider = parseProviderFromModelReference(options.requestedModel);
+  if (modelProvider !== undefined) {
+    return providerEnvKeys[modelProvider] ? modelProvider : undefined;
+  }
+
+  const activeProvider = normalizeProviderId(options.activeProviderId);
+  if (activeProvider && providerEnvKeys[activeProvider]) {
+    return activeProvider;
+  }
+
+  const parentEnv = options.parentEnv;
+  if (!parentEnv) {
+    return undefined;
+  }
+
+  for (const [providerId, envKey] of Object.entries(providerEnvKeys)) {
+    const candidate = parentEnv[envKey];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return providerId;
+    }
+  }
+
+  return undefined;
+}
+
+export async function resolveProviderEnvKeyAsync(
+  providerId: string | undefined,
+): Promise<string | undefined> {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!normalizedProviderId) {
+    return undefined;
+  }
+
+  const providerEnvKeys = await getProviderEnvKeysAsync();
+  return providerEnvKeys[normalizedProviderId];
+}
+
+export async function hasParentProviderCredentialEnvAsync(
+  providerId: string | undefined,
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): Promise<boolean> {
+  const envKey = await resolveProviderEnvKeyAsync(providerId);
+  return hasUsableEnvValue(parentEnv, envKey);
+}
+
+export async function shouldSkipDelegatedMultiAuthForProviderAsync(
+  providerId: string | undefined,
+): Promise<boolean> {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!normalizedProviderId) {
+    return false;
+  }
+
+  const envKey = await resolveProviderEnvKeyAsync(normalizedProviderId);
+  if (typeof envKey !== "string" || envKey.trim().length === 0) {
+    return false;
+  }
+
+  return DIRECT_ENV_DELEGATION_PROVIDER_IDS.has(normalizedProviderId);
+}
+
 export async function tryAcquireKeyForSubagent(
   sessionId: string,
   providerId: string | undefined,
-  options: { timeoutMs?: number; requestedModel?: string } = {},
+  options: { timeoutMs?: number; requestedModel?: string; parentSessionId?: string } = {},
 ): Promise<SubagentKeyLease | null> {
   const normalizedProviderId = normalizeProviderId(providerId);
   if (!normalizedProviderId) {
     return null;
   }
 
-  const providerEnvKeys = getProviderEnvKeys();
+  const providerEnvKeys = await getProviderEnvKeysAsync();
   const envKey = providerEnvKeys[normalizedProviderId];
   if (!envKey) {
     return null;
@@ -334,22 +501,67 @@ export async function tryAcquireKeyForSubagent(
     return null;
   }
 
-  const effectiveTimeoutMs =
-    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-      ? Math.max(1, Math.trunc(options.timeoutMs))
-      : DEFAULT_ACQUIRE_TIMEOUT_MS;
+  const hasParentFallbackCredential = hasUsableEnvValue(process.env, envKey);
+  const effectiveTimeoutMs = resolveAcquireTimeoutMs(
+    options.timeoutMs,
+    hasParentFallbackCredential,
+  );
   const modelId = parseModelIdFromReference(options.requestedModel);
+  const abortController = new AbortController();
+  const startedAt = Date.now();
 
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutSentinel = Symbol("subagent-key-acquire-timeout");
 
   try {
+    const existingLease = resolveApiKeyFromLease(
+      await distributor.getLeaseForSession?.(sessionId),
+      distributor,
+      sessionId,
+    );
+    if (existingLease) {
+      void piAgentRouterDebugLogger.info("subagent.key_reused", {
+        credentialId: existingLease.credentialId,
+        message:
+          `[pi-agent-router] Reused distributed ${normalizedProviderId} key (${existingLease.credentialId}) for subagent ${sessionId.slice(0, 8)}.`,
+        providerId: normalizedProviderId,
+        sessionId,
+        acquisitionLatencyMs: Date.now() - startedAt,
+      });
+      return {
+        providerId: normalizedProviderId,
+        envKey,
+        credentialId: existingLease.credentialId,
+        apiKey: existingLease.apiKey,
+      };
+    }
+
+    const shouldBypassDelegatedAcquisition = await distributor.shouldBypassDelegatedSubagentAcquisition?.(
+      normalizedProviderId,
+      {
+        modelId,
+        signal: abortController.signal,
+      },
+    );
+    if (shouldBypassDelegatedAcquisition) {
+      void piAgentRouterDebugLogger.info("subagent.key_acquire_bypassed", {
+        message:
+          `[pi-agent-router] Skipped distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because only one eligible credential remains.`,
+        providerId: normalizedProviderId,
+        sessionId,
+        acquisitionLatencyMs: Date.now() - startedAt,
+      });
+      return null;
+    }
+
     const acquiredLease = await Promise.race<
       KeyLease | string | null | undefined | typeof timeoutSentinel
     >([
       distributor.acquireForSubagent(sessionId, normalizedProviderId, {
         timeoutMs: effectiveTimeoutMs,
         modelId,
+        signal: abortController.signal,
+        parentSessionId: options.parentSessionId?.trim() || undefined,
       }),
       new Promise<typeof timeoutSentinel>((resolve) => {
         timeoutHandle = setTimeout(() => {
@@ -359,12 +571,16 @@ export async function tryAcquireKeyForSubagent(
     ]);
 
     if (acquiredLease === timeoutSentinel) {
+      abortController.abort();
       void piAgentRouterDebugLogger.warn("subagent.key_acquire_timeout", {
         message:
           `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms. Using parent environment key.`,
         providerId: normalizedProviderId,
         sessionId,
         timeoutMs: effectiveTimeoutMs,
+        acquisitionLatencyMs: Date.now() - startedAt,
+        fallbackEnvAvailable: hasParentFallbackCredential,
+        distributorMetrics: distributor.getMetrics?.(),
       });
       return null;
     }
@@ -386,6 +602,8 @@ export async function tryAcquireKeyForSubagent(
         `[pi-agent-router] Acquired distributed ${normalizedProviderId} key (${lease.credentialId}) for subagent ${sessionId.slice(0, 8)}.`,
       providerId: normalizedProviderId,
       sessionId,
+      acquisitionLatencyMs: Date.now() - startedAt,
+      distributorMetrics: distributor.getMetrics?.(),
     });
 
     return {
@@ -395,12 +613,18 @@ export async function tryAcquireKeyForSubagent(
       apiKey: lease.apiKey,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
+    if (error instanceof Error && error.name === "AbortError") {
+      return null;
+    }
+
+    const message = getErrorMessage(error);
     void piAgentRouterDebugLogger.warn("subagent.key_acquire_failed", {
       error: message,
       message: `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Using parent environment key.`,
       providerId: normalizedProviderId,
       sessionId,
+      acquisitionLatencyMs: Date.now() - startedAt,
+      distributorMetrics: distributor.getMetrics?.(),
     });
     return null;
   } finally {
@@ -423,11 +647,38 @@ export function releaseKeyForSubagent(sessionId: string): void {
       sessionId,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
+    const message = getErrorMessage(error);
     void piAgentRouterDebugLogger.warn("subagent.key_release_failed", {
       error: message,
       message: `[pi-agent-router] Failed to release distributed key for subagent ${sessionId.slice(0, 8)}: ${message}.`,
       sessionId,
+    });
+  }
+}
+
+export function releaseKeyLeasesForParentSession(parentSessionId: string): void {
+  const normalizedParentSessionId = parentSessionId.trim();
+  if (!normalizedParentSessionId) {
+    return;
+  }
+
+  const distributor = getGlobalKeyDistributor();
+  if (!distributor?.releaseLightweightSessionLeases) {
+    return;
+  }
+
+  try {
+    distributor.releaseLightweightSessionLeases(normalizedParentSessionId);
+    void piAgentRouterDebugLogger.info("subagent.parent_session_key_leases_released", {
+      message: `[pi-agent-router] Released lightweight distributed key leases for parent session ${normalizedParentSessionId.slice(0, 8)}.`,
+      parentSessionId: normalizedParentSessionId,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    void piAgentRouterDebugLogger.warn("subagent.parent_session_key_lease_release_failed", {
+      error: message,
+      message: `[pi-agent-router] Failed to release lightweight distributed key leases for parent session ${normalizedParentSessionId.slice(0, 8)}: ${message}.`,
+      parentSessionId: normalizedParentSessionId,
     });
   }
 }
@@ -639,7 +890,7 @@ export function reportSubagentKeyError(
           sessionId,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
+        const message = getErrorMessage(error);
         void piAgentRouterDebugLogger.warn("subagent.credential_disable_failed", {
           credentialId,
           error: message,
@@ -667,7 +918,7 @@ export function reportSubagentKeyError(
           sessionId,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
+        const message = getErrorMessage(error);
         void piAgentRouterDebugLogger.warn("subagent.credential_cooldown_failed", {
           credentialId,
           error: message,
@@ -719,7 +970,7 @@ export function reportSubagentKeyError(
       sessionId,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
+    const message = getErrorMessage(error);
     void piAgentRouterDebugLogger.warn("subagent.credential_error_report_failed", {
       credentialId,
       error: message,
@@ -776,7 +1027,7 @@ export function reportSubagentTransientKeyError(
       sessionId,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
+    const message = getErrorMessage(error);
     void piAgentRouterDebugLogger.warn("subagent.transient_key_error_report_failed", {
       credentialId,
       error: message,

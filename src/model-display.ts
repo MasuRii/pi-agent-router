@@ -2,6 +2,8 @@
  * Model footer formatting utilities.
  */
 
+import { normalizeInputText } from "./input-normalization";
+
 const PROVIDER_ALIASES: Record<string, string> = {
   openai: "OpenAI",
   "openai-codex": "OpenAI",
@@ -19,9 +21,6 @@ const PROVIDER_ALIASES: Record<string, string> = {
 
 export const MODEL_FOOTER_ICON = "";
 
-function normalizeInputText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
 
 function titleCaseToken(token: string): string {
   const normalized = token.trim();
