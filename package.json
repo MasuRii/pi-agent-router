@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-router",
-  "version": "0.1.0",
-  "description": "Pi extension for agent routing, active agent management, and subagent delegation rendering.",
+  "version": "0.2.0",
+  "description": "Pi extension for active-agent routing, controlled subagent delegation, and task result rendering.",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -10,27 +10,49 @@
   "files": [
     "index.ts",
     "src",
-    "README.md"
+    "!src/test",
+    "!src/test.ts",
+    "config/config.example.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
     "lint": "npm run typecheck",
     "typecheck": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json",
-    "test": "bun ./src/test.ts && bun ./src/test/active-agent-prompt-test.ts && bun ./src/test/agent-discovery-test.ts && bun ./src/test/display-enhancements-test.ts && bun ./src/test/output-contract-test.ts && bun ./src/test/output-sanitizer-test.ts && bun ./src/test/parallel-control-test.ts && bun ./src/test/parallel-result-activity-test.ts && bun ./src/test/session-paths-test.ts && bun ./src/test/spinner-surface-test.ts && bun ./src/test/subagent-memory-regression-test.ts && bun ./src/test/subagent-output-sink-test.ts && bun ./src/test/subagent-output-test.ts && bun ./src/test/subagent-runtime-env-test.ts && bun ./src/test/subagent-session-state-test.ts && bun ./src/test/subagent-key-distribution-entitlement-test.ts && bun ./src/test/task-controls-test.ts && bun ./src/test/task-display-formatting-test.ts && bun ./src/test/task-render-hints-test.ts && bun ./src/test/task-tool-adapter-test.ts && bun ./src/test/task-update-dedupe-test.ts && bun ./src/test/tool-formatting-test.ts && bun ./src/test/ui-utils-test.ts",
+    "test": "bun ./src/test.ts && bun ./src/test/active-agent-prompt-test.ts && bun ./src/test/agent-discovery-test.ts && bun ./src/test/config-test.ts && bun ./src/test/display-enhancements-test.ts && bun ./src/test/output-contract-test.ts && bun ./src/test/output-sanitizer-test.ts && bun ./src/test/parallel-control-test.ts && bun ./src/test/parallel-result-activity-test.ts && bun ./src/test/session-paths-test.ts && bun ./src/test/spinner-surface-test.ts && bun ./src/test/subagent-memory-regression-test.ts && bun ./src/test/subagent-output-sink-test.ts && bun ./src/test/subagent-output-test.ts && bun ./src/test/subagent-runtime-env-test.ts && bun ./src/test/subagent-session-state-test.ts && bun ./src/test/subagent-key-distribution-entitlement-test.ts && bun ./src/test/task-controls-test.ts && bun ./src/test/task-display-formatting-test.ts && bun ./src/test/task-render-hints-test.ts && bun ./src/test/task-tool-adapter-test.ts && bun ./src/test/task-update-dedupe-test.ts && bun ./src/test/tool-formatting-test.ts && bun ./src/test/ui-utils-test.ts",
     "check": "npm run build && npm run lint && npm run test"
   },
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
+    "pi-coding-agent",
+    "pi-tui",
+    "coding-agent",
     "agent-routing",
+    "active-agent",
     "delegation",
-    "subagents"
+    "subagents",
+    "task-routing",
+    "parallel-delegation"
   ],
   "author": "MasuRii",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MasuRii/pi-agent-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MasuRii/pi-agent-router/issues"
+  },
+  "homepage": "https://github.com/MasuRii/pi-agent-router#readme",
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "pi": {
     "extensions": [
