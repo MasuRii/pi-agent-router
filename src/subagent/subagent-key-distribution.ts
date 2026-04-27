@@ -12,20 +12,11 @@ import {
   getWeeklyQuotaCooldownMs,
   TRANSIENT_COOLDOWN_BASE_MS,
   TRANSIENT_COOLDOWN_MAX_MS,
-} from "../../../pi-multi-auth/src/balancer/credential-backoff.js";
+} from "./credential-backoff";
+import { createBoundedCache } from "../cache/bounded-cache";
+import { loadPiAgentRouterConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { getErrorMessage } from "../error-utils";
-
-/**
- * Core providers that are always available (hardcoded fallback).
- * These are providers that don't use models.json apiKey field or are critical for boot.
- */
-const CORE_PROVIDER_ENV_KEYS: Record<string, string> = {
-  anthropic: "ANTHROPIC_API_KEY",
-  openai: "OPENAI_API_KEY",
-  "openai-codex": "OPENAI_API_KEY",
-  "google-gemini-cli": "GOOGLE_API_KEY",
-};
 
 /**
  * Cached provider env keys loaded from models.json.
@@ -34,6 +25,36 @@ const CORE_PROVIDER_ENV_KEYS: Record<string, string> = {
 let cachedProviderEnvKeys: Record<string, string> | null | undefined = undefined;
 let providerEnvKeysLoadPromise: Promise<Record<string, string> | null> | undefined;
 let providerEnvKeysCacheRevision = 0;
+
+type CredentialFallbackPolicy = "parent-env" | "distributed-only";
+
+type KeyDistributionConfigSlices = {
+  providerEnvKeys: Readonly<Record<string, string>>;
+  directEnvDelegationProviderIds: ReadonlySet<string>;
+  providerCredentialFallbackPolicies: Readonly<Record<string, CredentialFallbackPolicy>>;
+};
+
+let cachedKeyDistributionConfigSlices: KeyDistributionConfigSlices | undefined;
+
+function getConfiguredKeyDistributionSlices(): KeyDistributionConfigSlices {
+  if (cachedKeyDistributionConfigSlices) {
+    return cachedKeyDistributionConfigSlices;
+  }
+
+  const config = loadPiAgentRouterConfig().config;
+  cachedKeyDistributionConfigSlices = {
+    providerEnvKeys: { ...config.providerEnvKeys },
+    directEnvDelegationProviderIds: new Set(config.directEnvDelegationProviderIds),
+    providerCredentialFallbackPolicies: {
+      ...config.providerCredentialFallbackPolicies,
+    },
+  };
+  return cachedKeyDistributionConfigSlices;
+}
+
+function resetConfiguredKeyDistributionSlices(): void {
+  cachedKeyDistributionConfigSlices = undefined;
+}
 
 /**
  * Get the path to models.json file.
@@ -102,7 +123,10 @@ async function loadProviderEnvKeysFromModelsJsonAsync(): Promise<Record<string, 
 }
 
 function mergeProviderEnvKeys(dynamicKeys: Record<string, string> | null | undefined): Record<string, string> {
-  return dynamicKeys ? { ...CORE_PROVIDER_ENV_KEYS, ...dynamicKeys } : { ...CORE_PROVIDER_ENV_KEYS };
+  const configuredProviderEnvKeys = getConfiguredKeyDistributionSlices().providerEnvKeys;
+  return dynamicKeys
+    ? { ...configuredProviderEnvKeys, ...dynamicKeys }
+    : { ...configuredProviderEnvKeys };
 }
 
 /**
@@ -145,6 +169,7 @@ export function resetProviderEnvKeyCacheState(): void {
   providerEnvKeysCacheRevision += 1;
   cachedProviderEnvKeys = undefined;
   providerEnvKeysLoadPromise = undefined;
+  resetConfiguredKeyDistributionSlices();
 }
 
 /**
@@ -178,27 +203,25 @@ const PROVIDER_ID_ALIASES: Record<string, string> = {
   gemini: "google-gemini-cli",
 };
 
-const DIRECT_ENV_DELEGATION_PROVIDER_IDS = new Set([
-  "amazon-bedrock",
-  "anthropic",
-  "azure-openai-responses",
-  "cerebras",
-  "github-copilot",
-  "google",
-  "google-vertex",
-  "groq",
-  "huggingface",
-  "kimi-coding",
-  "minimax",
-  "minimax-cn",
-  "mistral",
-  "openai",
-  "opencode",
-  "opencode-go",
-  "openrouter",
-  "xai",
-  "zai",
-]);
+function getDirectEnvDelegationProviderIds(): ReadonlySet<string> {
+  return getConfiguredKeyDistributionSlices().directEnvDelegationProviderIds;
+}
+
+function getCredentialFallbackPolicy(providerId: string | undefined): CredentialFallbackPolicy {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!normalizedProviderId) {
+    return "parent-env";
+  }
+
+  return (
+    getConfiguredKeyDistributionSlices().providerCredentialFallbackPolicies[normalizedProviderId] ??
+    "parent-env"
+  );
+}
+
+function shouldInheritParentCredentialEnv(providerId: string | undefined): boolean {
+  return getCredentialFallbackPolicy(providerId) === "parent-env";
+}
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 1_500;
 const FALLBACK_ENV_ACQUIRE_TIMEOUT_MS = 250;
@@ -208,17 +231,47 @@ type KeyLease = {
   apiKey: string;
 };
 
+export type DelegatedCredentialRequest = {
+  sessionId: string;
+  providerId: string;
+  timeoutMs?: number;
+  modelId?: string;
+  modelRef?: string;
+  api?: string;
+  signal?: AbortSignal;
+  parentSessionId?: string;
+};
+
+export type DelegatedRoutingCapabilities = {
+  providerId: string;
+  modelId?: string;
+  modelRef?: string;
+  api?: string;
+  credentialCounts: {
+    total: number;
+    structurallyEligible: number;
+    modelEligible: number;
+  };
+  modelConstraintApplied: boolean;
+  failureMessage?: string;
+};
+
 export type GlobalKeyDistributor = {
-  acquireForSubagent: (
-    sessionId: string,
-    providerId: string,
-    options?: {
-      timeoutMs?: number;
-      modelId?: string;
-      signal?: AbortSignal;
-      parentSessionId?: string;
-    },
-  ) => Promise<KeyLease | string | null | undefined>;
+  acquireForSubagent: {
+    (request: DelegatedCredentialRequest): Promise<KeyLease | string | null | undefined>;
+    (
+      sessionId: string,
+      providerId: string,
+      options?: {
+        timeoutMs?: number;
+        modelId?: string;
+        modelRef?: string;
+        api?: string;
+        signal?: AbortSignal;
+        parentSessionId?: string;
+      },
+    ): Promise<KeyLease | string | null | undefined>;
+  };
   releaseFromSubagent: (sessionId: string) => void;
   releaseLightweightSessionLeases?: (parentSessionId: string, providerId?: string) => void;
   getLeaseForSession?: (
@@ -230,9 +283,14 @@ export type GlobalKeyDistributor = {
     providerId: string,
     options?: {
       modelId?: string;
+      modelRef?: string;
+      api?: string;
       signal?: AbortSignal;
     },
   ) => Promise<boolean> | boolean;
+  getDelegatedCredentialRoutingCapabilities?: (
+    request: DelegatedCredentialRequest,
+  ) => Promise<DelegatedRoutingCapabilities> | DelegatedRoutingCapabilities;
   applyCooldown?: (
     credentialId: string,
     durationMs: number,
@@ -313,6 +371,44 @@ function parseModelIdFromReference(modelReference: string | undefined): string |
   return modelId || undefined;
 }
 
+function normalizeOptionalRoutingValue(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized ? normalized : undefined;
+}
+
+function resolveDelegatedCredentialRequest(options: {
+  sessionId: string;
+  providerId: string;
+  timeoutMs?: number;
+  requestedModel?: string;
+  modelContext?: {
+    providerId?: string;
+    modelId?: string;
+    modelRef?: string;
+    api?: string;
+  };
+  parentSessionId?: string;
+  signal: AbortSignal;
+}): DelegatedCredentialRequest {
+  const modelId =
+    normalizeOptionalRoutingValue(options.modelContext?.modelId) ??
+    parseModelIdFromReference(options.requestedModel);
+  const modelRef =
+    normalizeOptionalRoutingValue(options.modelContext?.modelRef) ??
+    normalizeOptionalRoutingValue(options.requestedModel);
+
+  return {
+    sessionId: options.sessionId,
+    providerId: options.providerId,
+    timeoutMs: options.timeoutMs,
+    modelId,
+    modelRef,
+    api: normalizeOptionalRoutingValue(options.modelContext?.api),
+    parentSessionId: normalizeOptionalRoutingValue(options.parentSessionId),
+    signal: options.signal,
+  };
+}
+
 function hasUsableEnvValue(env: NodeJS.ProcessEnv, envKey: string | undefined): boolean {
   if (!envKey) {
     return false;
@@ -338,6 +434,24 @@ function resolveAcquireTimeoutMs(
 function getGlobalKeyDistributor(): GlobalKeyDistributor | null {
   const globalScope = globalThis as GlobalWithKeyDistributor;
   return globalScope.__piMultiAuthKeyDistributor ?? null;
+}
+
+async function getRoutingCapabilitiesSafe(
+  distributor: GlobalKeyDistributor,
+  request: DelegatedCredentialRequest,
+): Promise<DelegatedRoutingCapabilities | undefined> {
+  try {
+    return await distributor.getDelegatedCredentialRoutingCapabilities?.(request);
+  } catch (error) {
+    const message = getErrorMessage(error);
+    void piAgentRouterDebugLogger.warn("subagent.routing_capabilities_failed", {
+      error: message,
+      message: `[pi-agent-router] Failed to resolve redacted routing capabilities for ${request.providerId}: ${message}`,
+      providerId: request.providerId,
+      sessionId: request.sessionId,
+    });
+    return undefined;
+  }
 }
 
 function resolveApiKeyFromLease(
@@ -464,7 +578,7 @@ export async function hasParentProviderCredentialEnvAsync(
   return hasUsableEnvValue(parentEnv, envKey);
 }
 
-export async function shouldSkipDelegatedMultiAuthForProviderAsync(
+export async function isDirectEnvDelegationAuthAvailableForProviderAsync(
   providerId: string | undefined,
 ): Promise<boolean> {
   const normalizedProviderId = normalizeProviderId(providerId);
@@ -477,13 +591,35 @@ export async function shouldSkipDelegatedMultiAuthForProviderAsync(
     return false;
   }
 
-  return DIRECT_ENV_DELEGATION_PROVIDER_IDS.has(normalizedProviderId);
+  return getDirectEnvDelegationProviderIds().has(normalizedProviderId);
+}
+
+export async function shouldSkipDelegatedMultiAuthForProviderAsync(
+  providerId: string | undefined,
+): Promise<boolean> {
+  return isDirectEnvDelegationAuthAvailableForProviderAsync(providerId);
+}
+
+export function shouldInheritParentCredentialEnvForProvider(
+  providerId: string | undefined,
+): boolean {
+  return shouldInheritParentCredentialEnv(providerId);
 }
 
 export async function tryAcquireKeyForSubagent(
   sessionId: string,
   providerId: string | undefined,
-  options: { timeoutMs?: number; requestedModel?: string; parentSessionId?: string } = {},
+  options: {
+    timeoutMs?: number;
+    requestedModel?: string;
+    modelContext?: {
+      providerId?: string;
+      modelId?: string;
+      modelRef?: string;
+      api?: string;
+    };
+    parentSessionId?: string;
+  } = {},
 ): Promise<SubagentKeyLease | null> {
   const normalizedProviderId = normalizeProviderId(providerId);
   if (!normalizedProviderId) {
@@ -501,17 +637,40 @@ export async function tryAcquireKeyForSubagent(
     return null;
   }
 
-  const hasParentFallbackCredential = hasUsableEnvValue(process.env, envKey);
+  const fallbackPolicy = getCredentialFallbackPolicy(normalizedProviderId);
+  const parentFallbackAllowed = fallbackPolicy === "parent-env";
+  const hasParentFallbackCredential =
+    parentFallbackAllowed && hasUsableEnvValue(process.env, envKey);
   const effectiveTimeoutMs = resolveAcquireTimeoutMs(
     options.timeoutMs,
     hasParentFallbackCredential,
   );
-  const modelId = parseModelIdFromReference(options.requestedModel);
   const abortController = new AbortController();
+  const delegatedRequest = resolveDelegatedCredentialRequest({
+    sessionId,
+    providerId: normalizedProviderId,
+    timeoutMs: effectiveTimeoutMs,
+    requestedModel: options.requestedModel,
+    modelContext: options.modelContext,
+    parentSessionId: options.parentSessionId,
+    signal: abortController.signal,
+  });
+  const modelId = delegatedRequest.modelId;
   const startedAt = Date.now();
 
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutSentinel = Symbol("subagent-key-acquire-timeout");
+
+  if (normalizedProviderId === "openai-codex" && !delegatedRequest.modelId) {
+    void piAgentRouterDebugLogger.warn("subagent.key_acquire_missing_model_context", {
+      message:
+        `[pi-agent-router] Refused distributed ${normalizedProviderId} credential acquisition for subagent ${sessionId.slice(0, 8)} because model context is required by provider policy.`,
+      providerId: normalizedProviderId,
+      sessionId,
+      fallbackPolicy,
+    });
+    return null;
+  }
 
   try {
     const existingLease = resolveApiKeyFromLease(
@@ -521,9 +680,8 @@ export async function tryAcquireKeyForSubagent(
     );
     if (existingLease) {
       void piAgentRouterDebugLogger.info("subagent.key_reused", {
-        credentialId: existingLease.credentialId,
         message:
-          `[pi-agent-router] Reused distributed ${normalizedProviderId} key (${existingLease.credentialId}) for subagent ${sessionId.slice(0, 8)}.`,
+          `[pi-agent-router] Reused distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
         providerId: normalizedProviderId,
         sessionId,
         acquisitionLatencyMs: Date.now() - startedAt,
@@ -540,6 +698,8 @@ export async function tryAcquireKeyForSubagent(
       normalizedProviderId,
       {
         modelId,
+        modelRef: delegatedRequest.modelRef,
+        api: delegatedRequest.api,
         signal: abortController.signal,
       },
     );
@@ -557,12 +717,7 @@ export async function tryAcquireKeyForSubagent(
     const acquiredLease = await Promise.race<
       KeyLease | string | null | undefined | typeof timeoutSentinel
     >([
-      distributor.acquireForSubagent(sessionId, normalizedProviderId, {
-        timeoutMs: effectiveTimeoutMs,
-        modelId,
-        signal: abortController.signal,
-        parentSessionId: options.parentSessionId?.trim() || undefined,
-      }),
+      distributor.acquireForSubagent(delegatedRequest),
       new Promise<typeof timeoutSentinel>((resolve) => {
         timeoutHandle = setTimeout(() => {
           resolve(timeoutSentinel);
@@ -573,13 +728,16 @@ export async function tryAcquireKeyForSubagent(
     if (acquiredLease === timeoutSentinel) {
       abortController.abort();
       void piAgentRouterDebugLogger.warn("subagent.key_acquire_timeout", {
-        message:
-          `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms. Using parent environment key.`,
+        message: parentFallbackAllowed
+          ? `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms; parent environment credential remains allowed by provider policy.`
+          : `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms; parent environment credential fallback is disabled by provider policy.`,
         providerId: normalizedProviderId,
         sessionId,
         timeoutMs: effectiveTimeoutMs,
         acquisitionLatencyMs: Date.now() - startedAt,
+        fallbackPolicy,
         fallbackEnvAvailable: hasParentFallbackCredential,
+        routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
         distributorMetrics: distributor.getMetrics?.(),
       });
       return null;
@@ -588,18 +746,20 @@ export async function tryAcquireKeyForSubagent(
     const lease = resolveApiKeyFromLease(acquiredLease, distributor, sessionId);
     if (!lease) {
       void piAgentRouterDebugLogger.info("subagent.key_acquire_unavailable", {
-        message:
-          `[pi-agent-router] No distributed ${normalizedProviderId} key available for subagent ${sessionId.slice(0, 8)}. Using parent environment key.`,
+        message: parentFallbackAllowed
+          ? `[pi-agent-router] No distributed ${normalizedProviderId} key was available for subagent ${sessionId.slice(0, 8)}; parent environment credential remains allowed by provider policy.`
+          : `[pi-agent-router] No distributed ${normalizedProviderId} key was available for subagent ${sessionId.slice(0, 8)}; parent environment credential fallback is disabled by provider policy.`,
         providerId: normalizedProviderId,
         sessionId,
+        fallbackPolicy,
+        routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
       });
       return null;
     }
 
     void piAgentRouterDebugLogger.info("subagent.key_acquired", {
-      credentialId: lease.credentialId,
       message:
-        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key (${lease.credentialId}) for subagent ${sessionId.slice(0, 8)}.`,
+        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
       providerId: normalizedProviderId,
       sessionId,
       acquisitionLatencyMs: Date.now() - startedAt,
@@ -620,10 +780,14 @@ export async function tryAcquireKeyForSubagent(
     const message = getErrorMessage(error);
     void piAgentRouterDebugLogger.warn("subagent.key_acquire_failed", {
       error: message,
-      message: `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Using parent environment key.`,
+      message: parentFallbackAllowed
+        ? `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Parent environment credential remains allowed by provider policy.`
+        : `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Parent environment credential fallback is disabled by provider policy.`,
       providerId: normalizedProviderId,
       sessionId,
+      fallbackPolicy,
       acquisitionLatencyMs: Date.now() - startedAt,
+      routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
       distributorMetrics: distributor.getMetrics?.(),
     });
     return null;
@@ -768,6 +932,7 @@ const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
 ];
 
 const DEFAULT_QUOTA_COOLDOWN_MS = 60_000; // 1 minute for regular quota errors
+export const KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES = 1_024;
 
 /**
  * Checks whether an error message indicates a quota or rate-limit condition
@@ -840,11 +1005,11 @@ function isWeeklyQuotaError(errorText: string): boolean {
 }
 
 /**
- * Weekly quota attempt tracking for exponential backoff.
- * Maps credentialId -> consecutive weekly error count.
+ * Weekly quota and transient provider attempt tracking for exponential backoff.
+ * Bounded by credentialId to prevent unbounded long-lived process growth.
  */
-const weeklyQuotaAttempts: Map<string, number> = new Map();
-const transientProviderAttempts: Map<string, number> = new Map();
+const weeklyQuotaAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
+const transientProviderAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
 
 /**
  * Reports a quota/rate-limit error on a credential to the global KeyDistributor

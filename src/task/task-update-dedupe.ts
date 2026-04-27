@@ -188,6 +188,7 @@ export function createTaskToolPartialUpdateGate(options?: {
   minIntervalMs?: number;
   unchangedFrameIntervalMs?: number;
 }): {
+  shouldBuildFingerprint: (input?: { force?: boolean }) => boolean;
   shouldEmit: (input: { fingerprint: string; force?: boolean }) => boolean;
 } {
   const now = options?.now ?? Date.now;
@@ -205,6 +206,16 @@ export function createTaskToolPartialUpdateGate(options?: {
   let lastEmittedAt = 0;
 
   return {
+    shouldBuildFingerprint(input: { force?: boolean } = {}): boolean {
+      if (input.force || !lastFingerprint) {
+        return true;
+      }
+
+      const nowMs = now();
+      const elapsed = Math.max(0, nowMs - lastEmittedAt);
+      return elapsed >= minIntervalMs;
+    },
+
     shouldEmit(input: { fingerprint: string; force?: boolean }): boolean {
       const fingerprint = normalizeFingerprintText(input.fingerprint);
       if (!fingerprint) {

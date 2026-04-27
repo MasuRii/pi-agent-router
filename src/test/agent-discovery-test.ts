@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AGENT_DISCOVERY_CACHE_MAX_ENTRIES } from "../constants";
+import { CONFIG_PATH } from "../config";
 import {
+  AGENT_MARKDOWN_PARSE_CONCURRENCY,
   discoverAgents,
   discoverAgentsAsync,
   findNearestProjectAgentsDirAsync,
   getAgentDiscoveryCacheSnapshot,
+  getAgentEmoji,
   invalidateAgentDiscoveryCaches,
+  isPrimaryAgent,
   loadAgents,
   resetAgentDiscoveryCacheState,
 } from "../agent/agent-discovery";
@@ -32,6 +36,29 @@ function writeAgent(
     `---\nname: ${name}\ndescription: ${description}${colorLine}\n---\n\nSystem prompt for ${name}`,
     "utf-8",
   );
+}
+
+function writeRouterConfig(config: Record<string, unknown>): void {
+  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+}
+
+function withRouterConfig(config: Record<string, unknown>, testFn: () => void): void {
+  const previousConfig = existsSync(CONFIG_PATH)
+    ? readFileSync(CONFIG_PATH, "utf-8")
+    : undefined;
+
+  try {
+    writeRouterConfig(config);
+    resetAgentDiscoveryCacheState();
+    testFn();
+  } finally {
+    if (previousConfig === undefined) {
+      rmSync(CONFIG_PATH, { force: true });
+    } else {
+      writeFileSync(CONFIG_PATH, previousConfig, "utf-8");
+    }
+    resetAgentDiscoveryCacheState();
+  }
 }
 
 await runTest("discoverAgentsAsync honors project precedence .omp > .pi > .claude", async () => {
@@ -85,6 +112,12 @@ await runTest("discoverAgentsAsync parses and normalizes frontmatter color", asy
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+await runTest("agent markdown parsing uses a bounded positive concurrency limit", () => {
+  assert.equal(Number.isInteger(AGENT_MARKDOWN_PARSE_CONCURRENCY), true);
+  assert.equal(AGENT_MARKDOWN_PARSE_CONCURRENCY > 0, true);
+  assert.equal(AGENT_MARKDOWN_PARSE_CONCURRENCY < AGENT_DISCOVERY_CACHE_MAX_ENTRIES, true);
 });
 
 await runTest("discoverAgentsAsync caches hits and rehydrates after invalidation", async () => {
@@ -168,6 +201,51 @@ await runTest("discoverAgents sync API preserves cached semantics for compatibil
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+await runTest("primary agent and emoji config slices cache until agent discovery invalidation", () => {
+  withRouterConfig(
+    {
+      primaryAgents: ["cached-primary"],
+      agentEmojis: {
+        "cached-primary": "🧪",
+      },
+    },
+    () => {
+      const cachedPrimaryAgent = {
+        name: "cached-primary",
+        description: "cached",
+        systemPrompt: "cached",
+      };
+      const updatedPrimaryAgent = {
+        name: "updated-primary",
+        description: "updated",
+        systemPrompt: "updated",
+      };
+
+      assert.equal(isPrimaryAgent(cachedPrimaryAgent), true);
+      assert.equal(getAgentEmoji("cached-primary"), "🧪");
+
+      writeRouterConfig({
+        primaryAgents: ["updated-primary"],
+        agentEmojis: {
+          "cached-primary": "🔁",
+          "updated-primary": "✅",
+        },
+      });
+
+      assert.equal(isPrimaryAgent(cachedPrimaryAgent), true);
+      assert.equal(isPrimaryAgent(updatedPrimaryAgent), false);
+      assert.equal(getAgentEmoji("cached-primary"), "🧪");
+
+      invalidateAgentDiscoveryCaches();
+
+      assert.equal(isPrimaryAgent(cachedPrimaryAgent), false);
+      assert.equal(isPrimaryAgent(updatedPrimaryAgent), true);
+      assert.equal(getAgentEmoji("cached-primary"), "🔁");
+      assert.equal(getAgentEmoji("updated-primary"), "✅");
+    },
+  );
 });
 
 await runTest("loadAgents supports project-local agents when scope includes project", () => {

@@ -3,169 +3,31 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-type AgentMode = "primary" | "subagent" | "all";
-type AgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-const VALID_THINKING_LEVELS = new Set<AgentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
-const SUBAGENT_STDOUT_CAPTURE_MAX_CHARS = 2 * 1024 * 1024;
-const SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS = 4 * 1024 * 1024;
-
-function normalizeAgentMode(value: string | undefined): AgentMode | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "primary" || normalized === "subagent" || normalized === "all") {
-    return normalized;
-  }
-
-  return undefined;
-}
-
-function normalizeThinkingLevel(value: string | undefined): AgentThinkingLevel | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return undefined;
-  }
-
-  if (normalized === "none") {
-    return "off";
-  }
-
-  if (normalized === "max") {
-    return "xhigh";
-  }
-
-  if (VALID_THINKING_LEVELS.has(normalized as AgentThinkingLevel)) {
-    return normalized as AgentThinkingLevel;
-  }
-
-  return undefined;
-}
-
-function parseTemperature(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const parsed = Number.parseFloat(value);
-  if (!Number.isFinite(parsed)) {
-    return undefined;
-  }
-
-  return parsed;
-}
-
-function buildDelegatedTemperatureExtensionSource(temperature: number): string {
-  const runtimeTemperature = Number.isFinite(temperature) ? temperature : 1;
-  return `const runtimeTemperature = ${JSON.stringify(runtimeTemperature)};`;
-}
-
-function buildDelegatedCopilotInitiatorExtensionSource(): string {
-  return [
-    "const TARGET_APIS: Api[] = [\"openai-completions\", \"openai-responses\", \"anthropic-messages\"];",
-    "for (const api of TARGET_APIS) {",
-    "ensureWrapper(pi, api);",
-    "const provider = (model as Model<Api> & { provider?: string }).provider;",
-    "if (provider !== \"github-copilot\") {",
-    "\"X-Initiator\": \"agent\"",
-  ].join("\n");
-}
-
-type BoundedTextCapture = {
-  value: string;
-  droppedChars: number;
-};
-
-function createBoundedTextCapture(): BoundedTextCapture {
-  return {
-    value: "",
-    droppedChars: 0,
-  };
-}
-
-function appendToBoundedTextCapture(capture: BoundedTextCapture, piece: string, maxChars: number): void {
-  if (!piece) {
-    return;
-  }
-
-  if (!Number.isFinite(maxChars) || maxChars <= 0) {
-    capture.droppedChars += piece.length;
-    return;
-  }
-
-  const combined = `${capture.value}${piece}`;
-  if (combined.length <= maxChars) {
-    capture.value = combined;
-    return;
-  }
-
-  const overflow = combined.length - maxChars;
-  capture.value = combined.slice(overflow);
-  capture.droppedChars += overflow;
-}
-
-function parseModelReference(modelReference: string | undefined): { provider: string; modelId: string } | undefined {
-  if (!modelReference) {
-    return undefined;
-  }
-
-  const trimmed = modelReference.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-
-  const separatorIndex = trimmed.indexOf("/");
-  if (separatorIndex <= 0 || separatorIndex === trimmed.length - 1) {
-    return undefined;
-  }
-
-  return {
-    provider: trimmed.slice(0, separatorIndex),
-    modelId: trimmed.slice(separatorIndex + 1),
-  };
-}
-
-const SESSIONS_DIR = join("/tmp", ".pi", "agent", "sessions");
-
-function encodeSessionDirectoryForCwd(cwd: string): string {
-  let normalized = cwd;
-  if (normalized.startsWith("/") || normalized.startsWith("\\")) {
-    normalized = normalized.slice(1);
-  }
-
-  return `--${normalized.replaceAll("/", "-").replaceAll("\\", "-").replaceAll(":", "-")}--`;
-}
-
-function buildSessionPathFromHeader(id: string, timestamp: string, cwd: string, sessionDir?: string): string {
-  const baseSessionDir = sessionDir ? resolve(sessionDir) : join(SESSIONS_DIR, encodeSessionDirectoryForCwd(cwd));
-  const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-  return join(baseSessionDir, `${fileTimestamp}_${id}.jsonl`);
-}
-
-function formatDuration(milliseconds: number): string {
-  if (milliseconds < 1000) {
-    return `${milliseconds}ms`;
-  }
-
-  const seconds = Math.floor(milliseconds / 1000);
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ${seconds % 60}s`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes % 60}m`;
-}
+import {
+  normalizeAgentMode,
+  normalizeThinkingLevel,
+  parseTemperature,
+} from "./agent/agent-discovery";
+import {
+  buildDelegatedCopilotInitiatorExtensionSource,
+  buildDelegatedTemperatureExtensionSource,
+} from "./agent/extension-sources";
+import {
+  analyzeSubagentOutput,
+  createSubagentOutputAnalysisCacheKey,
+  SUBAGENT_OUTPUT_ANALYSIS_RAW_CACHE_KEY_MAX_CHARS,
+} from "./text-formatting";
+import { DEFAULT_PI_AGENT_ROUTER_CONFIG } from "./config";
+import {
+  SESSIONS_DIR,
+  SUBAGENT_STDOUT_CAPTURE_MAX_CHARS,
+  SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS,
+} from "./constants";
+import { parseModelReference } from "./model-resolution";
+import { parseDelegatedExtensionRuntimeMetadata } from "./subagent/delegated-extensions";
+import { formatDuration } from "./subagent/subagent-execution";
+import { buildSessionPathFromHeader, encodeSessionDirectoryForCwd } from "./subagent/session-paths";
+import { appendToBoundedTextCapture, createBoundedTextCapture } from "./subagent/subagent-usage";
 
 function runTest(name: string, testFn: () => void): void {
   testFn();
@@ -204,7 +66,7 @@ runTest("buildDelegatedTemperatureExtensionSource embeds runtime temperature", (
 
 runTest("buildDelegatedCopilotInitiatorExtensionSource pre-registers wrappers and forces agent initiator for Copilot", () => {
   const source = buildDelegatedCopilotInitiatorExtensionSource();
-  assert.equal(source.includes('TARGET_APIS: Api[]'), true);
+  assert.equal(source.includes('const TARGET_APIS = ["openai-completions","openai-responses","anthropic-messages"] as Api[];'), true);
   assert.equal(source.includes('ensureWrapper(pi, api);'), true);
   assert.equal(source.includes('provider !== "github-copilot"'), true);
   assert.equal(source.includes('"X-Initiator": "agent"'), true);
@@ -288,20 +150,42 @@ runTest("bounded stdout capture prevents unbounded growth", () => {
   assert.equal(capture.droppedChars, 1234);
 });
 
-runTest("delegated subagents forward the supported optional extension set", () => {
-  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  const match = routerSource.match(/const SUBAGENT_OPTIONAL_EXTENSION_NAMES = \[(.*?)\] as const;/s);
-  assert.notEqual(match, null);
+runTest("subagent output analysis cache keys do not retain oversized raw output", () => {
+  const oversizedOutput = [
+    "# Summary",
+    "Large stream snapshot",
+    "→ read src/index.ts",
+    "x".repeat(SUBAGENT_OUTPUT_ANALYSIS_RAW_CACHE_KEY_MAX_CHARS + 1),
+  ].join("\n");
 
-  const extensionNames = [...(match?.[1] ?? "").matchAll(/"([^"]+)"/g)].map(([, extensionName]) => extensionName);
-  assert.deepEqual(extensionNames, [
-    "pi-factory-auth",
-    "pi-multi-auth",
-    "multi-auth",
-    "pi-find-robustness",
-    "pi-fast-mode",
-    "pi-tool-display",
-  ]);
+  const cacheKey = createSubagentOutputAnalysisCacheKey(oversizedOutput);
+  assert.equal(cacheKey.startsWith("sha256:"), true);
+  assert.equal(cacheKey.includes(oversizedOutput), false);
+
+  const firstAnalysis = analyzeSubagentOutput(oversizedOutput);
+  const secondAnalysis = analyzeSubagentOutput(oversizedOutput);
+  assert.equal(secondAnalysis, firstAnalysis);
+  assert.equal(firstAnalysis.summary.startsWith("Large stream snapshot"), true);
+  assert.deepEqual(firstAnalysis.commands, ["read src/index.ts"]);
+});
+
+runTest("delegated subagents do not load local extensions by default", () => {
+  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  assert.equal(routerSource.includes("routerConfig.delegatedExtensions"), true);
+  assert.deepEqual(DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions, []);
+});
+
+runTest("delegated extension metadata declares generic runtime skip rules", () => {
+  const result = parseDelegatedExtensionRuntimeMetadata({
+    piAgentRouter: {
+      delegatedRuntime: {
+        skipWhen: ["directEnvAuthAvailable"],
+      },
+    },
+  });
+
+  assert.deepEqual(result.metadata.skipWhen, ["directEnvAuthAvailable"]);
+  assert.deepEqual(result.warnings, []);
 });
 
 runTest("delegated subagents disable automatic extension discovery before applying the curated extension set", () => {

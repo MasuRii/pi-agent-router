@@ -1,6 +1,9 @@
 node_modules
 config.json
 *.log
+debug/
+src/test/
+src/test.ts
 .git
 .gitignore
 .npmignore

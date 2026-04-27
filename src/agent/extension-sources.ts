@@ -7,6 +7,12 @@ import type { Api, AssistantMessageEventStream, Context as LlmContext, Model, Si
 import type { Agent, ApiStreamSimpleDelegate, GlobalWithAgentRouterBaseApiStreams } from "../types";
 
 const ACTIVE_AGENT_PROMPT_MODULE_URL = new URL("./active-agent-prompt.ts", import.meta.url).href;
+const TEMPERATURE_SUPPORT_MODULE_URL = new URL("./temperature-support.ts", import.meta.url).href;
+const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
+  "openai-completions",
+  "openai-responses",
+  "anthropic-messages",
+] as const;
 
 export function getAgentRouterBaseApiStreams(): Map<string, ApiStreamSimpleDelegate> {
   const globalScope = globalThis as GlobalWithAgentRouterBaseApiStreams;
@@ -48,6 +54,7 @@ export function buildDelegatedTemperatureExtensionSource(temperature: number): s
   return [
     "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@mariozechner/pi-ai\";",
     "import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";",
+    `import { supportsRuntimeTemperatureOption } from ${JSON.stringify(TEMPERATURE_SUPPORT_MODULE_URL)};`,
     "",
     `const runtimeTemperature = ${JSON.stringify(runtimeTemperature)};`,
     "",
@@ -79,10 +86,12 @@ export function buildDelegatedTemperatureExtensionSource(temperature: number): s
     "      streamSimple: (model, context, options) => {",
     "        const base = baseApiStreams.get(model.api);",
     "        if (!base) throw new Error(`No base stream provider for api '${model.api}'.`);",
+    "        const typedModel = model as Model<Api>;",
+    "        if (!supportsRuntimeTemperatureOption(typedModel)) return base(typedModel, context, options);",
     "        const nextOptions: SimpleStreamOptions = options",
     "          ? { ...options, temperature: runtimeTemperature }",
     "          : { temperature: runtimeTemperature };",
-    "        return base(model as Model<Api>, context, nextOptions);",
+    "        return base(typedModel, context, nextOptions);",
     "      },",
     "    });",
     "    wrappedApis.add(api);",
@@ -104,7 +113,9 @@ export function buildDelegatedTemperatureExtensionSource(temperature: number): s
   ].join("\n");
 }
 
-export function buildDelegatedCopilotInitiatorExtensionSource(): string {
+export function buildDelegatedCopilotInitiatorExtensionSource(
+  targetApis: readonly string[] = DEFAULT_COPILOT_INITIATOR_TARGET_APIS,
+): string {
   return [
     "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@mariozechner/pi-ai\";",
     "import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";",
@@ -117,7 +128,7 @@ export function buildDelegatedCopilotInitiatorExtensionSource(): string {
     "",
     "const baseApiStreams = new Map<string, ApiStreamSimpleDelegate>();",
     "const wrappedApis = new Set<string>();",
-    "const TARGET_APIS: Api[] = [\"openai-completions\", \"openai-responses\", \"anthropic-messages\"];",
+    `const TARGET_APIS = ${JSON.stringify([...targetApis])} as Api[];`,
     "",
     "function ensureWrapper(pi: ExtensionAPI, api: Api): boolean {",
     "  if (wrappedApis.has(api)) return true;",

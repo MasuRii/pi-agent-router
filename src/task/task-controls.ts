@@ -6,10 +6,13 @@ import { createBoundedCache } from "../cache/bounded-cache";
 import {
   AGENT_DIR,
   SUBAGENT_DEFAULT_TIMEOUT_MS,
+  SUBAGENT_MAX_CONFIGURABLE_CONCURRENCY,
   SUBAGENT_MAX_CONCURRENCY,
+  SUBAGENT_MIN_CONCURRENCY,
   SUBAGENT_MIN_TIMEOUT_MS,
   TASK_CONTROLS_CACHE_MAX_ENTRIES,
 } from "../constants";
+import { CONFIG_PATH, loadPiAgentRouterConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { normalizeInputText } from "../input-normalization";
 import type { OutputContractStrictness } from "../output-contract";
@@ -23,6 +26,12 @@ export type AgentRouterTaskControls = {
   defaultTimeoutMs: number;
   outputStrictness: OutputContractStrictness;
 };
+
+export interface TaskControlsResolutionOptions {
+  configPath?: string;
+  globalSettingsPath?: string;
+  projectSettingsPath?: string;
+}
 
 const DEFAULT_TASK_CONTROLS: AgentRouterTaskControls = {
   maxConcurrency: SUBAGENT_MAX_CONCURRENCY,
@@ -87,8 +96,19 @@ function getTaskControlsEnvSignature(): string {
   ].join("\u0000");
 }
 
-function createTaskControlsCacheKey(cwd: string): string {
-  return `${resolve(cwd)}\u0000${getTaskControlsEnvSignature()}`;
+function getTaskControlsConfigSignature(options: TaskControlsResolutionOptions = {}): string {
+  return [
+    resolve(options.configPath ?? CONFIG_PATH),
+    resolve(options.globalSettingsPath ?? join(AGENT_DIR, "settings.json")),
+    options.projectSettingsPath ? resolve(options.projectSettingsPath) : "nearest-project-settings",
+  ].join("\u0000");
+}
+
+function createTaskControlsCacheKey(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): string {
+  return `${resolve(cwd)}\u0000${getTaskControlsEnvSignature()}\u0000${getTaskControlsConfigSignature(options)}`;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -269,19 +289,28 @@ function parseStrictnessSetting(
   return fallback;
 }
 
-function buildTaskControlsResult(cwd: string): {
+function buildTaskControlsResult(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): {
   controls: AgentRouterTaskControls;
   warnings: string[];
 } {
   const warnings: string[] = [];
 
-  const globalSettingsPath = join(AGENT_DIR, "settings.json");
-  const projectSettingsPath = findNearestProjectSettingsPath(cwd);
+  const routerConfigResult = loadPiAgentRouterConfig(options.configPath ?? CONFIG_PATH);
+  if (routerConfigResult.warning) {
+    warnings.push(routerConfigResult.warning);
+  }
+
+  const globalSettingsPath = options.globalSettingsPath ?? join(AGENT_DIR, "settings.json");
+  const projectSettingsPath = options.projectSettingsPath ?? findNearestProjectSettingsPath(cwd);
 
   const globalTaskSettings = pickTaskSettings(readJsonFile(globalSettingsPath));
   const projectTaskSettings = pickTaskSettings(projectSettingsPath ? readJsonFile(projectSettingsPath) : undefined);
 
   const merged: Record<string, unknown> = {
+    maxConcurrency: routerConfigResult.config.maxParallelDelegationConcurrency,
     ...globalTaskSettings,
     ...projectTaskSettings,
   };
@@ -304,8 +333,8 @@ function buildTaskControlsResult(cwd: string): {
   return {
     controls: {
       maxConcurrency: parseNumberSetting(merged.maxConcurrency, DEFAULT_TASK_CONTROLS.maxConcurrency, {
-        min: 1,
-        max: 16,
+        min: SUBAGENT_MIN_CONCURRENCY,
+        max: SUBAGENT_MAX_CONFIGURABLE_CONCURRENCY,
         field: "maxConcurrency",
       }, warnings),
       maxRecursionDepth: parseNumberSetting(merged.maxRecursionDepth, DEFAULT_TASK_CONTROLS.maxRecursionDepth, {
@@ -325,14 +354,22 @@ function buildTaskControlsResult(cwd: string): {
   };
 }
 
-async function buildTaskControlsResultAsync(cwd: string): Promise<{
+async function buildTaskControlsResultAsync(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): Promise<{
   controls: AgentRouterTaskControls;
   warnings: string[];
 }> {
   const warnings: string[] = [];
 
-  const globalSettingsPath = join(AGENT_DIR, "settings.json");
-  const projectSettingsPath = await findNearestProjectSettingsPathAsync(cwd);
+  const routerConfigResult = loadPiAgentRouterConfig(options.configPath ?? CONFIG_PATH);
+  if (routerConfigResult.warning) {
+    warnings.push(routerConfigResult.warning);
+  }
+
+  const globalSettingsPath = options.globalSettingsPath ?? join(AGENT_DIR, "settings.json");
+  const projectSettingsPath = options.projectSettingsPath ?? (await findNearestProjectSettingsPathAsync(cwd));
 
   const [globalSettings, projectSettings] = await Promise.all([
     readJsonFileAsync(globalSettingsPath),
@@ -343,6 +380,7 @@ async function buildTaskControlsResultAsync(cwd: string): Promise<{
   const projectTaskSettings = pickTaskSettings(projectSettings);
 
   const merged: Record<string, unknown> = {
+    maxConcurrency: routerConfigResult.config.maxParallelDelegationConcurrency,
     ...globalTaskSettings,
     ...projectTaskSettings,
   };
@@ -365,8 +403,8 @@ async function buildTaskControlsResultAsync(cwd: string): Promise<{
   return {
     controls: {
       maxConcurrency: parseNumberSetting(merged.maxConcurrency, DEFAULT_TASK_CONTROLS.maxConcurrency, {
-        min: 1,
-        max: 16,
+        min: SUBAGENT_MIN_CONCURRENCY,
+        max: SUBAGENT_MAX_CONFIGURABLE_CONCURRENCY,
         field: "maxConcurrency",
       }, warnings),
       maxRecursionDepth: parseNumberSetting(merged.maxRecursionDepth, DEFAULT_TASK_CONTROLS.maxRecursionDepth, {
@@ -386,11 +424,14 @@ async function buildTaskControlsResultAsync(cwd: string): Promise<{
   };
 }
 
-export function resolveTaskControls(cwd: string): {
+export function resolveTaskControls(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): {
   controls: AgentRouterTaskControls;
   warnings: string[];
 } {
-  const cacheKey = createTaskControlsCacheKey(cwd);
+  const cacheKey = createTaskControlsCacheKey(cwd, options);
   const cachedResult = taskControlsCache.get(cacheKey);
   if (cachedResult) {
     taskControlsCounters.hits += 1;
@@ -398,7 +439,7 @@ export function resolveTaskControls(cwd: string): {
   }
 
   taskControlsCounters.misses += 1;
-  const result = buildTaskControlsResult(cwd);
+  const result = buildTaskControlsResult(cwd, options);
 
   const setResult = taskControlsCache.set(cacheKey, {
     controls: cloneTaskControls(result.controls),
@@ -414,11 +455,14 @@ export function resolveTaskControls(cwd: string): {
   return cloneTaskControlsResult(result);
 }
 
-export async function resolveTaskControlsAsync(cwd: string): Promise<{
+export async function resolveTaskControlsAsync(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): Promise<{
   controls: AgentRouterTaskControls;
   warnings: string[];
 }> {
-  const cacheKey = createTaskControlsCacheKey(cwd);
+  const cacheKey = createTaskControlsCacheKey(cwd, options);
   const cachedResult = taskControlsCache.get(cacheKey);
   if (cachedResult) {
     taskControlsCounters.hits += 1;
@@ -434,7 +478,7 @@ export async function resolveTaskControlsAsync(cwd: string): Promise<{
   const cacheRevision = taskControlsCacheRevision;
 
   const loadPromise = (async (): Promise<{ controls: AgentRouterTaskControls; warnings: string[] }> => {
-    const result = await buildTaskControlsResultAsync(cwd);
+    const result = await buildTaskControlsResultAsync(cwd, options);
 
     if (cacheRevision === taskControlsCacheRevision) {
       const setResult = taskControlsCache.set(cacheKey, {

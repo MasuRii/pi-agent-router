@@ -65,6 +65,23 @@ runTest("partial update gate dedupes identical frames and throttles rapid change
   assert.equal(gate.shouldEmit({ fingerprint: "frame-b" }), true);
 });
 
+runTest("partial update gate skips fingerprint work while cadence suppresses all changes", () => {
+  let now = 1_000;
+  const gate = createTaskToolPartialUpdateGate({
+    now: () => now,
+    minIntervalMs: 400,
+  });
+
+  assert.equal(gate.shouldBuildFingerprint(), true);
+  assert.equal(gate.shouldEmit({ fingerprint: "frame-a" }), true);
+
+  now += 100;
+  assert.equal(gate.shouldBuildFingerprint(), false);
+
+  now += 300;
+  assert.equal(gate.shouldBuildFingerprint(), true);
+});
+
 runTest("partial update gate force option bypasses throttle for changed state", () => {
   let now = 2_000;
   const gate = createTaskToolPartialUpdateGate({

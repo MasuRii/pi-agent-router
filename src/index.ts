@@ -65,7 +65,6 @@ import type {
 import {
   AGENT_DIR,
   DEFAULT_AGENT,
-  DEFAULT_PRIMARY_AGENTS,
   FINISHED_SUBAGENT_TTL_MS,
   LINUX_TAB_CYCLE_DEBOUNCE_MS,
   SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
@@ -152,6 +151,11 @@ import {
 } from "./subagent/subagent-execution";
 import { renderParallelDelegationResult } from "./task/parallel-delegation-renderer";
 import { mapWithAbortAwareConcurrency } from "./task/parallel-control";
+import {
+  mergeDelegatedExtensionSkipWhen,
+  readDelegatedExtensionRuntimeMetadataAsync,
+  shouldSkipDelegatedExtension,
+} from "./subagent/delegated-extensions";
 import { SPINNER_RENDER_INTERVAL_MS } from "./progress-spinner";
 import { createAnimatedRenderSurface } from "./ui/animated-render-surface";
 import { createUiRenderScheduler } from "./ui/render-scheduler";
@@ -162,6 +166,7 @@ import {
   resolveTaskToolUpdateCadence,
 } from "./task/task-update-dedupe";
 import { normalizeDelegatedOutput } from "./output-contract";
+import { loadPiAgentRouterConfig } from "./config";
 import { piAgentRouterDebugLogger } from "./debug-logger";
 import { getErrorMessage } from "./error-utils";
 import {
@@ -169,17 +174,22 @@ import {
   detectSubagentProviderIdAsync,
   isQuotaOrRateLimitError,
   resolveProviderEnvKeyAsync,
+  isDirectEnvDelegationAuthAvailableForProviderAsync,
+  shouldInheritParentCredentialEnvForProvider,
   isRetryableModelAvailabilityError,
   isTransientCredentialError,
   releaseKeyForSubagent,
   releaseKeyLeasesForParentSession,
   reportSubagentKeyError,
   reportSubagentTransientKeyError,
-  shouldSkipDelegatedMultiAuthForProviderAsync,
   tryAcquireKeyForSubagent,
 } from "./subagent/subagent-key-distribution";
 import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env.js";
 import { buildSystemPromptForActiveAgent } from "./agent/active-agent-prompt";
+import {
+  getRuntimeTemperatureUnsupportedReason,
+  supportsRuntimeTemperatureOption,
+} from "./agent/temperature-support";
 
 // Re-export shared types for external consumers
 export type {
@@ -232,26 +242,8 @@ const TaskBatchItem = Type.Object({
   agent: Type.String({ description: "Agent name for this task (required)." }),
 });
 
-const SUBAGENT_REQUIRED_EXTENSION_CANDIDATES = [
-  ["pi-permission-system"],
-  ["pi-sensitive-guard", "env-protection"],
-  ["context-injector"],
-  ["pi-mcp-adapter"],
-  ["pi-rtk-optimizer", "rtk-integration"],
-  ["pi-system-prompt-sanitizer"],
-] as const;
-
 const PI_FAST_MODE_EXTENSION_NAME = "pi-fast-mode";
 const PI_FAST_MODE_FLAG = "fast";
-
-const SUBAGENT_OPTIONAL_EXTENSION_NAMES = [
-  "pi-factory-auth",
-  "pi-multi-auth",
-  "multi-auth",
-  "pi-find-robustness",
-  "pi-fast-mode",
-  "pi-tool-display",
-] as const;
 
 const resolveExtensionDirectory = (
   extensionCandidates: readonly string[],
@@ -304,6 +296,20 @@ const shouldForwardFastModeFlag = (
   return delegatedExtensionDirs.includes(
     join(AGENT_DIR, "extensions", PI_FAST_MODE_EXTENSION_NAME),
   );
+};
+
+const mergeOutputNotices = (
+  current: string | undefined,
+  next: string | undefined,
+): string | undefined => {
+  const merged = [current?.trim(), next?.trim()].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (merged.length === 0) {
+    return undefined;
+  }
+
+  return [...new Set(merged)].join("\n");
 };
 
 export default function agentRouterExtension(pi: ExtensionAPI) {
@@ -858,15 +864,19 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             );
           }
 
-          if (typeof activeRuntimeTemperature !== "number") {
-            return delegate(model as Model<Api>, context, options);
+          const typedModel = model as Model<Api>;
+          if (
+            typeof activeRuntimeTemperature !== "number" ||
+            !supportsRuntimeTemperatureOption(typedModel)
+          ) {
+            return delegate(typedModel, context, options);
           }
 
           const nextOptions: SimpleStreamOptions = options
             ? { ...options, temperature: activeRuntimeTemperature }
             : { temperature: activeRuntimeTemperature };
 
-          return delegate(model as Model<Api>, context, nextOptions);
+          return delegate(typedModel, context, nextOptions);
         },
       });
 
@@ -1002,6 +1012,19 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           return;
         }
 
+        const temperatureUnsupportedReason = getRuntimeTemperatureUnsupportedReason(effectiveModel as Model<Api>);
+        if (temperatureUnsupportedReason) {
+          const warningKey = `${agent.name}:temperature:unsupported-model:${toModelReference(effectiveModel)}`;
+          if (!warnedTemperatureRuntime.has(warningKey)) {
+            warnedTemperatureRuntime.add(warningKey);
+            notify(
+              `Agent '${agent.name}' temperature ${agent.temperature} was ignored because ${temperatureUnsupportedReason}.`,
+              "info",
+            );
+          }
+          return;
+        }
+
         const api = effectiveModel.api as Api;
         const wrapperReady = ensureTemperatureApiWrapper(api, notify);
         if (!wrapperReady) {
@@ -1102,7 +1125,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     session.stdoutTruncated = Boolean(run.stdoutTruncated);
     session.stderrTruncated = Boolean(run.stderrTruncated);
-    session.outputNotice = run.outputNotice?.trim() || undefined;
+    session.outputNotice = mergeOutputNotices(
+      session.outputNotice,
+      run.outputNotice,
+    );
 
     if (run.stderr.trim()) {
       session.stderr = session.stderr
@@ -1451,6 +1477,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     enforceSubagentSessionRetentionLimit();
     requestSubagentUiRender();
 
+    const delegatedModelResolution = resolveAgentModel<{ provider: string; id: string; api: Api }>(ctx, agent);
+    const delegatedModel = delegatedModelResolution.model;
+    const delegatedModelRef = delegatedModel
+      ? toModelReference(delegatedModel)
+      : agent.model?.trim() || undefined;
+    const delegatedModelContext = delegatedModel
+      ? {
+          providerId: delegatedModel.provider,
+          modelId: delegatedModel.id,
+          modelRef: delegatedModelRef,
+          api: String(delegatedModel.api),
+        }
+      : undefined;
+
     const args: string[] = [
       "--mode",
       "json",
@@ -1462,16 +1502,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     if (options.sessionPath) {
       args.push("--session", options.sessionPath);
     }
-    if (agent.model) {
-      args.push("--model", agent.model);
+    if (delegatedModelRef) {
+      args.push("--model", delegatedModelRef);
     }
     if (agent.thinkingLevel) {
       args.push("--thinking", agent.thinkingLevel);
     }
 
     const subagentProviderId = await detectSubagentProviderIdAsync({
-      requestedModel: agent.model,
-      activeProviderId: ctx.model?.provider,
+      requestedModel: delegatedModelRef,
+      activeProviderId: delegatedModel?.provider ?? ctx.model?.provider,
       parentEnv: process.env,
     });
     const subagentProviderEnvKey = await resolveProviderEnvKeyAsync(subagentProviderId);
@@ -1488,47 +1528,76 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       session.isolatedAgentDir = isolatedAgentDirResult.agentDir;
       isolatedAgentDirs.add(isolatedAgentDirResult.agentDir);
 
-      const resolvedRequiredExtensions = await Promise.all(
-        SUBAGENT_REQUIRED_EXTENSION_CANDIDATES.map(async (extensionCandidates) => ({
-          extensionCandidates,
-          resolvedExtensionDir: await resolveExtensionDirectoryAsync(extensionCandidates),
-        })),
-      );
-      const requiredExtensionDirs = resolvedRequiredExtensions
-        .map((entry) => entry.resolvedExtensionDir)
-        .filter((extensionDir): extensionDir is string => Boolean(extensionDir));
-      const missingRequiredExtensions = resolvedRequiredExtensions
-        .filter((entry) => !entry.resolvedExtensionDir)
-        .map((entry) => formatExtensionCandidatePaths(entry.extensionCandidates));
+      const routerConfig = loadPiAgentRouterConfig().config;
+      const directEnvAuthAvailable =
+        await isDirectEnvDelegationAuthAvailableForProviderAsync(subagentProviderId);
+      const delegatedExtensionResolutionResults = await Promise.all(
+        routerConfig.delegatedExtensions.map(async (extensionEntry) => {
+          const resolvedExtensionDir = await resolveExtensionDirectoryAsync(
+            extensionEntry.candidates,
+          );
+          if (!resolvedExtensionDir) {
+            return {
+              extensionEntry,
+              missingExtensionCandidates: formatExtensionCandidatePaths(
+                extensionEntry.candidates,
+              ),
+            };
+          }
 
-      if (missingRequiredExtensions.length > 0) {
-        throw new Error(
-          `Missing required delegated extensions: ${missingRequiredExtensions.join(", ")}. Ensure critical/important extensions are installed before delegating.`,
-        );
+          const metadataResult = await readDelegatedExtensionRuntimeMetadataAsync(
+            resolvedExtensionDir,
+          );
+          const skipWhen = mergeDelegatedExtensionSkipWhen(
+            extensionEntry,
+            metadataResult.metadata,
+          );
+
+          return {
+            extensionEntry,
+            metadataWarnings: metadataResult.warnings,
+            resolvedExtensionDir,
+            skipWhen,
+          };
+        }),
+      );
+
+      const delegatedExtensionDirs: string[] = [];
+      for (const resolutionResult of delegatedExtensionResolutionResults) {
+        if ("missingExtensionCandidates" in resolutionResult) {
+          void piAgentRouterDebugLogger.warn("subagent.delegated_extension_missing", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            missingExtensionCandidates: resolutionResult.missingExtensionCandidates,
+          });
+          continue;
+        }
+
+        for (const metadataWarning of resolutionResult.metadataWarnings) {
+          void piAgentRouterDebugLogger.warn("subagent.delegated_extension_metadata_warning", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            extensionDir: resolutionResult.resolvedExtensionDir,
+            warning: metadataWarning,
+          });
+        }
+
+        if (
+          shouldSkipDelegatedExtension(resolutionResult.skipWhen, {
+            directEnvAuthAvailable,
+          })
+        ) {
+          void piAgentRouterDebugLogger.info("subagent.delegated_extension_skipped_by_rule", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            extensionDir: resolutionResult.resolvedExtensionDir,
+            skipWhen: resolutionResult.skipWhen,
+          });
+          continue;
+        }
+
+        delegatedExtensionDirs.push(resolutionResult.resolvedExtensionDir);
       }
-
-      const shouldSkipDelegatedMultiAuth = await shouldSkipDelegatedMultiAuthForProviderAsync(
-        subagentProviderId,
-      );
-      const optionalExtensionDirs = (
-        await Promise.all(
-          SUBAGENT_OPTIONAL_EXTENSION_NAMES.map(async (extensionName) => {
-            const isDelegatedMultiAuthExtension =
-              extensionName === "pi-multi-auth" || extensionName === "multi-auth";
-            if (shouldSkipDelegatedMultiAuth && isDelegatedMultiAuthExtension) {
-              return null;
-            }
-
-            const extensionDir = join(AGENT_DIR, "extensions", extensionName);
-            return (await isDirectoryAsync(extensionDir)) ? extensionDir : null;
-          }),
-        )
-      ).filter((extensionDir): extensionDir is string => Boolean(extensionDir));
-
-      const delegatedExtensionDirs = [
-        ...requiredExtensionDirs,
-        ...optionalExtensionDirs,
-      ];
 
       for (const extensionDir of delegatedExtensionDirs) {
         args.push("-e", extensionDir);
@@ -1551,7 +1620,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         "delegated-runtime-copilot-initiator.ts",
       );
       const copilotInitiatorExtensionSource =
-        buildDelegatedCopilotInitiatorExtensionSource();
+        buildDelegatedCopilotInitiatorExtensionSource(
+          routerConfig.copilotInitiatorTargetApis,
+        );
 
       const delegatedIdentityExtension = join(
         tempDir,
@@ -1853,20 +1924,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       );
     };
 
-    const mergeOutputNotices = (
-      current: string | undefined,
-      next: string | undefined,
-    ): string | undefined => {
-      const merged = [current?.trim(), next?.trim()].filter(
-        (value): value is string => Boolean(value),
-      );
-      if (merged.length === 0) {
-        return undefined;
-      }
-
-      return [...new Set(merged)].join("\n");
-    };
-
     const preferRicherRunResult = (
       base: SubagentRunResult,
       candidate: SubagentRunResult | undefined,
@@ -2003,7 +2060,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         session.id,
         subagentProviderId,
         {
-          requestedModel: agent.model,
+          requestedModel: delegatedModelRef,
+          modelContext: delegatedModelContext,
           parentSessionId: session.parentSessionId,
         },
       );
@@ -2293,9 +2351,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const startSubagentProcess = async (): Promise<void> => {
           try {
             const parentSessionId = activeParentSessionId || syncActiveParentSessionId(ctx);
-            const inheritedEnvKeys = subagentProviderEnvKey
-              ? [subagentProviderEnvKey]
-              : undefined;
+            const inheritedEnvKeys =
+              subagentProviderEnvKey && shouldInheritParentCredentialEnvForProvider(subagentProviderId)
+                ? [subagentProviderEnvKey]
+                : undefined;
             const subagentEnv = buildSubagentSpawnEnv({
               parentEnv: process.env,
               parentSessionId,
@@ -2635,8 +2694,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     if (cyclable.length === 0) {
       const available = agents.map((agent) => agent.name).join(", ") || "none";
+      const configuredPrimaryAgents = loadPiAgentRouterConfig().config.primaryAgents;
       ctx.ui.notify(
-        `No primary agents found for Tab cycling. Expected primary defaults: ${DEFAULT_PRIMARY_AGENTS.join(", ")}\nAvailable: ${available}`,
+        `No primary agents found for Tab cycling. Expected primary defaults: ${configuredPrimaryAgents.join(", ")}\nAvailable: ${available}`,
         "warning",
       );
       return;
@@ -3586,6 +3646,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           }
 
           try {
+            if (!partialUpdateGate.shouldBuildFingerprint({ force: options.force })) {
+              return;
+            }
+
             const snapshot = buildParallelUpdateSnapshot();
             const fingerprint = buildTaskToolPartialUpdateFingerprint({
               message,

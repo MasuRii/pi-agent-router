@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { loadPiAgentRouterConfig, type SubagentWidgetIconConfigMode } from "../config";
+
 export type SubagentWidgetIconMode = "nerd" | "fallback";
 
 export type SubagentWidgetIcons = {
@@ -20,7 +22,7 @@ export type SubagentWidgetIconDetectionContext = {
   readTextFile: (path: string) => string | null;
 };
 
-type SubagentWidgetIconPreference = SubagentWidgetIconMode | "auto";
+type SubagentWidgetIconPreference = SubagentWidgetIconConfigMode;
 
 const NERD_ICONS: SubagentWidgetIcons = {
   running: "",
@@ -95,6 +97,7 @@ function parsePreference(value: string | undefined): SubagentWidgetIconPreferenc
 
 function resolvePreference(
   env: Record<string, string | undefined>,
+  configuredPreference: SubagentWidgetIconPreference,
 ): SubagentWidgetIconPreference {
   const explicitMode = parsePreference(env.PI_AGENT_ROUTER_ICON_MODE);
   if (explicitMode) {
@@ -108,7 +111,7 @@ function resolvePreference(
     return explicitBoolean ? "nerd" : "fallback";
   }
 
-  return "auto";
+  return configuredPreference;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -397,8 +400,9 @@ function iconsForMode(mode: SubagentWidgetIconMode): SubagentWidgetIcons {
 
 export function resolveSubagentWidgetIconsForContext(
   context: SubagentWidgetIconDetectionContext,
+  configuredPreference: SubagentWidgetIconPreference = "auto",
 ): ResolvedSubagentWidgetIcons {
-  const preference = resolvePreference(context.env);
+  const preference = resolvePreference(context.env, configuredPreference);
   const mode =
     preference === "auto"
       ? resolveAutoMode(context)
@@ -413,5 +417,8 @@ export function resolveSubagentWidgetIconsForContext(
 }
 
 export function resolveSubagentWidgetIcons(): ResolvedSubagentWidgetIcons {
-  return resolveSubagentWidgetIconsForContext(createDefaultContext());
+  return resolveSubagentWidgetIconsForContext(
+    createDefaultContext(),
+    loadPiAgentRouterConfig().config.subagentWidgetIconMode,
+  );
 }

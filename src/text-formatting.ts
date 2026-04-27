@@ -2,6 +2,8 @@
  * Text formatting and display utilities.
  */
 
+import { createHash } from "node:crypto";
+
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import {
@@ -11,12 +13,16 @@ import {
   TASK_HISTORY_SUMMARY_MAX_CHARS,
 } from "./constants";
 import { getPersistedActiveAgentName } from "./agent/agent-discovery";
+import { createBoundedCache } from "./cache/bounded-cache";
 import { normalizeInputText } from "./input-normalization";
 import { sanitizeSubagentResultForDisplay } from "./output-sanitizer";
 import type { SubagentOutputDigest, AgentScope } from "./types";
 
 const SUBAGENT_OUTPUT_ANALYSIS_CACHE_MAX_ENTRIES = 128;
-const subagentOutputAnalysisCache = new Map<string, SubagentOutputAnalysis>();
+export const SUBAGENT_OUTPUT_ANALYSIS_RAW_CACHE_KEY_MAX_CHARS = 16 * 1024;
+const subagentOutputAnalysisCache = createBoundedCache<string, SubagentOutputAnalysis>(
+  SUBAGENT_OUTPUT_ANALYSIS_CACHE_MAX_ENTRIES,
+);
 
 export type SubagentOutputAnalysis = SubagentOutputDigest & {
   toolCalls: number;
@@ -27,22 +33,20 @@ function stripAnsiCodes(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
+export function createSubagentOutputAnalysisCacheKey(rawText: string): string {
+  if (rawText.length <= SUBAGENT_OUTPUT_ANALYSIS_RAW_CACHE_KEY_MAX_CHARS) {
+    return `raw:${rawText}`;
+  }
+
+  const digest = createHash("sha256").update(rawText).digest("hex");
+  return `sha256:${rawText.length}:${digest}`;
+}
+
 function cacheSubagentOutputAnalysis(
   cacheKey: string,
   analysis: SubagentOutputAnalysis,
 ): SubagentOutputAnalysis {
-  if (subagentOutputAnalysisCache.has(cacheKey)) {
-    subagentOutputAnalysisCache.delete(cacheKey);
-  }
-
   subagentOutputAnalysisCache.set(cacheKey, analysis);
-  if (subagentOutputAnalysisCache.size > SUBAGENT_OUTPUT_ANALYSIS_CACHE_MAX_ENTRIES) {
-    const oldestKey = subagentOutputAnalysisCache.keys().next().value;
-    if (typeof oldestKey === "string") {
-      subagentOutputAnalysisCache.delete(oldestKey);
-    }
-  }
-
   return analysis;
 }
 
@@ -295,13 +299,14 @@ export function extractToolCommandPreviews(text: string, maxCommands = 4): strin
 }
 
 export function analyzeSubagentOutput(rawText: string | undefined): SubagentOutputAnalysis {
-  const cacheKey = typeof rawText === "string" ? rawText : "";
+  const sourceText = typeof rawText === "string" ? rawText : "";
+  const cacheKey = createSubagentOutputAnalysisCacheKey(sourceText);
   const cached = subagentOutputAnalysisCache.get(cacheKey);
   if (cached) {
     return cached;
   }
 
-  const sanitized = sanitizeSubagentResultForDisplay(cacheKey);
+  const sanitized = sanitizeSubagentResultForDisplay(sourceText);
   if (!sanitized) {
     return cacheSubagentOutputAnalysis(cacheKey, {
       summary: "(no output yet)",

@@ -1,0 +1,67 @@
+{
+  "debug": false,
+  "maxParallelDelegationConcurrency": 4,
+  "agentDiscovery": {
+    "projectSourceDirs": [
+      ".omp/agents",
+      ".pi/agents",
+      ".claude/agents"
+    ],
+    "userSourceDirs": [
+      "{home}/.omp/agents",
+      "{agentDir}/agents",
+      "{home}/.claude/agents"
+    ]
+  },
+  "delegatedExtensions": [],
+  "providerEnvKeys": {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai-codex": "OPENAI_API_KEY",
+    "google-gemini-cli": "GOOGLE_API_KEY"
+  },
+  "directEnvDelegationProviderIds": [
+    "amazon-bedrock",
+    "anthropic",
+    "azure-openai-responses",
+    "cerebras",
+    "github-copilot",
+    "google",
+    "google-vertex",
+    "groq",
+    "huggingface",
+    "kimi-coding",
+    "minimax",
+    "minimax-cn",
+    "mistral",
+    "openai",
+    "opencode",
+    "opencode-go",
+    "openrouter",
+    "xai",
+    "zai"
+  ],
+  "providerCredentialFallbackPolicies": {
+    "openai-codex": "distributed-only"
+  },
+  "copilotInitiatorTargetApis": [
+    "openai-completions",
+    "openai-responses",
+    "anthropic-messages"
+  ],
+  "primaryAgents": [
+    "code",
+    "ask",
+    "debug",
+    "architect",
+    "orchestrator"
+  ],
+  "agentEmojis": {
+    "code": "💻",
+    "ask": "❓",
+    "debug": "🐛",
+    "architect": "🏗️",
+    "orchestrator": "🎯"
+  },
+  "subagentWidgetIconMode": "auto"
+}

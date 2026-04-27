@@ -12,15 +12,16 @@ import { dirname, join, resolve } from "node:path";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import { createBoundedCache } from "../cache/bounded-cache";
+import { mapWithAbortAwareConcurrency } from "../task/parallel-control";
 import {
+  AGENT_DIR,
   AGENTS_DIR,
   AGENT_DISCOVERY_CACHE_MAX_ENTRIES,
-  DEFAULT_PRIMARY_AGENTS,
-  DEFAULT_PRIMARY_AGENT_SET,
   PRIMARY_MODE_VALUES,
   VALID_THINKING_LEVELS,
-  AGENT_EMOJIS,
 } from "../constants";
+import { loadPiAgentRouterConfig } from "../config";
+import type { AgentDiscoveryConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { normalizeInputText } from "../input-normalization";
 import { isDirectory, isDirectoryAsync } from "../subagent/session-paths";
@@ -34,13 +35,85 @@ import type {
 } from "../types";
 
 
-const PROJECT_AGENT_SOURCE_DIRS = [
-  [".omp", "agents"],
-  [".pi", "agents"],
-  [".claude", "agents"],
-] as const;
+export const AGENT_MARKDOWN_PARSE_CONCURRENCY = 8;
 
-const USER_AGENT_SOURCE_DIRS = [join(homedir(), ".omp", "agents"), AGENTS_DIR, join(homedir(), ".claude", "agents")] as const;
+type AgentDiscoveryConfigSlices = {
+  agentDiscovery: AgentDiscoveryConfig;
+  primaryAgents: readonly string[];
+  primaryAgentSet: ReadonlySet<string>;
+  agentEmojis: Readonly<Record<string, string>>;
+};
+
+let cachedAgentDiscoveryConfigSlices: AgentDiscoveryConfigSlices | undefined;
+
+function getConfiguredAgentDiscoverySlices(): AgentDiscoveryConfigSlices {
+  if (cachedAgentDiscoveryConfigSlices) {
+    return cachedAgentDiscoveryConfigSlices;
+  }
+
+  const config = loadPiAgentRouterConfig().config;
+  cachedAgentDiscoveryConfigSlices = {
+    agentDiscovery: {
+      projectSourceDirs: [...config.agentDiscovery.projectSourceDirs],
+      userSourceDirs: [...config.agentDiscovery.userSourceDirs],
+    },
+    primaryAgents: [...config.primaryAgents],
+    primaryAgentSet: new Set(config.primaryAgents),
+    agentEmojis: { ...config.agentEmojis },
+  };
+  return cachedAgentDiscoveryConfigSlices;
+}
+
+function resetConfiguredAgentDiscoverySlices(): void {
+  cachedAgentDiscoveryConfigSlices = undefined;
+}
+
+function getConfiguredAgentDiscovery(): AgentDiscoveryConfig {
+  return getConfiguredAgentDiscoverySlices().agentDiscovery;
+}
+
+function stripLeadingPathSeparators(value: string): string {
+  return value.replace(/^[\\/]+/, "");
+}
+
+function resolveConfiguredUserPath(rawPath: string): string {
+  const normalizedPath = normalizeInputText(rawPath);
+  if (!normalizedPath) {
+    return resolve(AGENTS_DIR);
+  }
+
+  if (normalizedPath === "~") {
+    return homedir();
+  }
+
+  if (normalizedPath.startsWith("~/") || normalizedPath.startsWith("~\\")) {
+    return join(homedir(), stripLeadingPathSeparators(normalizedPath.slice(1)));
+  }
+
+  if (normalizedPath === "{home}") {
+    return homedir();
+  }
+
+  if (normalizedPath.startsWith("{home}/") || normalizedPath.startsWith("{home}\\")) {
+    return join(homedir(), stripLeadingPathSeparators(normalizedPath.slice("{home}".length)));
+  }
+
+  if (normalizedPath === "{agentDir}") {
+    return AGENT_DIR;
+  }
+
+  if (normalizedPath.startsWith("{agentDir}/") || normalizedPath.startsWith("{agentDir}\\")) {
+    return join(AGENT_DIR, stripLeadingPathSeparators(normalizedPath.slice("{agentDir}".length)));
+  }
+
+  return resolve(normalizedPath);
+}
+
+function getConfiguredUserAgentSourceDirs(): string[] {
+  return getConfiguredAgentDiscovery().userSourceDirs.map((sourceDir) =>
+    resolveConfiguredUserPath(sourceDir),
+  );
+}
 
 const agentDirectoryCache = createBoundedCache<string, Agent[]>(AGENT_DISCOVERY_CACHE_MAX_ENTRIES);
 const agentDiscoveryCache = createBoundedCache<string, { agents: Agent[]; projectAgentsDir: string | null }>(
@@ -172,6 +245,7 @@ export function invalidateAgentDiscoveryCaches(): void {
   const removedDiscoveryEntries = agentDiscoveryCache.size();
 
   agentDiscoveryCacheRevision += 1;
+  resetConfiguredAgentDiscoverySlices();
   agentDirectoryCache.clear();
   agentDiscoveryCache.clear();
   agentDirectoryInflightLoads.clear();
@@ -189,6 +263,7 @@ export function invalidateAgentDiscoveryCaches(): void {
 
 export function resetAgentDiscoveryCacheState(): void {
   agentDiscoveryCacheRevision += 1;
+  resetConfiguredAgentDiscoverySlices();
   agentDirectoryCache.clear();
   agentDiscoveryCache.clear();
   agentDirectoryInflightLoads.clear();
@@ -359,11 +434,17 @@ export async function loadAgentsFromDirAsync(dirPath: string): Promise<Agent[]> 
   const loadPromise = (async (): Promise<Agent[]> => {
     try {
       const entries = await readdir(cacheKey, { withFileTypes: true });
-      const parsedAgents = await Promise.all(
-        entries
-          .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-          .map((entry) => parseAgentAsync(join(cacheKey, entry.name))),
-      );
+      const markdownEntries = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".md"));
+      const parseResult = await mapWithAbortAwareConcurrency({
+        items: markdownEntries,
+        concurrency: AGENT_MARKDOWN_PARSE_CONCURRENCY,
+        worker: (entry) => parseAgentAsync(join(cacheKey, entry.name)),
+      });
+      if (parseResult.control.firstError) {
+        throw parseResult.control.firstError;
+      }
+
+      const parsedAgents = parseResult.results;
       const agents = parsedAgents
         .filter((agent): agent is Agent => Boolean(agent))
         .sort((a, b) => a.name.localeCompare(b.name));
@@ -407,10 +488,11 @@ export async function loadAgentsFromDirAsync(dirPath: string): Promise<Agent[]> 
 
 function findNearestProjectAgentDirs(cwd: string): string[] {
   let currentDir = resolve(normalizeInputText(cwd) || process.cwd());
+  const projectSourceDirs = getConfiguredAgentDiscovery().projectSourceDirs;
 
   while (true) {
-    const candidates = PROJECT_AGENT_SOURCE_DIRS
-      .map((segments) => join(currentDir, ...segments))
+    const candidates = projectSourceDirs
+      .map((sourceDir) => resolve(currentDir, sourceDir))
       .filter((candidate) => isDirectory(candidate));
 
     if (candidates.length > 0) {
@@ -428,11 +510,12 @@ function findNearestProjectAgentDirs(cwd: string): string[] {
 
 async function findNearestProjectAgentDirsAsync(cwd: string): Promise<string[]> {
   let currentDir = resolve(normalizeInputText(cwd) || process.cwd());
+  const projectSourceDirs = getConfiguredAgentDiscovery().projectSourceDirs;
 
   while (true) {
     const candidateResults = await Promise.all(
-      PROJECT_AGENT_SOURCE_DIRS.map(async (segments) => {
-        const candidate = join(currentDir, ...segments);
+      projectSourceDirs.map(async (sourceDir) => {
+        const candidate = resolve(currentDir, sourceDir);
         return (await isDirectoryAsync(candidate)) ? candidate : null;
       }),
     );
@@ -475,7 +558,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): { agents: Agent[
   agentDiscoveryCounters.misses += 1;
 
   const projectAgentDirs = scope === "user" ? [] : findNearestProjectAgentDirs(cwd);
-  const userAgentDirs = scope === "project" ? [] : [...USER_AGENT_SOURCE_DIRS].filter((candidate) => isDirectory(candidate));
+  const userAgentDirs = scope === "project" ? [] : getConfiguredUserAgentSourceDirs().filter((candidate) => isDirectory(candidate));
 
   const byName = new Map<string, Agent>();
   const precedenceOrder = [
@@ -544,7 +627,7 @@ export async function discoverAgentsAsync(
       ? []
       : (
           await Promise.all(
-            [...USER_AGENT_SOURCE_DIRS].map(async (candidate) => ((await isDirectoryAsync(candidate)) ? candidate : null)),
+            getConfiguredUserAgentSourceDirs().map(async (candidate) => ((await isDirectoryAsync(candidate)) ? candidate : null)),
           )
         ).filter((candidate): candidate is string => Boolean(candidate));
 
@@ -600,27 +683,42 @@ export async function discoverAgentsAsync(
   }
 }
 
-export function isPrimaryAgent(agent: Agent): boolean {
+function isPrimaryAgentWithConfig(agent: Agent, configuredPrimaryAgentSet: ReadonlySet<string>): boolean {
   if (agent.mode) {
     return PRIMARY_MODE_VALUES.has(agent.mode);
   }
 
-  return DEFAULT_PRIMARY_AGENT_SET.has(agent.name);
+  return configuredPrimaryAgentSet.has(agent.name);
+}
+
+export function isPrimaryAgent(agent: Agent): boolean {
+  return isPrimaryAgentWithConfig(
+    agent,
+    getConfiguredAgentDiscoverySlices().primaryAgentSet,
+  );
 }
 
 export function getPrimaryAgents(agents: Agent[]): Agent[] {
-  return agents.filter((agent) => isPrimaryAgent(agent));
+  const configuredPrimaryAgentSet = getConfiguredAgentDiscoverySlices().primaryAgentSet;
+  return agents.filter((agent) => isPrimaryAgentWithConfig(agent, configuredPrimaryAgentSet));
 }
 
 export function getCyclablePrimaryAgents(agents: Agent[]): string[] {
-  const primaryNames = new Set(getPrimaryAgents(agents).map((agent) => agent.name));
-  const orderedDefaults = DEFAULT_PRIMARY_AGENTS.filter((name) => primaryNames.has(name));
-  const extras = [...primaryNames].filter((name) => !DEFAULT_PRIMARY_AGENT_SET.has(name));
+  const configuredSlices = getConfiguredAgentDiscoverySlices();
+  const configuredPrimaryAgents = configuredSlices.primaryAgents;
+  const configuredPrimaryAgentSet = configuredSlices.primaryAgentSet;
+  const primaryNames = new Set(
+    agents
+      .filter((agent) => isPrimaryAgentWithConfig(agent, configuredPrimaryAgentSet))
+      .map((agent) => agent.name),
+  );
+  const orderedDefaults = configuredPrimaryAgents.filter((name) => primaryNames.has(name));
+  const extras = [...primaryNames].filter((name) => !configuredPrimaryAgentSet.has(name));
   return [...orderedDefaults, ...extras.sort((a, b) => a.localeCompare(b))];
 }
 
 export function getAgentEmoji(name: string): string {
-  return AGENT_EMOJIS[name] || "🤖";
+  return getConfiguredAgentDiscoverySlices().agentEmojis[name] || "🤖";
 }
 
 export function getPersistedActiveAgentName(ctx: ExtensionContext): string | null | undefined {

@@ -62,6 +62,72 @@ function writeProjectTaskSettings(root: string, settings: Record<string, unknown
   writeFileSync(join(settingsDir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
 }
 
+function writeRouterConfig(root: string, settings: Record<string, unknown>): string {
+  const configPath = join(root, "config.json");
+  writeFileSync(configPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+  return configPath;
+}
+
+await runTest("resolveTaskControlsAsync uses extension config maxParallelDelegationConcurrency", async () => {
+  resetTaskControlsCacheState();
+  const root = mkdtempSync(join(tmpdir(), "task-controls-router-config-"));
+
+  try {
+    const configPath = writeRouterConfig(root, {
+      debug: false,
+      maxParallelDelegationConcurrency: 6,
+    });
+
+    await withEnv(
+      {
+        PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY: undefined,
+        PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS: undefined,
+        PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS: undefined,
+      },
+      async () => {
+        const { controls, warnings } = await resolveTaskControlsAsync(root, {
+          configPath,
+          globalSettingsPath: join(root, "missing-global-settings.json"),
+        });
+        assert.equal(controls.maxConcurrency, 6);
+        assert.equal(warnings.length, 0);
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await runTest("resolveTaskControlsAsync reports invalid extension config concurrency", async () => {
+  resetTaskControlsCacheState();
+  const root = mkdtempSync(join(tmpdir(), "task-controls-router-config-"));
+
+  try {
+    const configPath = writeRouterConfig(root, {
+      debug: false,
+      maxParallelDelegationConcurrency: 17,
+    });
+
+    await withEnv(
+      {
+        PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY: undefined,
+        PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS: undefined,
+        PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS: undefined,
+      },
+      async () => {
+        const { controls, warnings } = await resolveTaskControlsAsync(root, {
+          configPath,
+          globalSettingsPath: join(root, "missing-global-settings.json"),
+        });
+        assert.equal(controls.maxConcurrency, SUBAGENT_MAX_CONCURRENCY);
+        assert.equal(warnings.some((warning) => warning.includes("maxParallelDelegationConcurrency")), true);
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 await runTest("resolveTaskControlsAsync accepts valid environment overrides", async () => {
   resetTaskControlsCacheState();
   await withEnv(
