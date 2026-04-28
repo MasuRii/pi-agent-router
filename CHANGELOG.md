@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-28
+
+### Added
+- Added retained task context handoff support through `contextFrom`, including bounded final-response/result injection from previous delegated sessions and earlier completed chain-mode items.
+- Added retry support through `retry` and `retryFrom` so delegated tasks can resume retained Pi session paths by logical task id, task id, session id, or session path.
+- Added chain-mode validation and coverage for prior-step context references, output sanitizer behavior, output contract handling, subagent output retention, and task tool adapter behavior.
+
+### Changed
+- Improved delegated output normalization and sanitization to retain handoff-safe final responses and structured `submit_result` payloads while omitting ambiguous tool transcripts and full session history.
+- Expanded task tool descriptions and README usage guidance for explicit task agents, parallel and chain execution, retained context handoffs, and retry semantics.
+
 ## [0.2.0] - 2026-04-27
 
 ### Added
