@@ -1,12 +1,15 @@
 import type { Message } from "@mariozechner/pi-ai";
 
 import {
+  containsToolTranscriptLine,
   extractHumanReadableSubagentOutput,
+  sanitizeStructuredSubagentResultForHandoff,
+  sanitizeSubagentFinalResponseForHandoff,
   sanitizeSubagentResultForDisplay,
 } from "./output-sanitizer";
 import { asRecord } from "./record-utils";
 import {
-  getSubagentOutputFromMessages,
+  getLatestSubagentFinalResponseFromMessages,
   getToolCallArguments,
   normalizeInputText,
 } from "./subagent/subagent-output";
@@ -118,7 +121,7 @@ function findLatestSubmitResult(messages: readonly Message[]): unknown {
 function formatOutputValue(value: unknown): string {
   const extracted = extractHumanReadableSubagentOutput(value);
   if (extracted !== undefined) {
-    return extracted;
+    return sanitizeSubagentFinalResponseForHandoff(extracted);
   }
 
   if (value === undefined) {
@@ -126,35 +129,61 @@ function formatOutputValue(value: unknown): string {
   }
 
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(sanitizeStructuredSubagentResultForHandoff(value), null, 2);
   } catch {
     return String(value);
   }
 }
 
-function resolveFallbackOutput(messages: readonly Message[], fallbackOutputText: string | undefined): {
+function resolveFallbackOutput(
+  messages: readonly Message[],
+  finalResponseText: string | undefined,
+  fallbackOutputText: string | undefined,
+): {
   outputText: string;
   source: DelegatedOutputSource;
+  warnings: string[];
 } {
-  const sanitizedFallback = sanitizeSubagentResultForDisplay(fallbackOutputText || "").trim();
-  if (sanitizedFallback) {
-    return {
-      outputText: sanitizedFallback,
-      source: "streamed_output",
-    };
-  }
-
-  const assistantOutput = getSubagentOutputFromMessages(messages).trim();
+  const assistantOutput = sanitizeSubagentFinalResponseForHandoff(
+    getLatestSubagentFinalResponseFromMessages(messages),
+  );
   if (assistantOutput) {
     return {
       outputText: assistantOutput,
       source: "assistant_output",
+      warnings: [],
     };
   }
+
+  const capturedFinalResponse = sanitizeSubagentFinalResponseForHandoff(finalResponseText || "");
+  if (capturedFinalResponse) {
+    return {
+      outputText: capturedFinalResponse,
+      source: "assistant_output",
+      warnings: [],
+    };
+  }
+
+  const rawFallback = fallbackOutputText || "";
+  const sanitizedFallback = sanitizeSubagentFinalResponseForHandoff(rawFallback, {
+    allowPreToolTextWhenNoTrailingFinal: false,
+  });
+  if (sanitizedFallback) {
+    return {
+      outputText: sanitizedFallback,
+      source: "streamed_output",
+      warnings: [],
+    };
+  }
+
+  const warnings = rawFallback.trim() && containsToolTranscriptLine(sanitizeSubagentResultForDisplay(rawFallback))
+    ? ["No handoff-safe terminal final response was available; omitted ambiguous streamed transcript text."]
+    : [];
 
   return {
     outputText: "",
     source: "empty",
+    warnings,
   };
 }
 
@@ -332,6 +361,7 @@ function formatValidationIssues(issues: readonly SchemaValidationIssue[]): strin
 
 export function normalizeDelegatedOutput(options: {
   messages?: readonly Message[];
+  finalResponseText?: string;
   fallbackOutputText?: string;
   schema?: unknown;
   strictness?: OutputContractStrictness;
@@ -343,7 +373,8 @@ export function normalizeDelegatedOutput(options: {
   const submitResult = findLatestSubmitResult(messages);
   const hasSubmitResult = submitResult !== undefined;
   const hasSchema = options.schema !== undefined && options.schema !== null;
-  const fallback = resolveFallbackOutput(messages, options.fallbackOutputText);
+  const fallback = resolveFallbackOutput(messages, options.finalResponseText, options.fallbackOutputText);
+  warnings.push(...fallback.warnings);
 
   let outputText = fallback.outputText;
   let source = fallback.source;
@@ -362,7 +393,7 @@ export function normalizeDelegatedOutput(options: {
   if (hasSchema) {
     if (!hasSubmitResult) {
       warnings.push(
-        "Structured output schema was provided, but the subagent returned a human-readable report instead of submit_result. Preserved the report text.",
+        "Structured output schema was provided, but the subagent returned a human-readable final response instead of submit_result. Preserved the final response text.",
       );
       if (strictness === "strict") {
         return {

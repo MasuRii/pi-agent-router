@@ -33,14 +33,20 @@ import { renderSubagentWidgetLines } from "./subagent/subagent-widget-renderer";
 import { resolveSubagentWidgetIcons } from "./subagent/subagent-widget-icons";
 import { SubagentOutputOverlay } from "./subagent/subagent-overlays";
 import {
+  buildTaskAgentCatalogText,
   isTaskBatchItem,
+  normalizeTaskReferenceList,
   renderTaskBatchPrompt,
   renderTaskBatchSummary,
+  renderTaskContextFromText,
   validateTaskBatchItems,
+  type TaskContextFromSource,
 } from "./task/task-tool-adapter";
 import {
   applyPreviousOutputSubstitution,
+  resolveChainContextFromSources,
   resolveTaskExecutionMode,
+  validateChainContextFromReferences,
   type TaskExecutionMode,
 } from "./task/task-chain-mode";
 
@@ -220,27 +226,56 @@ export type {
   TaskStyleDelegationItem,
 } from "./types";
 
-const TaskBatchItem = Type.Object({
-  id: Type.String({
-    description: "CamelCase identifier, max 32 chars",
-    maxLength: 32,
-  }),
-  description: Type.String({ description: "Short task label for UI display." }),
-  assignment: Type.String({
-    description: "Detailed assignment executed by the delegated agent.",
-  }),
-  skills: Type.Optional(
-    Type.Array(Type.String(), {
-      description: "Optional skill names for this delegated task.",
+const TASK_TOOL_BASE_DESCRIPTION =
+  'Delegate task batches to local agents using task-style items: tasks[{id,description,assignment,skills?,cwd?,agent,contextFrom?,retry?,retryFrom?}] with optional shared context/schema. Set mode="parallel" (default) or mode="chain" for sequential execution. In chain mode, use {previous} in later assignments to inject the prior step output (safely truncated), or per-task contextFrom to reference earlier completed items in the same chain batch by id. Use contextFrom to inject only bounded final responses/results from prior delegated sessions or earlier chain items. Use retry/retryFrom to resume prior delegated work through its retained session path when available. Each task must explicitly provide its agent. agentScope: "user" => the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project" => nearest .pi/agents, "both" => merge both. Supports live attach updates and bounded concurrency.';
+
+function buildTaskToolDescription(agentCatalogText: string): string {
+  return [TASK_TOOL_BASE_DESCRIPTION, "", agentCatalogText].join("\n");
+}
+
+function createTaskBatchItemSchema() {
+  return Type.Object({
+    id: Type.String({
+      description: "CamelCase identifier, max 32 chars",
+      maxLength: 32,
     }),
-  ),
-  cwd: Type.Optional(
-    Type.String({
-      description: "Working directory override for this task item (optional).",
+    description: Type.String({ description: "Short task label for UI display." }),
+    assignment: Type.String({
+      description: "Detailed assignment executed by the delegated agent.",
     }),
-  ),
-  agent: Type.String({ description: "Agent name for this task (required)." }),
-});
+    skills: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Optional skill names for this delegated task.",
+      }),
+    ),
+    cwd: Type.Optional(
+      Type.String({
+        description: "Working directory override for this task item (optional).",
+      }),
+    ),
+    agent: Type.String({
+      description: "Agent name for this task (required). See the task tool description for available agents.",
+    }),
+    contextFrom: Type.Optional(
+      Type.Union([Type.String(), Type.Array(Type.String())], {
+        description:
+          "Prior delegated task/session reference(s). In chain mode, may reference an earlier completed item in the same batch by id. Injects only bounded final response/result or validated structured result, never full transcripts or tool history.",
+      }),
+    ),
+    retry: Type.Optional(
+      Type.Boolean({
+        description:
+          "Resume previous delegated work for this logical task id using the retained session path when available.",
+      }),
+    ),
+    retryFrom: Type.Optional(
+      Type.String({
+        description:
+          "Task id, logical task id, session id, or session path to resume with --session. Implies retry behavior.",
+      }),
+    ),
+  });
+}
 
 const PI_FAST_MODE_EXTENSION_NAME = "pi-fast-mode";
 const PI_FAST_MODE_FLAG = "fast";
@@ -354,6 +389,276 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
   const listSubagentSessions = (): SubagentSession[] =>
     listVisibleSubagentSessions(subagentSessions.values(), activeParentSessionId);
+
+  type ResolvedTaskReference = {
+    source: "registry" | "session";
+    reference: string;
+    taskId: string;
+    logicalTaskId?: string;
+    sessionId?: string;
+    sessionPath?: string;
+    status: SubagentExecutionStatus;
+    outputText?: string;
+    structuredResult?: unknown;
+  };
+
+  const isActiveReferenceStatus = (status: SubagentExecutionStatus): boolean =>
+    status === "running" || status === "queued";
+
+  const describeResolvedTaskReference = (
+    candidate: ResolvedTaskReference,
+  ): string => {
+    const identifiers = [
+      candidate.logicalTaskId ? `logical=${candidate.logicalTaskId}` : undefined,
+      `task=${candidate.taskId}`,
+      candidate.sessionId ? `session=${candidate.sessionId}` : undefined,
+    ].filter((entry): entry is string => Boolean(entry));
+    return identifiers.join("/");
+  };
+
+  const isRetainedOutputSafeForHandoff = (
+    source: SubagentTaskRegistryEntry["lastOutputSource"],
+  ): boolean => source === "assistant_output" || source === "streamed_output";
+
+  const buildResolvedTaskReferenceCandidates = (
+    parentSessionId: string,
+  ): ResolvedTaskReference[] => {
+    const candidates = new Map<string, ResolvedTaskReference>();
+
+    const upsertCandidate = (candidate: ResolvedTaskReference): void => {
+      const key = `${candidate.taskId}:${candidate.sessionId || ""}`;
+      const existing = candidates.get(key);
+      candidates.set(key, {
+        ...existing,
+        ...candidate,
+        outputText: candidate.outputText || existing?.outputText,
+        structuredResult:
+          candidate.structuredResult !== undefined
+            ? candidate.structuredResult
+            : existing?.structuredResult,
+        sessionPath: candidate.sessionPath || existing?.sessionPath,
+        sessionId: candidate.sessionId || existing?.sessionId,
+      });
+    };
+
+    for (const entry of subagentTaskRegistry.values()) {
+      if (parentSessionId && entry.parentSessionId !== parentSessionId) {
+        continue;
+      }
+
+      const latestSessionId = [...entry.childSessionIds]
+        .reverse()
+        .find((sessionId) => subagentSessions.has(sessionId));
+      const latestSession = latestSessionId
+        ? subagentSessions.get(latestSessionId)
+        : undefined;
+      upsertCandidate({
+        source: "registry",
+        reference: entry.logicalTaskId || entry.taskId,
+        taskId: entry.taskId,
+        logicalTaskId: entry.logicalTaskId,
+        sessionId: latestSession?.id || latestSessionId,
+        sessionPath: entry.sessionPath || latestSession?.sessionPath,
+        status: entry.status,
+        outputText:
+          entry.lastFinalResponseText ||
+          latestSession?.lastFinalResponseText ||
+          (isRetainedOutputSafeForHandoff(entry.lastOutputSource)
+            ? entry.lastOutput
+            : undefined),
+        structuredResult: entry.lastStructuredResult,
+      });
+    }
+
+    for (const session of subagentSessions.values()) {
+      if (parentSessionId && session.parentSessionId !== parentSessionId) {
+        continue;
+      }
+
+      upsertCandidate({
+        source: "session",
+        reference: session.logicalTaskId || session.taskId,
+        taskId: session.taskId,
+        logicalTaskId: session.logicalTaskId,
+        sessionId: session.id,
+        sessionPath: session.sessionPath,
+        status: session.status,
+        outputText: session.lastFinalResponseText,
+      });
+    }
+
+    return [...candidates.values()];
+  };
+
+  const resolveTaskReference = (
+    reference: string,
+    parentSessionId: string,
+    fieldName: string,
+  ): { candidate?: ResolvedTaskReference; error?: string } => {
+    const normalizedReference = normalizeInputText(reference);
+    const normalized = normalizedReference.toLowerCase();
+    if (!normalized) {
+      return {
+        error: `Task delegation failed: '${fieldName}' requires a non-empty task or session reference.`,
+      };
+    }
+
+    const candidates = buildResolvedTaskReferenceCandidates(parentSessionId);
+    const matchesReference = (
+      candidate: ResolvedTaskReference,
+      exact: boolean,
+    ): boolean => {
+      const values = [
+        candidate.taskId,
+        candidate.logicalTaskId,
+        candidate.sessionId,
+        candidate.sessionPath,
+      ]
+        .map((value) => normalizeInputText(value).toLowerCase())
+        .filter(Boolean);
+
+      return values.some((value) => exact ? value === normalized : value.startsWith(normalized));
+    };
+
+    const exactSessionIdMatches = candidates.filter(
+      (candidate) => normalizeInputText(candidate.sessionId).toLowerCase() === normalized,
+    );
+    const exactMatches = exactSessionIdMatches.length > 0
+      ? exactSessionIdMatches
+      : candidates.filter((candidate) => matchesReference(candidate, true));
+    const registryExactMatches = exactMatches.filter(
+      (candidate) => candidate.source === "registry",
+    );
+    const matches = registryExactMatches.length > 0
+      ? registryExactMatches
+      : exactMatches.length > 0
+        ? exactMatches
+        : candidates.filter((candidate) => matchesReference(candidate, false));
+
+    if (matches.length === 0) {
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${normalizedReference}' was not found in retained delegated sessions.`,
+      };
+    }
+
+    const uniqueMatches = new Map(
+      matches.map((candidate) => [
+        `${candidate.taskId}:${candidate.sessionId || ""}`,
+        candidate,
+      ]),
+    );
+    if (uniqueMatches.size > 1) {
+      const labels = [...uniqueMatches.values()]
+        .slice(0, 6)
+        .map((candidate) => describeResolvedTaskReference(candidate))
+        .join(", ");
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${normalizedReference}' is ambiguous; matched ${labels}. Use a full taskId or sessionId.`,
+      };
+    }
+
+    return { candidate: [...uniqueMatches.values()][0] };
+  };
+
+  const resolveRetainedContextFromSource = (
+    reference: string,
+    parentSessionId: string,
+    fieldName: string,
+  ): { source?: TaskContextFromSource; error?: string } => {
+    const resolved = resolveTaskReference(reference, parentSessionId, fieldName);
+    if (resolved.error || !resolved.candidate) {
+      return { error: resolved.error };
+    }
+
+    const candidate = resolved.candidate;
+    if (isActiveReferenceStatus(candidate.status)) {
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${reference}' is not available because the delegated session is ${candidate.status}.`,
+      };
+    }
+
+    if (candidate.structuredResult === undefined && !normalizeInputText(candidate.outputText)) {
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${reference}' has no retained final response/result.`,
+      };
+    }
+
+    return {
+      source: {
+        reference,
+        taskId: candidate.taskId,
+        sessionId: candidate.sessionId,
+        status: candidate.status,
+        outputText: candidate.outputText,
+        structuredResult: candidate.structuredResult,
+      },
+    };
+  };
+
+  const resolveContextFromSources = (
+    references: readonly string[],
+    parentSessionId: string,
+    fieldName: string,
+  ): { sources?: TaskContextFromSource[]; error?: string } => {
+    const sources: TaskContextFromSource[] = [];
+
+    for (const reference of references) {
+      const resolved = resolveRetainedContextFromSource(
+        reference,
+        parentSessionId,
+        fieldName,
+      );
+      if (resolved.error || !resolved.source) {
+        return { error: resolved.error };
+      }
+      sources.push(resolved.source);
+    }
+
+    return { sources };
+  };
+
+  const resolveContextFromText = (
+    references: readonly string[],
+    parentSessionId: string,
+    fieldName: string,
+  ): { text?: string; error?: string } => {
+    const resolved = resolveContextFromSources(
+      references,
+      parentSessionId,
+      fieldName,
+    );
+    if (resolved.error || !resolved.sources) {
+      return { error: resolved.error };
+    }
+
+    return { text: renderTaskContextFromText(resolved.sources) };
+  };
+
+  const resolveRetryReference = (
+    reference: string,
+    parentSessionId: string,
+    fieldName: string,
+  ): { taskId?: string; sessionPath?: string; error?: string } => {
+    const resolved = resolveTaskReference(reference, parentSessionId, fieldName);
+    if (resolved.error || !resolved.candidate) {
+      return { error: resolved.error };
+    }
+
+    const candidate = resolved.candidate;
+    if (isActiveReferenceStatus(candidate.status)) {
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${reference}' cannot be retried while it is ${candidate.status}.`,
+      };
+    }
+
+    if (!candidate.sessionPath) {
+      return {
+        error: `Task delegation failed: ${fieldName} reference '${reference}' cannot be retried because no retained session path is available.`,
+      };
+    }
+
+    return { taskId: candidate.taskId, sessionPath: candidate.sessionPath };
+  };
 
   const hasRunningVisibleSubagentSession = (): boolean => {
     for (const session of subagentSessions.values()) {
@@ -1138,8 +1443,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     const normalizedRunOutput = normalizeDelegatedOutput({
       messages: run.messages || [],
-      fallbackOutputText:
-        session.fullOutput || session.lastOutput || run.outputText,
+      finalResponseText: run.finalResponseText,
+      fallbackOutputText: run.outputText,
     });
     if (normalizedRunOutput.outputText.trim()) {
       appendSessionOutput(session, normalizedRunOutput.outputText);
@@ -1186,6 +1491,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     const retainedCompletedOutput = buildRetainedHistoryText(
       normalizedRunOutput.outputText || session.fullOutput || session.lastOutput || run.stdout,
     );
+    const retainedFinalResponseOutput = buildRetainedHistoryText(
+      normalizedRunOutput.format === "human_text" ? normalizedRunOutput.outputText : "",
+    );
+    session.lastFinalResponseText = retainedFinalResponseOutput.excerpt || undefined;
     if (retainedCompletedOutput.excerpt) {
       session.fullOutput = retainedCompletedOutput.excerpt;
       session.lastOutput = retainedCompletedOutput.excerpt;
@@ -1210,8 +1519,21 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       trackedTask.sessionPath =
         session.sessionPath || run.sessionPath || trackedTask.sessionPath;
       trackedTask.lastTask = session.task;
+      trackedTask.logicalTaskId = session.logicalTaskId || trackedTask.logicalTaskId;
       trackedTask.lastOutput =
         retainedCompletedOutput.excerpt || trackedTask.lastOutput;
+      if (retainedFinalResponseOutput.excerpt) {
+        trackedTask.lastFinalResponseText = retainedFinalResponseOutput.excerpt;
+      } else {
+        delete trackedTask.lastFinalResponseText;
+      }
+      trackedTask.lastOutputFormat = normalizedRunOutput.format;
+      trackedTask.lastOutputSource = normalizedRunOutput.source;
+      if (normalizedRunOutput.submitResult !== undefined) {
+        trackedTask.lastStructuredResult = normalizedRunOutput.submitResult;
+      } else {
+        delete trackedTask.lastStructuredResult;
+      }
       trackedTask.lastError = retainedCompletedError.excerpt || undefined;
       trackedTask.lastExitCode = session.exitCode;
       trackedTask.lastTimedOut = session.status === "timed_out";
@@ -1341,6 +1663,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     options: {
       notifyCompletion?: boolean;
       taskId?: string;
+      logicalTaskId?: string;
       parentSessionId?: string;
       displayTask?: string;
       sessionPath?: string;
@@ -1375,6 +1698,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     const taskRegistryEntry: SubagentTaskRegistryEntry =
       existingTaskRegistryEntry || {
         taskId,
+        logicalTaskId: normalizeInputText(options.logicalTaskId) || undefined,
         sessionPath: options.sessionPath,
         parentSessionId,
         delegatedBy,
@@ -1390,6 +1714,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     taskRegistryEntry.updatedAt = now;
     taskRegistryEntry.status = "running";
+    taskRegistryEntry.logicalTaskId =
+      normalizeInputText(options.logicalTaskId) ||
+      taskRegistryEntry.logicalTaskId;
     taskRegistryEntry.delegatedBy = delegatedBy;
     taskRegistryEntry.parentSessionId = parentSessionId;
     taskRegistryEntry.agent = agent.name;
@@ -1404,6 +1731,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     const session: SubagentSession = {
       id: sessionId,
       taskId,
+      logicalTaskId: normalizeInputText(options.logicalTaskId) || undefined,
       sessionPath: options.sessionPath,
       parentSessionId,
       delegatedBy,
@@ -2307,6 +2635,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 usage: cloneSubagentUsage(eventState.usage),
                 malformedEventCount: eventState.malformedEventCount,
                 outputText: eventState.outputText,
+                finalResponseText: eventState.finalResponseText,
                 toolInvocations: getSubagentToolInvocationsFromState(eventState),
                 toolInvocationCount: eventState.toolInvocationTotalCount,
                 latestToolCall: eventState.latestToolCall,
@@ -2334,6 +2663,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 usage: cloneSubagentUsage(eventState.usage),
                 malformedEventCount: eventState.malformedEventCount,
                 outputText: eventState.outputText,
+                finalResponseText: eventState.finalResponseText,
                 toolInvocations: getSubagentToolInvocationsFromState(eventState),
                 toolInvocationCount: eventState.toolInvocationTotalCount,
                 latestToolCall: eventState.latestToolCall,
@@ -3141,11 +3471,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
   });
 
+  const taskToolRegistrationAgentCatalog = buildTaskAgentCatalogText(
+    loadAgents({ cwd: process.cwd(), scope: "both" }),
+  );
   const taskToolDefinition = defineTool({
     name: "task",
     label: "Task",
-    description:
-      'Delegate task batches to local agents using task-style items: tasks[{id,description,assignment,skills?,cwd?,agent}] with optional shared context/schema. Set mode="parallel" (default) or mode="chain" for sequential execution. In chain mode, use {previous} in later assignments to inject the prior step output (safely truncated). Each task must explicitly provide its agent. agentScope: "user" => the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project" => nearest .pi/agents, "both" => merge both. Supports live attach updates and bounded concurrency.',
+    description: buildTaskToolDescription(taskToolRegistrationAgentCatalog),
     promptSnippet: "Delegate work to local agents in parallel or chain mode",
     promptGuidelines: [
       "Use task when work should be delegated to one or more specialized agents instead of handled entirely in the current session.",
@@ -3153,14 +3485,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     renderShell: "self",
 
     parameters: Type.Object({
-      tasks: Type.Array(TaskBatchItem, {
-        description:
-          "Task items: [{id, description, assignment, skills?, cwd?, agent}]",
+      tasks: Type.Array(createTaskBatchItemSchema(), {
+        description: "Task items: [{id, description, assignment, skills?, cwd?, agent, contextFrom?, retry?, retryFrom?}]",
       }),
       mode: Type.Optional(
         Type.Union([Type.Literal("parallel"), Type.Literal("chain")], {
           description:
-            "Execution strategy. parallel: run tasks concurrently (default). chain: run tasks sequentially and stop on first failure; supports {previous} replacement.",
+            "Execution strategy. parallel: run tasks concurrently (default). chain: run tasks sequentially and stop on first failure; supports {previous} replacement and per-task contextFrom references to earlier completed chain items.",
           default: "parallel",
         }),
       ),
@@ -3170,10 +3501,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             "Shared background prepended to each assignment. Use for global constraints, contracts, and acceptance criteria.",
         }),
       ),
+      contextFrom: Type.Optional(
+        Type.Union([Type.String(), Type.Array(Type.String())], {
+          description:
+            "Shared prior delegated task/session reference(s) injected into every task as bounded final response/result or validated structured result only. Full transcripts and tool history are never injected.",
+        }),
+      ),
       schema: Type.Optional(
         Type.Unknown({
           description:
-            "Optional structured output schema for explicit submit_result payloads. Human-readable TASK COMPLETION REPORT output remains the default in compat mode.",
+            "Optional structured output schema for explicit submit_result payloads. Human-readable final responses remain supported in compat mode."
         }),
       ),
       agentScope: Type.Optional(
@@ -3211,6 +3548,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         tasks: TaskStyleDelegationItem[];
         mode?: "parallel" | "chain";
         context?: string;
+        contextFrom?: string | string[];
         schema?: unknown;
         agentScope?: "user" | "project" | "both";
         attach?: boolean;
@@ -3241,27 +3579,15 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             : undefined,
           cwd: normalizeInputText(item.cwd) || undefined,
           agent: normalizeInputText(item.agent),
+          contextFrom: item.contextFrom,
+          retry: item.retry === true,
+          retryFrom: normalizeInputText(item.retryFrom) || undefined,
         }));
       const taskStyleValidationError =
         validateTaskBatchItems(taskStyleMetadata);
       const distinctTaskAgents = [
         ...new Set(taskStyleMetadata.map((task) => task.agent).filter(Boolean)),
       ];
-
-      const providedTasks: SubagentTaskItemInput[] = taskStyleMetadata.map(
-        (task) => ({
-          agent: task.agent,
-          task: renderTaskBatchPrompt({
-            context: delegatedContext || undefined,
-            assignment: task.assignment,
-            schema: params.schema,
-            taskId: task.id,
-            description: task.description || task.id,
-            skills: task.skills,
-          }),
-          cwd: task.cwd,
-        }),
-      );
 
       const resolvedMode = resolveTaskExecutionMode(params.mode);
       const requestedMode: TaskExecutionMode = resolvedMode.mode;
@@ -3280,7 +3606,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             ? "multiple-agents"
             : "(missing task agent)";
       const modeTaskLabel = `${taskStyleMetadata.length} task tool item(s)`;
-      const hasExecutableTasks = providedTasks.length > 0;
+      const hasExecutableTasks = taskStyleMetadata.length > 0;
 
       // Single validation gate for task delegation.
       // Internal execution paths trust the validated values from this entry point.
@@ -3365,6 +3691,152 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         };
       }
 
+      const parentSessionId = ctx.sessionManager.getSessionId();
+      const sharedContextFromReferences = normalizeTaskReferenceList(
+        params.contextFrom,
+        "contextFrom",
+      );
+      if (sharedContextFromReferences.error) {
+        const details = createSubagentExecutionDetails(
+          delegatedBy,
+          modeAgentLabel,
+          modeTaskLabel,
+          "failed",
+          {
+            mode: requestedMode,
+            parentSessionId,
+          },
+        );
+        return {
+          isError: true,
+          content: [{ type: "text", text: sharedContextFromReferences.error }],
+          details,
+        };
+      }
+
+      const sharedContextFrom = resolveContextFromText(
+        sharedContextFromReferences.references,
+        parentSessionId,
+        "contextFrom",
+      );
+      if (sharedContextFrom.error) {
+        const details = createSubagentExecutionDetails(
+          delegatedBy,
+          modeAgentLabel,
+          modeTaskLabel,
+          "failed",
+          {
+            mode: requestedMode,
+            parentSessionId,
+          },
+        );
+        return {
+          isError: true,
+          content: [{ type: "text", text: sharedContextFrom.error }],
+          details,
+        };
+      }
+
+      const itemContextFromReferencesByIndex: string[][] = [];
+      const itemContextFromTexts: string[] = [];
+      for (let index = 0; index < taskStyleMetadata.length; index += 1) {
+        const itemContextFromReferences = normalizeTaskReferenceList(
+          taskStyleMetadata[index]?.contextFrom,
+          `tasks[${index}].contextFrom`,
+        );
+        if (itemContextFromReferences.error) {
+          const details = createSubagentExecutionDetails(
+            delegatedBy,
+            modeAgentLabel,
+            modeTaskLabel,
+            "failed",
+            {
+              mode: requestedMode,
+              parentSessionId,
+            },
+          );
+          return {
+            isError: true,
+            content: [{ type: "text", text: itemContextFromReferences.error }],
+            details,
+          };
+        }
+
+        itemContextFromReferencesByIndex[index] = itemContextFromReferences.references;
+
+        if (requestedMode === "chain") {
+          itemContextFromTexts[index] = "";
+          continue;
+        }
+
+        const itemContextFrom = resolveContextFromText(
+          itemContextFromReferences.references,
+          parentSessionId,
+          `tasks[${index}].contextFrom`,
+        );
+        if (itemContextFrom.error) {
+          const details = createSubagentExecutionDetails(
+            delegatedBy,
+            modeAgentLabel,
+            modeTaskLabel,
+            "failed",
+            {
+              mode: requestedMode,
+              parentSessionId,
+            },
+          );
+          return {
+            isError: true,
+            content: [{ type: "text", text: itemContextFrom.error }],
+            details,
+          };
+        }
+
+        itemContextFromTexts[index] = itemContextFrom.text || "";
+      }
+
+      if (requestedMode === "chain") {
+        const chainContextFromValidationError = validateChainContextFromReferences({
+          tasks: taskStyleMetadata,
+          referencesByTaskIndex: itemContextFromReferencesByIndex,
+        });
+        if (chainContextFromValidationError) {
+          const details = createSubagentExecutionDetails(
+            delegatedBy,
+            modeAgentLabel,
+            modeTaskLabel,
+            "failed",
+            {
+              mode: requestedMode,
+              parentSessionId,
+            },
+          );
+          return {
+            isError: true,
+            content: [{ type: "text", text: chainContextFromValidationError }],
+            details,
+          };
+        }
+      }
+
+      const providedTasks: SubagentTaskItemInput[] = taskStyleMetadata.map(
+        (task, index) => ({
+          agent: task.agent,
+          task: renderTaskBatchPrompt({
+            context: delegatedContext || undefined,
+            contextFrom: [sharedContextFrom.text, itemContextFromTexts[index]]
+              .filter((value): value is string => Boolean(value?.trim()))
+              .join("\n\n") || undefined,
+            assignment: task.assignment,
+            schema: params.schema,
+            taskId: task.id,
+            description: task.description || task.id,
+            skills: task.skills,
+          }),
+          cwd: task.cwd,
+        }),
+      );
+
       const resolvedGlobalCwd = await resolveSubagentWorkingDirectoryAsync(
         params.cwd,
         defaultExecutionCwd,
@@ -3390,6 +3862,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const executionBaseCwd = resolvedGlobalCwd.cwd;
       const agentDiscovery = await discoverAgentsAsync(executionBaseCwd, agentScope);
       const availableAgents = agentDiscovery.agents;
+      const liveTaskAgentCatalog = buildTaskAgentCatalogText(availableAgents);
 
       const timeout = resolveSubagentTimeoutMs(
         params.timeoutMs ?? taskControls.defaultTimeoutMs,
@@ -3408,6 +3881,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             ? taskStyleMetadata[index]?.description ||
               taskStyleMetadata[index]?.id
             : undefined,
+          assignment: taskStyleMetadata[index]?.assignment || "",
+          skills: taskStyleMetadata[index]?.skills,
+          contextFromReferences: itemContextFromReferencesByIndex[index] || [],
+          retry: taskStyleMetadata[index]?.retry === true,
+          retryFrom: taskStyleMetadata[index]?.retryFrom,
         }));
 
         const invalidTaskIndex = normalizedTasks.findIndex(
@@ -3444,6 +3922,39 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const agentsByName = new Map(
           availableAgents.map((item) => [item.name, item] as const),
         );
+        const unknownTaskAgents = [
+          ...new Set(
+            normalizedTasks
+              .map((task) => task.agent)
+              .filter((agentName) => !agentsByName.has(agentName)),
+          ),
+        ];
+        if (unknownTaskAgents.length > 0) {
+          const details = createSubagentExecutionDetails(
+            delegatedBy,
+            modeAgentLabel,
+            modeTaskLabel,
+            "failed",
+            {
+              mode: requestedMode,
+              parentSessionId: ctx.sessionManager.getSessionId(),
+            },
+          );
+          const unknownAgentLabel = unknownTaskAgents.length === 1
+            ? `Unknown agent: ${unknownTaskAgents[0]}`
+            : `Unknown agents: ${unknownTaskAgents.join(", ")}`;
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Task delegation failed: ${unknownAgentLabel}\n${liveTaskAgentCatalog}`,
+              },
+            ],
+            details,
+          };
+        }
+
         const builtInAgentColorFallback = new Map<string, string>([
           ["architect", "#50E3C2"],
           ["ask", "#9013FE"],
@@ -3771,6 +4282,31 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         pendingDelegationJobs.add(trackedDelegationJob);
 
         let previousChainOutput = "";
+        const completedChainContextByTaskId = new Map<string, TaskContextFromSource>();
+
+        const resolveChainItemContextFromText = (
+          taskIndex: number,
+          references: readonly string[],
+        ): { text?: string; error?: string } => {
+          const resolved = resolveChainContextFromSources({
+            tasks: taskStyleMetadata,
+            taskIndex,
+            references,
+            completedSourcesByTaskId: completedChainContextByTaskId,
+            resolveRetainedReference: (reference, fieldName) =>
+              resolveRetainedContextFromSource(
+                reference,
+                parentSessionId,
+                fieldName,
+              ),
+            fieldName: `tasks[${taskIndex}].contextFrom`,
+          });
+          if (resolved.error) {
+            return { error: resolved.error };
+          }
+
+          return { text: renderTaskContextFromText(resolved.sources) };
+        };
 
         let parallelControl: {
           aborted: boolean;
@@ -3831,7 +4367,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 if (!agent) {
                   taskResult.status = "failed";
                   taskResult.exitCode = 1;
-                  taskResult.error = `Unknown agent: ${task.agent}`;
+                  taskResult.error = `Unknown agent: ${task.agent}\n${liveTaskAgentCatalog}`;
                   throw new Error(taskResult.error);
                 }
 
@@ -3847,8 +4383,30 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
                 let delegatedTaskPayload = task.task;
                 if (requestedMode === "chain") {
+                  const chainItemContextFrom = resolveChainItemContextFromText(
+                    index,
+                    task.contextFromReferences,
+                  );
+                  if (chainItemContextFrom.error) {
+                    taskResult.status = "failed";
+                    taskResult.exitCode = 1;
+                    taskResult.error = chainItemContextFrom.error;
+                    throw new Error(taskResult.error);
+                  }
+
+                  const chainTaskPrompt = renderTaskBatchPrompt({
+                    context: delegatedContext || undefined,
+                    contextFrom: [sharedContextFrom.text, chainItemContextFrom.text]
+                      .filter((value): value is string => Boolean(value?.trim()))
+                      .join("\n\n") || undefined,
+                    assignment: task.assignment,
+                    schema: params.schema,
+                    taskId: task.taskLabel || `task-${index + 1}`,
+                    description: task.taskDescription || task.taskLabel || `Task ${index + 1}`,
+                    skills: task.skills,
+                  });
                   const substitution = applyPreviousOutputSubstitution({
-                    task: task.task,
+                    task: chainTaskPrompt,
                     previousOutput: previousChainOutput,
                   });
                   delegatedTaskPayload = substitution.task;
@@ -3862,6 +4420,21 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   }
                 }
 
+                const retryReference = task.retryFrom || (task.retry ? task.taskLabel : undefined);
+                const retryResume = retryReference
+                  ? resolveRetryReference(
+                      retryReference,
+                      parentSessionId,
+                      task.retryFrom ? `tasks[${index}].retryFrom` : `tasks[${index}].retry`,
+                    )
+                  : {};
+                if (retryResume.error) {
+                  taskResult.status = "failed";
+                  taskResult.exitCode = 1;
+                  taskResult.error = retryResume.error;
+                  throw new Error(taskResult.error);
+                }
+
                 const session = await startBackgroundSubagent(
                   ctx,
                   delegatedBy,
@@ -3871,6 +4444,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   timeout,
                   {
                     notifyCompletion: false,
+                    taskId: retryResume.taskId,
+                    logicalTaskId: task.taskLabel,
+                    sessionPath: retryResume.sessionPath,
                     onStreamUpdate: (update) => {
                       if (attachToParent || !taskResult.output) {
                         taskResult.output = update.outputText;
@@ -3951,8 +4527,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
                 const normalizedDelegatedOutput = normalizeDelegatedOutput({
                   messages: run.messages || [],
-                  fallbackOutputText:
-                    session.fullOutput || session.lastOutput || run.outputText,
+                  finalResponseText: run.finalResponseText,
+                  fallbackOutputText: run.outputText,
                   schema: params.schema,
                   strictness: taskControls.outputStrictness,
                 });
@@ -3979,6 +4555,31 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 const retainedTaskOutput = buildRetainedHistoryText(finalOutputText);
                 taskResult.output = retainedTaskOutput.excerpt;
                 taskResult.resultSummary = retainedTaskOutput.summary;
+                const schemaValidationWarning = normalizedDelegatedOutput.warnings.some(
+                  (warning) => warning.startsWith("submit_result does not satisfy schema:"),
+                );
+
+                const trackedTask = subagentTaskRegistry.get(session.taskId);
+                if (trackedTask) {
+                  trackedTask.logicalTaskId = task.taskLabel || trackedTask.logicalTaskId;
+                  trackedTask.lastOutput = retainedTaskOutput.excerpt || trackedTask.lastOutput;
+                  if (normalizedDelegatedOutput.format === "human_text" && retainedTaskOutput.excerpt) {
+                    trackedTask.lastFinalResponseText = retainedTaskOutput.excerpt;
+                  } else {
+                    delete trackedTask.lastFinalResponseText;
+                  }
+                  trackedTask.lastOutputFormat = normalizedDelegatedOutput.format;
+                  trackedTask.lastOutputSource = normalizedDelegatedOutput.source;
+                  if (
+                    normalizedDelegatedOutput.submitResult !== undefined &&
+                    !normalizedDelegatedOutput.error &&
+                    !schemaValidationWarning
+                  ) {
+                    trackedTask.lastStructuredResult = normalizedDelegatedOutput.submitResult;
+                  } else {
+                    delete trackedTask.lastStructuredResult;
+                  }
+                }
 
                 if (normalizedDelegatedOutput.error) {
                   taskResult.status = "failed";
@@ -3990,6 +4591,26 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   taskResult.resultSummary =
                     retainedContractError.summary || taskResult.resultSummary;
                   throw new Error(taskResult.error);
+                }
+
+                if (finalStatus === "finished" && requestedMode === "chain") {
+                  const normalizedTaskLabel = normalizeInputText(
+                    task.taskLabel,
+                  ).toLowerCase();
+                  if (normalizedTaskLabel) {
+                    completedChainContextByTaskId.set(normalizedTaskLabel, {
+                      reference: task.taskLabel || `task-${index + 1}`,
+                      taskId: session.taskId,
+                      sessionId: session.id,
+                      status: finalStatus,
+                      outputText: normalizedDelegatedOutput.outputText,
+                      structuredResult:
+                        normalizedDelegatedOutput.submitResult !== undefined &&
+                        !schemaValidationWarning
+                          ? normalizedDelegatedOutput.submitResult
+                          : undefined,
+                    });
+                  }
                 }
 
                 const finalToolInvocations =

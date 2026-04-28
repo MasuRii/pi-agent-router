@@ -59,6 +59,7 @@ export function createSubagentJsonEventState(options: {
     outputText: "",
     committedOutputText: "",
     liveOutputText: "",
+    finalResponseText: "",
     outputTextMaxChars: normalizePositiveLimit(
       options.outputTextMaxChars,
       SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,

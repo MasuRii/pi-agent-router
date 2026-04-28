@@ -53,6 +53,8 @@ export type SubagentTaskItemInput = {
   cwd?: string;
 };
 
+type TaskReferenceInput = string | string[];
+
 type TaskBatchItemInput = {
   id: string;
   description: string;
@@ -60,6 +62,9 @@ type TaskBatchItemInput = {
   skills?: string[];
   cwd?: string;
   agent: string;
+  contextFrom?: TaskReferenceInput;
+  retry?: boolean;
+  retryFrom?: string;
 };
 
 export type TaskStyleDelegationItem = TaskBatchItemInput;
@@ -88,6 +93,7 @@ export type SubagentRunResult = {
   usage?: SubagentUsage;
   malformedEventCount?: number;
   outputText?: string;
+  finalResponseText?: string;
   toolInvocations?: SubagentToolInvocation[];
   toolInvocationCount?: number;
   latestToolCall?: string;
@@ -175,6 +181,7 @@ export type SubagentJsonEventState = {
   outputText: string;
   committedOutputText: string;
   liveOutputText: string;
+  finalResponseText: string;
   outputTextMaxChars: number;
   usage: SubagentUsage;
   malformedEventCount: number;
@@ -191,6 +198,7 @@ export type SubagentJsonEventState = {
 export type SubagentSession = {
   id: string;
   taskId: string;
+  logicalTaskId?: string;
   sessionPath?: string;
   sessionDir?: string;
   parentSessionId: string;
@@ -206,6 +214,7 @@ export type SubagentSession = {
   fallback?: boolean;
   fullOutput?: string;
   lastOutput?: string;
+  lastFinalResponseText?: string;
   toolInvocations?: SubagentToolInvocation[];
   stderr: string;
   exitCode?: number;
@@ -226,6 +235,7 @@ export type SubagentSession = {
 
 export type SubagentTaskRegistryEntry = {
   taskId: string;
+  logicalTaskId?: string;
   sessionPath?: string;
   parentSessionId: string;
   delegatedBy: string;
@@ -238,6 +248,10 @@ export type SubagentTaskRegistryEntry = {
   childSessionIds: string[];
   lastTask: string;
   lastOutput?: string;
+  lastFinalResponseText?: string;
+  lastStructuredResult?: unknown;
+  lastOutputFormat?: "structured" | "human_text" | "empty";
+  lastOutputSource?: "submit_result" | "streamed_output" | "assistant_output" | "empty";
   lastError?: string;
   lastExitCode?: number;
   lastTimedOut?: boolean;

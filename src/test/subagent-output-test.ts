@@ -4,6 +4,7 @@ import type { Message } from "@mariozechner/pi-ai";
 
 import {
   appendBoundedOutputSection,
+  getLatestSubagentFinalResponseFromMessages,
   getLatestSubagentToolCallLabel,
   getSubagentLiveOutputFromMessages,
   getSubagentToolInvocationsFromState,
@@ -45,6 +46,7 @@ runTest("processSubagentJsonEventLine accepts assistant messages with string con
   );
 
   assert.equal(state.messages.length, 1);
+  assert.equal(state.finalResponseText, "Visible answer");
   assert.equal(state.usage.turns, 1);
   assert.equal(state.usage.input, 12);
   assert.equal(state.usage.output, 34);
@@ -295,6 +297,110 @@ runTest("processSubagentJsonEventLine preserves multipart assistant section orde
       count: 1,
     },
   ]);
+});
+
+runTest("getLatestSubagentFinalResponseFromMessages keeps only post-tool text from mixed assistant output", () => {
+  const messages: Message[] = [
+    {
+      role: "assistant",
+      timestamp: Date.now(),
+      content: [
+        {
+          type: "text",
+          text: "Investigating issue",
+        } as Message["content"][number],
+        {
+          type: "toolCall",
+          name: "read",
+          arguments: {
+            path: "secret.txt",
+          },
+        } as Message["content"][number],
+        {
+          type: "text",
+          text: "Final summary only.",
+        } as Message["content"][number],
+      ],
+    } as Message,
+  ];
+
+  const finalResponse = getLatestSubagentFinalResponseFromMessages(messages);
+  assert.equal(finalResponse, "Final summary only.");
+  assert.equal(finalResponse.includes("Investigating issue"), false);
+});
+
+runTest("getLatestSubagentFinalResponseFromMessages refuses pre-tool text without closing assistant response", () => {
+  const messages: Message[] = [
+    {
+      role: "assistant",
+      timestamp: Date.now(),
+      content: "Investigating before tool use.",
+    } as Message,
+    {
+      role: "assistant",
+      timestamp: Date.now(),
+      content: [
+        {
+          type: "toolCall",
+          name: "read",
+          arguments: { path: "secret.txt" },
+        } as Message["content"][number],
+      ],
+    } as Message,
+    {
+      role: "tool",
+      timestamp: Date.now(),
+      content: "secret tool output",
+    } as Message,
+  ];
+
+  assert.equal(getLatestSubagentFinalResponseFromMessages(messages), "");
+});
+
+runTest("processSubagentJsonEventLine clears final response candidate after later tool activity", () => {
+  const state = createSubagentJsonEventState();
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: "Initial answer",
+      },
+    }),
+    state,
+  );
+  assert.equal(state.finalResponseText, "Initial answer");
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "read",
+            arguments: { path: "secret.txt" },
+          },
+        ],
+      },
+    }),
+    state,
+  );
+  assert.equal(state.finalResponseText, "");
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: "Terminal answer",
+      },
+    }),
+    state,
+  );
+  assert.equal(state.finalResponseText, "Terminal answer");
 });
 
 runTest("processSubagentJsonEventLine keeps bounded message history while preserving incremental output", () => {

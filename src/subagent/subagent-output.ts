@@ -68,6 +68,64 @@ function getSanitizedMessageText(message: Message): string {
   return stripSubagentThinkingContent(extractMessageText(message));
 }
 
+function assistantMessageHasToolCall(message: Message): boolean {
+  if (message.role !== "assistant") {
+    return false;
+  }
+
+  const parts = getMessageContentParts(message);
+  if (!parts) {
+    return false;
+  }
+
+  return parts.some((part) => getContentPartType(part) === "toolCall");
+}
+
+function getAssistantTextOnly(message: Message): string {
+  if (message.role !== "assistant") {
+    return "";
+  }
+
+  const parts = getMessageContentParts(message);
+  if (!parts) {
+    return getSanitizedMessageText(message);
+  }
+
+  const preToolTextSections: string[] = [];
+  const postToolTextSections: string[] = [];
+  let hasToolCall = false;
+
+  for (const part of parts) {
+    const partType = getContentPartType(part);
+    if (partType === "toolCall") {
+      hasToolCall = true;
+      postToolTextSections.length = 0;
+      continue;
+    }
+
+    if (partType !== "text") {
+      continue;
+    }
+
+    const textPart = getContentPartRecord(part);
+    const text = typeof textPart?.text === "string"
+      ? stripSubagentThinkingContent(textPart.text)
+      : "";
+    if (!text) {
+      continue;
+    }
+
+    if (hasToolCall) {
+      postToolTextSections.push(text);
+      continue;
+    }
+
+    preToolTextSections.push(text);
+  }
+
+  return (hasToolCall ? postToolTextSections : preToolTextSections).join("\n").trim();
+}
+
 function normalizeToolCallName(value: unknown): string {
   const normalized = normalizeInputText(typeof value === "string" ? value : "");
   return truncatePreview(normalized, SUBAGENT_TOOL_NAME_MAX_CHARS) || "(unknown)";
@@ -164,6 +222,27 @@ function refreshDerivedOutputState(state: SubagentJsonEventState): void {
     state.outputTextMaxChars,
   );
   state.latestToolCall = state.liveLatestToolCall || state.committedLatestToolCall;
+}
+
+function updateTerminalFinalResponseState(state: SubagentJsonEventState, message: Message): void {
+  if (message.role === "tool") {
+    state.finalResponseText = "";
+    return;
+  }
+
+  if (message.role !== "assistant") {
+    return;
+  }
+
+  const assistantText = getAssistantTextOnly(message);
+  if (assistantText) {
+    state.finalResponseText = assistantText;
+    return;
+  }
+
+  if (assistantMessageHasToolCall(message)) {
+    state.finalResponseText = "";
+  }
 }
 
 function clearLiveMessageState(state: SubagentJsonEventState): void {
@@ -321,6 +400,7 @@ function appendMessageToState(message: Message, state: SubagentJsonEventState): 
 
   const details = parseMessageDetails(message);
   appendOutputSections(state, details.outputSections);
+  updateTerminalFinalResponseState(state, message);
 
   for (const toolCall of details.toolCalls) {
     recordToolInvocation(state, toolCall);
@@ -418,6 +498,37 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
   if (eventType === "usage") {
     mergeUsageTotals(state.usage, eventRecord.usage ?? eventRecord);
   }
+}
+
+export function getLatestSubagentFinalResponseFromMessages(messages: readonly Message[]): string {
+  let encounteredLaterToolActivity = false;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message) {
+      continue;
+    }
+
+    if (message.role === "tool") {
+      encounteredLaterToolActivity = true;
+      continue;
+    }
+
+    if (message.role !== "assistant") {
+      continue;
+    }
+
+    const text = getAssistantTextOnly(message);
+    if (text) {
+      return encounteredLaterToolActivity ? "" : text;
+    }
+
+    if (assistantMessageHasToolCall(message)) {
+      encounteredLaterToolActivity = true;
+    }
+  }
+
+  return "";
 }
 
 export function getSubagentOutputFromMessages(messages: readonly Message[]): string {

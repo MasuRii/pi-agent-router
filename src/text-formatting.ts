@@ -119,15 +119,28 @@ export type RetainedHistoryText = {
   truncated: boolean;
 };
 
-function buildRetainedHistoryExcerpt(text: string, maxChars: number): string {
+type RetainedHistoryExcerptMode = "tail" | "head";
+
+function buildRetainedHistoryExcerpt(
+  text: string,
+  maxChars: number,
+  mode: RetainedHistoryExcerptMode,
+): string {
   if (text.length <= maxChars) {
     return text;
   }
 
-  const notice = "[Earlier output truncated for stored history; showing the most recent excerpt.]";
+  const notice = mode === "head"
+    ? "[Later output truncated for stored history; showing the first excerpt.]"
+    : "[Earlier output truncated for stored history; showing the most recent excerpt.]";
   const availableChars = Math.max(0, maxChars - notice.length - 2);
   if (availableChars === 0) {
     return truncatePreview(notice, maxChars);
+  }
+
+  if (mode === "head") {
+    const excerpt = text.slice(0, availableChars).trimEnd();
+    return `${excerpt}\n\n${notice}`;
   }
 
   const excerpt = text.slice(-availableChars).trimStart();
@@ -139,13 +152,16 @@ export function buildRetainedHistoryText(
   options: {
     maxChars?: number;
     maxSummaryChars?: number;
+    excerptMode?: RetainedHistoryExcerptMode;
+    sanitize?: boolean;
   } = {},
 ): RetainedHistoryText {
-  const sanitized = sanitizeSubagentResultForDisplay(rawText || "")
+  const shouldSanitize = options.sanitize !== false;
+  const retainedText = (shouldSanitize ? sanitizeSubagentResultForDisplay(rawText || "") : rawText || "")
     .replace(/\r\n/g, "\n")
     .trim();
 
-  if (!sanitized) {
+  if (!retainedText) {
     return { truncated: false };
   }
 
@@ -155,14 +171,18 @@ export function buildRetainedHistoryText(
   const maxSummaryChars = Number.isFinite(options.maxSummaryChars)
     ? Math.max(64, Math.trunc(options.maxSummaryChars || 0))
     : TASK_HISTORY_SUMMARY_MAX_CHARS;
-  const digest = buildSubagentOutputDigest(sanitized);
-  const summary = truncatePreview(digest.summary || sanitized, maxSummaryChars);
-  const truncated = sanitized.length > maxChars;
+  const digest = buildSubagentOutputDigest(retainedText);
+  const summary = truncatePreview(digest.summary || retainedText, maxSummaryChars);
+  const truncated = retainedText.length > maxChars;
 
   return {
     excerpt: truncated
-      ? buildRetainedHistoryExcerpt(sanitized, maxChars)
-      : sanitized,
+      ? buildRetainedHistoryExcerpt(
+          retainedText,
+          maxChars,
+          options.excerptMode === "head" ? "head" : "tail",
+        )
+      : retainedText,
     summary: summary || undefined,
     truncated,
   };

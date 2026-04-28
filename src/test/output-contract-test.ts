@@ -80,7 +80,7 @@ runTest("validateSubagentOutputContract falls back to assistant text when submit
   assert.equal(result.warnings.length > 0, true);
   assert.equal(
     result.warnings[0],
-    "Structured output schema was provided, but the subagent returned a human-readable report instead of submit_result. Preserved the report text.",
+    "Structured output schema was provided, but the subagent returned a human-readable final response instead of submit_result. Preserved the final response text.",
   );
   assert.equal(result.error, undefined);
 });
@@ -141,6 +141,34 @@ runTest("validateSubagentOutputContract unwraps report payloads for display", ()
   assert.equal(result.error, undefined);
   assert.equal(result.outputText, "## TASK COMPLETION REPORT\n\n- Wrapped output");
   assert.equal(result.submitResult, "## TASK COMPLETION REPORT\n\n- Wrapped output");
+});
+
+runTest("normalizeDelegatedOutput strips nested transcript lines from structured output text", () => {
+  const messages: Message[] = [
+    assistantMessage([
+      {
+        type: "toolCall",
+        name: "submit_result",
+        arguments: {
+          result: {
+            summary: "Done",
+            details: "Visible detail\n→ read secret.txt",
+            nested: {
+              value: "Keep this\n→ grep hidden src",
+            },
+          },
+        },
+      } as Message["content"][number],
+    ]),
+  ];
+
+  const result = normalizeDelegatedOutput({ messages });
+
+  assert.equal(result.outputText.includes("Visible detail"), true);
+  assert.equal(result.outputText.includes("Keep this"), true);
+  assert.equal(result.outputText.includes("→"), false);
+  assert.equal(result.outputText.includes("secret.txt"), false);
+  assert.equal(result.outputText.includes("grep hidden"), false);
 });
 
 runTest("normalizeDelegatedOutput parses JSON strings nested in submit_result result fields", () => {
@@ -265,6 +293,88 @@ runTest("validateSubagentOutputContract returns strict-mode error when schema re
   assert.equal(result.outputText, "## TASK COMPLETION REPORT\n\nCompleted successfully.");
   assert.equal(result.source, "assistant_output");
   assert.equal(result.format, "human_text");
+});
+
+runTest("normalizeDelegatedOutput uses latest assistant final response instead of streamed tool transcript", () => {
+  const messages: Message[] = [
+    assistantMessage("Investigating before final response."),
+    assistantMessage([
+      {
+        type: "toolCall",
+        name: "read",
+        arguments: { path: "secret.txt" },
+      } as Message["content"][number],
+    ]),
+    {
+      role: "tool",
+      content: "secret tool result must not be handed off",
+      timestamp: Date.now(),
+    } as Message,
+    assistantMessage("Final response only."),
+  ];
+
+  const result = normalizeDelegatedOutput({
+    messages,
+    fallbackOutputText: [
+      "Investigating before final response.",
+      "→ read secret.txt",
+      "secret tool result must not be handed off",
+      "Final response only.",
+    ].join("\n"),
+  });
+
+  assert.equal(result.outputText, "Final response only.");
+  assert.equal(result.source, "assistant_output");
+  assert.equal(result.outputText.includes("→ read"), false);
+  assert.equal(result.outputText.includes("secret tool result"), false);
+});
+
+runTest("normalizeDelegatedOutput extracts fallback final response without tool-call transcript lines", () => {
+  const result = normalizeDelegatedOutput({
+    messages: [],
+    fallbackOutputText: [
+      "Streaming analysis before tool use.",
+      "→ read src/index.ts",
+      "",
+      "Final fallback response only.",
+    ].join("\n"),
+  });
+
+  assert.equal(result.outputText, "Final fallback response only.");
+  assert.equal(result.source, "streamed_output");
+  assert.equal(result.outputText.includes("→ read"), false);
+  assert.equal(result.outputText.includes("Streaming analysis"), false);
+});
+
+runTest("normalizeDelegatedOutput uses captured final response before ambiguous streamed transcript", () => {
+  const result = normalizeDelegatedOutput({
+    messages: [],
+    finalResponseText: "Plain final answer from arbitrary agent.",
+    fallbackOutputText: [
+      "Earlier streamed content.",
+      "→ read secret.txt",
+      "secret tool result must not be handed off",
+    ].join("\n"),
+  });
+
+  assert.equal(result.outputText, "Plain final answer from arbitrary agent.");
+  assert.equal(result.source, "assistant_output");
+  assert.equal(result.outputText.includes("secret"), false);
+});
+
+runTest("normalizeDelegatedOutput omits ambiguous streamed transcripts without terminal final text", () => {
+  const result = normalizeDelegatedOutput({
+    messages: [],
+    fallbackOutputText: [
+      "Streaming analysis before tool use.",
+      "→ read secret.txt",
+      "secret tool result must not be handed off",
+    ].join("\n"),
+  });
+
+  assert.equal(result.outputText, "");
+  assert.equal(result.source, "empty");
+  assert.equal(result.warnings.includes("No handoff-safe terminal final response was available; omitted ambiguous streamed transcript text."), true);
 });
 
 console.log("All output-contract tests passed.");
