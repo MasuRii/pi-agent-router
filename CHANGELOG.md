@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-30
+
+### Added
+- Expanded `/dismiss` targeting to accept retained task ids, logical task ids, and unique delegated agent names in addition to session ids.
+
+### Changed
+- Refactored delegated-session widget and dismiss menu rendering for more compact active-state and task selection displays.
+- Shortened task tool and parameter descriptions to reduce prompt/context overhead while preserving `contextFrom` mode rules.
+- Updated Pi peer dependency ranges to `@mariozechner/*` `^0.70.6` and `typebox` `^1.1.35`.
+
+### Fixed
+- Added explicit validation for top-level and parallel `contextFrom` references that match current-batch task ids, with guidance to use chain mode or retained delegated sessions.
+- Fixed `/dismiss` so dismissing one running parallel delegated session no longer aborts or skips unrelated parallel tasks.
+
 ## [0.3.0] - 2026-04-28
 
 ### Added
