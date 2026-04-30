@@ -2068,7 +2068,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         args.push("-e", delegatedRuntimeExtension);
       }
       args.push("-e", delegatedIdentityExtension);
-      args.push("--append-system-prompt", tempPrompt, `Task: ${task}`);
+      args.push("--append-system-prompt", tempPrompt);
     } catch (error) {
       const message = getErrorMessage(error);
       session.status = "failed";
@@ -2456,20 +2456,63 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       : process.platform === "win32"
         ? ["/d", "/s", "/c", "pi", ...args]
         : args;
+    const delegatedTaskPrompt = `Task: ${task}`;
 
     let lastAcquiredCredentialId: string | undefined;
 
     const runSubagentAttempt = async (): Promise<SubagentRunResult> => {
-      const acquiredKeyLease = await tryAcquireKeyForSubagent(
-        session.id,
-        subagentProviderId,
-        {
-          requestedModel: delegatedModelRef,
-          modelContext: delegatedModelContext,
-          parentSessionId: session.parentSessionId,
-        },
+      const parentCredentialFallbackAllowed =
+        shouldInheritParentCredentialEnvForProvider(subagentProviderId);
+      const requiresDelegatedCredential = Boolean(
+        subagentProviderId &&
+          subagentProviderEnvKey &&
+          !parentCredentialFallbackAllowed,
       );
+      const hasDelegatedMultiAuthRuntime = args.some((argument) =>
+        /(?:^|[\\/])(?:pi-multi-auth|multi-auth)$/.test(argument),
+      );
+      const shouldAcquirePinnedDelegatedCredential = Boolean(
+        subagentProviderId &&
+          subagentProviderEnvKey &&
+          (!parentCredentialFallbackAllowed || !hasDelegatedMultiAuthRuntime),
+      );
+      if (subagentProviderId && subagentProviderEnvKey && !shouldAcquirePinnedDelegatedCredential) {
+        void piAgentRouterDebugLogger.info("subagent.key_acquire_skipped_multi_auth_runtime", {
+          message:
+            `[pi-agent-router] Skipped pinned ${subagentProviderId} key acquisition for subagent ${session.id.slice(0, 8)}; delegated pi-multi-auth will rotate credentials with shared runtime state.`,
+          providerId: subagentProviderId,
+          sessionId: session.id,
+          envKey: subagentProviderEnvKey,
+          parentCredentialFallbackAllowed,
+          hasDelegatedMultiAuthRuntime,
+          multiAuthRuntimeDir: AGENT_DIR,
+        });
+      }
+      const acquiredKeyLease = shouldAcquirePinnedDelegatedCredential
+        ? await tryAcquireKeyForSubagent(
+            session.id,
+            subagentProviderId,
+            {
+              requestedModel: delegatedModelRef,
+              modelContext: delegatedModelContext,
+              parentSessionId: session.parentSessionId,
+            },
+          )
+        : null;
       lastAcquiredCredentialId = acquiredKeyLease?.credentialId;
+      if (!acquiredKeyLease && requiresDelegatedCredential) {
+        const modelContextText = delegatedModelRef ? ` for ${delegatedModelRef}` : "";
+        return {
+          code: 1,
+          stdout: "",
+          stderr:
+            `[pi-agent-router] No delegated ${subagentProviderId} credential was acquired${modelContextText}. ` +
+            "Parent environment credential fallback is disabled by provider policy, so the delegated subagent was not started to avoid unpinned multi-auth rotation.",
+          timedOut: false,
+          sessionPath: options.sessionPath,
+        };
+      }
+
       const stdoutSink = createOutputSink({
         inMemoryMaxChars: SUBAGENT_STDOUT_CAPTURE_MAX_CHARS,
       });
@@ -2775,6 +2818,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               parentEnv: process.env,
               parentSessionId,
               isolatedAgentDir: session.isolatedAgentDir,
+              multiAuthRuntimeDir: AGENT_DIR,
               inheritedEnvKeys,
               delegatedCredential: acquiredKeyLease
                 ? {
@@ -2789,11 +2833,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             const proc = spawn(command, commandArgs, {
               cwd,
               shell: false,
-              stdio: ["ignore", "pipe", "pipe"],
+              stdio: ["pipe", "pipe", "pipe"],
               env: subagentEnv,
             });
 
             session.proc = proc as SubagentSession["proc"];
+
+            proc.stdin.on("error", (error) => {
+              const message = getErrorMessage(
+                error,
+                "Failed to send delegated task to delegated process stdin",
+              );
+              appendStderrMessage(message);
+            });
+            proc.stdin.end(delegatedTaskPrompt);
 
             proc.stdout.on("data", (chunk) => {
               appendStdoutPiece(stdoutDecoder.decode(chunk, { stream: true }));

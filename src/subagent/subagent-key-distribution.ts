@@ -224,6 +224,7 @@ function shouldInheritParentCredentialEnv(providerId: string | undefined): boole
 }
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 1_500;
+const DISTRIBUTED_ONLY_ACQUIRE_TIMEOUT_MS = 30_000;
 const FALLBACK_ENV_ACQUIRE_TIMEOUT_MS = 250;
 
 type KeyLease = {
@@ -421,9 +422,14 @@ function hasUsableEnvValue(env: NodeJS.ProcessEnv, envKey: string | undefined): 
 function resolveAcquireTimeoutMs(
   requestedTimeoutMs: number | undefined,
   hasParentFallbackCredential: boolean,
+  parentFallbackAllowed: boolean,
 ): number {
   if (Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0) {
     return Math.max(1, Math.trunc(requestedTimeoutMs));
+  }
+
+  if (!parentFallbackAllowed) {
+    return DISTRIBUTED_ONLY_ACQUIRE_TIMEOUT_MS;
   }
 
   return hasParentFallbackCredential
@@ -644,6 +650,7 @@ export async function tryAcquireKeyForSubagent(
   const effectiveTimeoutMs = resolveAcquireTimeoutMs(
     options.timeoutMs,
     hasParentFallbackCredential,
+    parentFallbackAllowed,
   );
   const abortController = new AbortController();
   const delegatedRequest = resolveDelegatedCredentialRequest({
@@ -681,8 +688,9 @@ export async function tryAcquireKeyForSubagent(
     if (existingLease) {
       void piAgentRouterDebugLogger.info("subagent.key_reused", {
         message:
-          `[pi-agent-router] Reused distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
+          `[pi-agent-router] Reused distributed ${normalizedProviderId} key ${existingLease.credentialId} for subagent ${sessionId.slice(0, 8)}.`,
         providerId: normalizedProviderId,
+        credentialId: existingLease.credentialId,
         sessionId,
         acquisitionLatencyMs: Date.now() - startedAt,
       });
@@ -703,15 +711,27 @@ export async function tryAcquireKeyForSubagent(
         signal: abortController.signal,
       },
     );
-    if (shouldBypassDelegatedAcquisition) {
+    if (shouldBypassDelegatedAcquisition && parentFallbackAllowed) {
       void piAgentRouterDebugLogger.info("subagent.key_acquire_bypassed", {
         message:
-          `[pi-agent-router] Skipped distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because only one eligible credential remains.`,
+          `[pi-agent-router] Skipped distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because only one eligible credential remains and parent environment credential fallback is allowed.`,
         providerId: normalizedProviderId,
         sessionId,
         acquisitionLatencyMs: Date.now() - startedAt,
+        fallbackPolicy,
       });
       return null;
+    }
+
+    if (shouldBypassDelegatedAcquisition) {
+      void piAgentRouterDebugLogger.info("subagent.key_acquire_bypass_ignored", {
+        message:
+          `[pi-agent-router] Keeping distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because parent environment credential fallback is disabled by provider policy.`,
+        providerId: normalizedProviderId,
+        sessionId,
+        acquisitionLatencyMs: Date.now() - startedAt,
+        fallbackPolicy,
+      });
     }
 
     const acquiredLease = await Promise.race<
@@ -759,8 +779,9 @@ export async function tryAcquireKeyForSubagent(
 
     void piAgentRouterDebugLogger.info("subagent.key_acquired", {
       message:
-        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
+        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key ${lease.credentialId} for subagent ${sessionId.slice(0, 8)}.`,
       providerId: normalizedProviderId,
+      credentialId: lease.credentialId,
       sessionId,
       acquisitionLatencyMs: Date.now() - startedAt,
       distributorMetrics: distributor.getMetrics?.(),
