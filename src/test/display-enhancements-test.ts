@@ -75,7 +75,7 @@ runTest("tool activity labels keep full grep invocation without hard truncation"
 
 runTest("wrapped task activity previews clamp to four display lines", () => {
   const lines = buildWrappedPrefixedLines({
-    firstPrefix: "└ ",
+    firstPrefix: "└─ ",
     continuationPrefix: "   ",
     text: "bash ".repeat(120),
     targetWidth: 32,
@@ -83,7 +83,7 @@ runTest("wrapped task activity previews clamp to four display lines", () => {
   });
 
   assert.equal(lines.length, 4);
-  assert.equal(lines[0]?.startsWith("└ "), true);
+  assert.equal(lines[0]?.startsWith("└─ "), true);
   assert.equal(lines.slice(1).every((line) => line.startsWith("   ")), true);
   assert.equal(lines[3]?.endsWith("…"), true);
 });

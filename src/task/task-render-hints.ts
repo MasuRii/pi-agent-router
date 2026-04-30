@@ -2,13 +2,15 @@ import { normalizeInputText } from "../input-normalization";
 
 export function formatAttachSubagentOutputHint(
   sessionId: string | undefined,
+  action = "view output",
 ): string | undefined {
   const normalized = normalizeInputText(sessionId);
+  const normalizedAction = normalizeInputText(action) || "view output";
   if (!normalized) {
     return undefined;
   }
 
-  return `/attach ${normalized.slice(0, 8)} view subagent output`;
+  return `⌨ Type /attach ${normalized.slice(0, 8)} to ${normalizedAction}`;
 }
 
 export function formatHiddenTasksSummary(hiddenTaskCount: number): string | undefined {

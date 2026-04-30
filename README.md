@@ -73,9 +73,11 @@ Open or dismiss tracked delegated-task output:
 ```text
 /attach
 /attach <sessionId>
-/dismiss <sessionId>
+/dismiss <sessionId|taskId|agent>
 /dismiss all
 ```
+
+`/dismiss` accepts a session id/prefix, retained task id, logical task id, or a unique delegated agent name. Dismissing one task in parallel mode stops only that delegated session; chain mode stops later queued steps when the dismissed session is not the final step, while completed earlier chain results remain in the final summary.
 
 ## Configuration
 

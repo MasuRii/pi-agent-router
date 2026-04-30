@@ -80,7 +80,6 @@ import {
   SUBAGENT_STDERR_CAPTURE_MAX_CHARS,
   SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS,
   SUBAGENT_TASK_REGISTRY_TTL_MS,
-  SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS,
   SUBAGENT_WIDGET_KEY,
 } from "./constants";
 import {
@@ -152,6 +151,7 @@ import {
   getSubagentStatusDisplay,
   parseSubagentExecutionDetails,
   parseSubagentExecutionStatus,
+  resolveDismissSessionReference,
   resolveSessionByReference,
   resolveSubagentTimeoutMs,
   summarizeParallelResults,
@@ -399,6 +399,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     status: SubagentExecutionStatus;
     outputText?: string;
     structuredResult?: unknown;
+    lastDismissedAt?: number;
   };
 
   const isActiveReferenceStatus = (status: SubagentExecutionStatus): boolean =>
@@ -419,6 +420,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     source: SubagentTaskRegistryEntry["lastOutputSource"],
   ): boolean => source === "assistant_output" || source === "streamed_output";
 
+  const isLatestTaskRegistrySession = (
+    entry: SubagentTaskRegistryEntry,
+    sessionId: string,
+  ): boolean => entry.childSessionIds[entry.childSessionIds.length - 1] === sessionId;
+
   const buildResolvedTaskReferenceCandidates = (
     parentSessionId: string,
   ): ResolvedTaskReference[] => {
@@ -437,6 +443,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             : existing?.structuredResult,
         sessionPath: candidate.sessionPath || existing?.sessionPath,
         sessionId: candidate.sessionId || existing?.sessionId,
+        lastDismissedAt: candidate.lastDismissedAt ?? existing?.lastDismissedAt,
       });
     };
 
@@ -459,6 +466,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         sessionId: latestSession?.id || latestSessionId,
         sessionPath: entry.sessionPath || latestSession?.sessionPath,
         status: entry.status,
+        lastDismissedAt: entry.lastDismissedAt,
         outputText:
           entry.lastFinalResponseText ||
           latestSession?.lastFinalResponseText ||
@@ -483,6 +491,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         sessionPath: session.sessionPath,
         status: session.status,
         outputText: session.lastFinalResponseText,
+        lastDismissedAt: session.dismissed ? session.finishedAt ?? session.startedAt : undefined,
       });
     }
 
@@ -637,7 +646,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     reference: string,
     parentSessionId: string,
     fieldName: string,
-  ): { taskId?: string; sessionPath?: string; error?: string } => {
+  ): { taskId?: string; sessionPath?: string; error?: string; autoResumed?: boolean } => {
     const resolved = resolveTaskReference(reference, parentSessionId, fieldName);
     if (resolved.error || !resolved.candidate) {
       return { error: resolved.error };
@@ -657,6 +666,51 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
 
     return { taskId: candidate.taskId, sessionPath: candidate.sessionPath };
+  };
+
+  const resolveImplicitDismissedRetryReference = (
+    logicalTaskId: string | undefined,
+    parentSessionId: string,
+  ): { taskId?: string; sessionPath?: string; error?: string; autoResumed?: boolean } => {
+    const normalizedLogicalTaskId = normalizeInputText(logicalTaskId).toLowerCase();
+    if (!normalizedLogicalTaskId) {
+      return {};
+    }
+
+    const candidates = buildResolvedTaskReferenceCandidates(parentSessionId)
+      .filter((candidate) => {
+        if (!candidate.lastDismissedAt || !candidate.sessionPath) {
+          return false;
+        }
+
+        if (isActiveReferenceStatus(candidate.status)) {
+          return false;
+        }
+
+        const candidateLogicalTaskId = normalizeInputText(
+          candidate.logicalTaskId || candidate.taskId,
+        ).toLowerCase();
+        return candidateLogicalTaskId === normalizedLogicalTaskId;
+      })
+      .sort((left, right) => {
+        const dismissedAtDelta = (right.lastDismissedAt ?? 0) - (left.lastDismissedAt ?? 0);
+        if (dismissedAtDelta !== 0) {
+          return dismissedAtDelta;
+        }
+
+        return (right.sessionId || "").localeCompare(left.sessionId || "");
+      });
+
+    const candidate = candidates[0];
+    if (!candidate) {
+      return {};
+    }
+
+    return {
+      taskId: candidate.taskId,
+      sessionPath: candidate.sessionPath,
+      autoResumed: true,
+    };
   };
 
   const hasRunningVisibleSubagentSession = (): boolean => {
@@ -1508,7 +1562,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     session.stderr = retainedCompletedError.excerpt || "";
 
     const trackedTask = subagentTaskRegistry.get(session.taskId);
-    if (trackedTask) {
+    if (trackedTask && isLatestTaskRegistrySession(trackedTask, session.id)) {
       trackedTask.updatedAt = Date.now();
       trackedTask.status = session.status;
       trackedTask.delegatedBy = session.delegatedBy;
@@ -1632,6 +1686,27 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     return true;
   };
 
+  const markTaskRegistrySessionDismissed = (
+    session: SubagentSession,
+    reason: string,
+  ): void => {
+    const trackedTask = subagentTaskRegistry.get(session.taskId);
+    if (!trackedTask || !isLatestTaskRegistrySession(trackedTask, session.id)) {
+      return;
+    }
+
+    const now = Date.now();
+    trackedTask.status = "killed";
+    trackedTask.updatedAt = now;
+    trackedTask.sessionPath = session.sessionPath || trackedTask.sessionPath;
+    trackedTask.lastError = trackedTask.lastError
+      ? `${trackedTask.lastError}\n${reason}`
+      : reason;
+    trackedTask.lastExitCode = undefined;
+    trackedTask.lastTimedOut = false;
+    trackedTask.lastDismissedAt = now;
+  };
+
   const dismissSubagentSession = (sessionId: string): boolean => {
     const session = subagentSessions.get(sessionId);
     if (!session) {
@@ -1641,6 +1716,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     session.dismissed = true;
 
     if (session.status === "running") {
+      markTaskRegistrySessionDismissed(session, "Dismissed by user.");
       killSubagentSession(sessionId, "Dismissed by user.");
       return true;
     }
@@ -1725,6 +1801,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     taskRegistryEntry.lastTask = options.displayTask || task;
     taskRegistryEntry.runCount += 1;
     taskRegistryEntry.childSessionIds.push(sessionId);
+    delete taskRegistryEntry.lastDismissedAt;
     subagentTaskRegistry.set(taskId, taskRegistryEntry);
 
     const session: SubagentSession = {
@@ -2412,6 +2489,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       let lastStreamLatestToolCall: string | undefined;
 
       const emitStreamUpdate = (): void => {
+        const eventSessionPath = eventState.sessionPath;
+        if (eventSessionPath && session.sessionPath !== eventSessionPath) {
+          session.sessionPath = eventSessionPath;
+          const trackedTask = subagentTaskRegistry.get(session.taskId);
+          if (trackedTask && isLatestTaskRegistrySession(trackedTask, session.id)) {
+            trackedTask.sessionPath = eventSessionPath;
+            trackedTask.updatedAt = Date.now();
+          }
+        }
+
         const outputText = eventState.outputText;
         const toolInvocations = getSubagentToolInvocationsFromState(eventState);
         const toolInvocationCount = eventState.toolInvocationTotalCount;
@@ -2784,7 +2871,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       SUBAGENT_WIDGET_KEY,
       (tui, theme) => {
         const animatedSurface = createAnimatedRenderSurface(tui, {
-          intervalMs: SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS,
+          intervalMs: SPINNER_RENDER_INTERVAL_MS,
           shouldRender: hasRunningVisibleSubagentSession,
         });
         subagentWidgetRenderRequest = animatedSurface.requestRender;
@@ -3225,7 +3312,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const menu = buildAgentSelectionMenu(agents, activeAgent);
         const current = activeAgent || "none";
         const selected = await ctx.ui.select(
-          `Select active agent (current: ${current}; ↑/↓ to navigate, Enter to confirm)`,
+          `Select active agent (current: ${current}; ↑/↓, Enter, Esc: cancel)`,
           menu.labels,
         );
 
@@ -3321,7 +3408,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("dismiss", {
     description:
-      "Dismiss tracked delegated-task sessions (usage: /dismiss <sessionId|all>)",
+      "Dismiss delegated task sessions (usage: /dismiss <sessionId|taskId|agent|all>)",
     handler: async (args, ctx) => {
       pruneFinishedSessions();
       const sessions = listSubagentSessions();
@@ -3337,15 +3424,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         if (input.toLowerCase() === "all") {
           targetIds = sessions.map((session) => session.id);
         } else {
-          const resolved = resolveSessionByReference(input, sessions);
-          if (!resolved) {
-            ctx.ui.notify(`Session not found: ${input}`, "error");
+          const resolved = resolveDismissSessionReference(input, sessions);
+          if (!resolved.session) {
+            ctx.ui.notify(resolved.error || `Session not found: ${input}`, "error");
             return;
           }
-          targetIds = [resolved.id];
+          targetIds = [resolved.session.id];
         }
-      } else if (sessions.length === 1) {
-        targetIds = [sessions[0].id];
       } else {
         if (!ctx.hasUI) {
           ctx.ui.notify(
@@ -3355,22 +3440,47 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           return;
         }
 
+        const separatorOption = "────────────────────────────────────────";
+        const allSessionsOption = "⚠ Dismiss ALL delegated-task sessions";
+        const sessionRows = sessions.map((session) => {
+          const status = getSubagentStatusDisplay(session.status).label
+            .replace(/^[✓✗⏸⏳!]\s*/u, "")
+            .trim()
+            .toUpperCase();
+          const taskLabel = normalizeInputText(
+            session.logicalTaskId || session.taskId,
+          );
+          const label = `${session.id.slice(0, 8)} ${session.agent} ${taskLabel}`.trim();
+          return { label, status };
+        });
+        const statusWidth = Math.max(
+          0,
+          ...sessionRows.map((row) => row.status.length + 2),
+        );
+        const labelWidth = Math.max(
+          0,
+          ...sessionRows.map((row) => row.label.length),
+        );
         const options = [
-          "all",
-          ...sessions.map((session) => {
-            const status = getSubagentStatusDisplay(
-              session.status,
-            ).label.replace(/^✗\s*/, "");
-            return `${session.id.slice(0, 8)} ${session.agent} (${status})`;
-          }),
+          ...sessionRows.map((row) =>
+            `${row.label.padEnd(labelWidth)} ${`(${row.status})`.padStart(statusWidth)}`,
+          ),
+          separatorOption,
+          allSessionsOption,
         ];
 
-        const selected = await ctx.ui.select("Dismiss session", options);
+        const selected = await ctx.ui.select(
+          "Select delegated-task session to dismiss (Esc to cancel)",
+          options,
+        );
+        if (selected === separatorOption) {
+          return;
+        }
         if (!selected) {
           return;
         }
 
-        if (selected === "all") {
+        if (selected === allSessionsOption) {
           targetIds = sessions.map((session) => session.id);
         } else {
           targetIds = [selected.split(" ")[0] ?? ""];
@@ -4470,12 +4580,21 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                       parentSessionId,
                       task.retryFrom ? `tasks[${index}].retryFrom` : `tasks[${index}].retry`,
                     )
-                  : {};
+                  : resolveImplicitDismissedRetryReference(
+                      task.taskLabel,
+                      parentSessionId,
+                    );
                 if (retryResume.error) {
                   taskResult.status = "failed";
                   taskResult.exitCode = 1;
                   taskResult.error = retryResume.error;
                   throw new Error(taskResult.error);
+                }
+                if (retryResume.autoResumed) {
+                  taskResult.contractWarnings = [
+                    ...(taskResult.contractWarnings || []),
+                    `Task ${taskResult.index}: automatically resumed retained session after prior /dismiss for task id '${task.taskLabel}'.`,
+                  ];
                 }
 
                 const session = await startBackgroundSubagent(
@@ -4603,7 +4722,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 );
 
                 const trackedTask = subagentTaskRegistry.get(session.taskId);
-                if (trackedTask) {
+                if (trackedTask && isLatestTaskRegistrySession(trackedTask, session.id)) {
                   trackedTask.logicalTaskId = task.taskLabel || trackedTask.logicalTaskId;
                   trackedTask.lastOutput = retainedTaskOutput.excerpt || trackedTask.lastOutput;
                   if (normalizedDelegatedOutput.format === "human_text" && retainedTaskOutput.excerpt) {
@@ -4675,8 +4794,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 }
 
                 if (finalStatus === "aborted") {
-                  taskResult.abortReason =
-                    "Delegation aborted by signal while task was running.";
+                  taskResult.abortReason = session.dismissed
+                    ? "Delegated task dismissed by user."
+                    : "Delegation aborted by signal while task was running.";
                   throw new Error(taskResult.abortReason);
                 }
 

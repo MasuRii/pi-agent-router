@@ -259,8 +259,14 @@ export async function mapWithAbortAwareConcurrency<TIn, TOut>(options: {
             firstError = normalizedError;
           }
 
+          const isExternalAbort = options.signal?.aborted === true;
+          const isWorkerTimeoutAbort =
+            normalizedError.name === "AbortError" &&
+            /timed out after \d+ms/i.test(normalizedError.message);
+          const isCascadeAbort =
+            combined.signal.aborted && isAbortLikeError(normalizedError);
           const isSignalAbort =
-            options.signal?.aborted || isAbortLikeError(normalizedError);
+            isExternalAbort || isWorkerTimeoutAbort || isCascadeAbort;
 
           if (!abortReason) {
             if (isSignalAbort) {

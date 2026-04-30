@@ -9,6 +9,7 @@ import {
   listVisibleSubagentSessions,
   resetSubagentSessionRetentionState,
 } from "../subagent/subagent-session-state";
+import { resolveDismissSessionReference } from "../subagent/subagent-execution";
 import type { SubagentSession } from "../types";
 
 function runTest(name: string, testFn: () => void): void {
@@ -47,6 +48,52 @@ runTest("listVisibleSubagentSessions filters to the active parent session and hi
     visibleSessions.map((session) => session.id),
     ["running-current", "queued-current", "finished-current"],
   );
+});
+
+runTest("resolveDismissSessionReference resolves session, task, logical task, and unique agent refs", () => {
+  const sessions = [
+    createSession({
+      id: "11111111-aaaa",
+      taskId: "task-alpha",
+      logicalTaskId: "finalCommitPlan",
+      agent: "git",
+      status: "running",
+    }),
+    createSession({
+      id: "22222222-bbbb",
+      taskId: "task-beta",
+      logicalTaskId: "verifyRepos",
+      agent: "test",
+      status: "running",
+    }),
+  ];
+
+  assert.equal(resolveDismissSessionReference("11111111", sessions).session?.id, "11111111-aaaa");
+  assert.equal(resolveDismissSessionReference("task-beta", sessions).session?.id, "22222222-bbbb");
+  assert.equal(resolveDismissSessionReference("finalCommitPlan", sessions).session?.id, "11111111-aaaa");
+  assert.equal(resolveDismissSessionReference("test", sessions).session?.id, "22222222-bbbb");
+});
+
+runTest("resolveDismissSessionReference prefers exact agent refs over task prefixes", () => {
+  const sessions = [
+    createSession({ id: "11111111-aaaa", taskId: "testPlan", agent: "code", status: "running" }),
+    createSession({ id: "22222222-bbbb", taskId: "verifyRepos", agent: "test", status: "running" }),
+  ];
+
+  assert.equal(resolveDismissSessionReference("test", sessions).session?.id, "22222222-bbbb");
+});
+
+runTest("resolveDismissSessionReference reports ambiguous agent refs", () => {
+  const sessions = [
+    createSession({ id: "11111111-aaaa", taskId: "task-alpha", agent: "code", status: "running" }),
+    createSession({ id: "22222222-bbbb", taskId: "task-beta", agent: "code", status: "running" }),
+  ];
+
+  const resolved = resolveDismissSessionReference("code", sessions);
+
+  assert.equal(resolved.session, undefined);
+  assert.match(resolved.error || "", /ambiguous/i);
+  assert.match(resolved.error || "", /session id or task id/i);
 });
 
 runTest("clearStaleSubagentSessionsForNewSession preserves active work from other parent sessions", () => {

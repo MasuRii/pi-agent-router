@@ -255,6 +255,7 @@ export type SubagentTaskRegistryEntry = {
   lastError?: string;
   lastExitCode?: number;
   lastTimedOut?: boolean;
+  lastDismissedAt?: number;
   usage?: SubagentUsage;
 };
 

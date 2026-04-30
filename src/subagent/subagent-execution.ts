@@ -877,6 +877,52 @@ export function generateUniqueTaskId(registry: ReadonlyMap<string, unknown>): st
   return candidate;
 }
 
+function uniqueSessions(sessions: readonly SubagentSession[]): SubagentSession[] {
+  const byId = new Map<string, SubagentSession>();
+
+  for (const session of sessions) {
+    if (!byId.has(session.id)) {
+      byId.set(session.id, session);
+    }
+  }
+
+  return [...byId.values()];
+}
+
+function describeSessionReferenceMatch(session: SubagentSession): string {
+  const identifiers = [
+    `session=${session.id.slice(0, 8)}`,
+    `task=${session.taskId}`,
+    session.logicalTaskId ? `logical=${session.logicalTaskId}` : undefined,
+    `agent=${session.agent}`,
+  ].filter((entry): entry is string => Boolean(entry));
+
+  return identifiers.join("/");
+}
+
+function resolveUniqueSessionReferenceMatch(
+  reference: string,
+  matches: readonly SubagentSession[],
+): { session?: SubagentSession; error?: string } {
+  const uniqueMatches = uniqueSessions(matches);
+
+  if (uniqueMatches.length === 0) {
+    return {};
+  }
+
+  if (uniqueMatches.length === 1) {
+    return { session: uniqueMatches[0] };
+  }
+
+  const labels = uniqueMatches
+    .slice(0, 6)
+    .map((session) => describeSessionReferenceMatch(session))
+    .join(", ");
+  return {
+    error: `Session reference '${reference}' is ambiguous; matched ${labels}. Use a full session id or task id.`,
+  };
+}
+
 export function resolveSessionByReference(reference: string, sessions: readonly SubagentSession[]): SubagentSession | undefined {
   const normalized = normalizeSessionReference(reference);
   if (!normalized) {
@@ -894,4 +940,68 @@ export function resolveSessionByReference(reference: string, sessions: readonly 
   }
 
   return undefined;
+}
+
+export function resolveDismissSessionReference(
+  reference: string,
+  sessions: readonly SubagentSession[],
+): { session?: SubagentSession; error?: string } {
+  const normalized = normalizeSessionReference(reference);
+  if (!normalized) {
+    return { error: "Session reference is required." };
+  }
+
+  const exactSession = sessions.find(
+    (session) => session.id.toLowerCase() === normalized,
+  );
+  if (exactSession) {
+    return { session: exactSession };
+  }
+
+  const sessionPrefixMatch = resolveUniqueSessionReferenceMatch(
+    reference,
+    sessions.filter((session) => session.id.toLowerCase().startsWith(normalized)),
+  );
+  if (sessionPrefixMatch.session || sessionPrefixMatch.error) {
+    return sessionPrefixMatch;
+  }
+
+  const matchesTaskReference = (
+    session: SubagentSession,
+    exact: boolean,
+  ): boolean => {
+    const values = [session.taskId, session.logicalTaskId]
+      .map((value) => normalizeInputText(value).toLowerCase())
+      .filter(Boolean);
+
+    return values.some((value) => exact ? value === normalized : value.startsWith(normalized));
+  };
+
+  const exactTaskMatch = resolveUniqueSessionReferenceMatch(
+    reference,
+    sessions.filter((session) => matchesTaskReference(session, true)),
+  );
+  if (exactTaskMatch.session || exactTaskMatch.error) {
+    return exactTaskMatch;
+  }
+
+  const exactAgentMatch = resolveUniqueSessionReferenceMatch(
+    reference,
+    sessions.filter(
+      (session) => normalizeInputText(session.agent).toLowerCase() === normalized,
+    ),
+  );
+  if (exactAgentMatch.session || exactAgentMatch.error) {
+    return exactAgentMatch;
+  }
+
+  const taskPrefixMatch = resolveUniqueSessionReferenceMatch(
+    reference,
+    sessions.filter((session) => matchesTaskReference(session, false)),
+  );
+  if (taskPrefixMatch.session || taskPrefixMatch.error) {
+    return taskPrefixMatch;
+  }
+
+  return { error: `Session not found: ${reference}` };
 }

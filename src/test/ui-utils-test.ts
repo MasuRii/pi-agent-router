@@ -59,16 +59,16 @@ runTest("renderSubagentWidgetLines shows aggregate progress with live running an
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(" 1 running"), true);
-  assert.equal(line[0].includes(" 1 queued"), true);
-  assert.equal(line[0].includes("✓ 1 completed"), true);
-  assert.equal(line[0].includes(" code 24s"), true);
-  assert.equal(line[0].includes(" ask"), true);
+  assert.equal(line[0].includes(" 1/3"), true);
+  assert.equal(line[0].includes("▰ ▱ ▱"), true);
+  assert.equal(line[0].includes("◜ code 24s"), true);
+  assert.equal(line[0].includes("ask"), false);
   assert.equal(line[0].includes("63db3446"), false);
   assert.equal(line[0].includes("b8c831fd"), false);
   assert.equal(line[0].includes("a7a720ec"), false);
   assert.equal(line[0].includes(" | "), false);
-  assert.equal(line[0].includes(" · "), true);
+  assert.equal(line[0].includes(" │ "), true);
+  assert.equal(line[0].includes(" · "), false);
 });
 
 runTest("renderSubagentWidgetLines uses available width before collapsing running details", () => {
@@ -92,13 +92,13 @@ runTest("renderSubagentWidgetLines uses available width before collapsing runnin
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(" alpha 24s"), true);
-  assert.equal(line[0].includes(" beta 24s"), true);
-  assert.equal(line[0].includes(" gamma 24s"), true);
+  assert.equal(line[0].includes("◜ alpha 24s"), true);
+  assert.equal(line[0].includes("◜ beta 24s"), true);
+  assert.equal(line[0].includes("◜ gamma 24s"), true);
   assert.equal(line[0].includes("+1 more"), false);
 });
 
-runTest("renderSubagentWidgetLines collapses all-success sessions into a single summary", () => {
+runTest("renderSubagentWidgetLines keeps all-success sessions on the geometric track", () => {
   const line = renderSubagentWidgetLines({
     sessions: [
       { id: "11111111-aaaa", agent: "a", status: "finished", startedAt: 0, finishedAt: 1_000 },
@@ -118,8 +118,10 @@ runTest("renderSubagentWidgetLines collapses all-success sessions into a single 
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes("All 3 agents completed successfully"), true);
-  assert.equal(line[0].includes("3s"), true);
+  assert.equal(line[0].includes("✓ 3/3"), true);
+  assert.equal(line[0].includes("▰ ▰ ▰"), true);
+  assert.equal(line[0].includes("completed successfully"), true);
+  assert.equal(line[0].includes("(3s)"), true);
   assert.equal(line[0].includes("11111111"), false);
   assert.equal(line[0].includes("more sessions"), false);
 });
@@ -154,11 +156,36 @@ runTest("renderSubagentWidgetLines summarizes mixed terminal outcomes without pi
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes("✓ 1 completed"), true);
-  assert.equal(line[0].includes("✗ 1 failed (ui)"), true);
-  assert.equal(line[0].includes("! 1 aborted (security)"), true);
+  assert.equal(line[0].includes(" 1/3"), true);
+  assert.equal(line[0].includes("▰ ▱ ▱"), true);
+  assert.equal(line[0].includes("✕"), false);
+  assert.equal(line[0].includes(" 2 failed"), true);
   assert.equal(line[0].includes("in progress"), false);
   assert.equal(line[0].includes("more sessions"), false);
+});
+
+runTest("renderSubagentWidgetLines uses compact track spacing on narrow widths", () => {
+  const line = renderSubagentWidgetLines({
+    sessions: [
+      { id: "11111111-aaaa", agent: "done", status: "finished", startedAt: 0, finishedAt: 1_000 },
+      { id: "22222222-bbbb", agent: "code", status: "running", startedAt: 0 },
+      { id: "33333333-cccc", agent: "test", status: "queued", startedAt: 0 },
+    ],
+    width: 50,
+    theme: {
+      fg: (_color, text) => text,
+    },
+    formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
+    truncate: (text, width, marker) =>
+      text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
+    now: 0,
+    icons: widgetIcons,
+  });
+
+  assert.equal(line.length, 1);
+  assert.equal(line[0].includes("▰▱▱"), true);
+  assert.equal(line[0].includes("▰ ▰"), false);
 });
 
 runTest("renderSubagentWidgetLines keeps aggregate status on narrow widths", () => {
@@ -188,13 +215,34 @@ runTest("renderSubagentWidgetLines keeps aggregate status on narrow widths", () 
   assert.equal(line[0].includes("COMPLETED"), false);
 });
 
-runTest("renderSubagentWidgetLines retains bright custom agent colors without background blocks", () => {
-  const line = renderSubagentWidgetLines({
+runTest("renderSubagentWidgetLines pulses the first active track segment", () => {
+  const createLine = (now: number): string => renderSubagentWidgetLines({
+    sessions: [
+      { id: "11111111-aaaa", agent: "done", status: "finished", startedAt: 0, finishedAt: 1_000 },
+      { id: "22222222-bbbb", agent: "code", status: "running", startedAt: 0 },
+    ],
+    width: 500,
+    theme: {
+      fg: (_color, text) => text,
+    },
+    formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
+    truncate: (text, width, marker) =>
+      text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
+    now,
+    icons: widgetIcons,
+  })[0] || "";
+
+  assert.equal(createLine(0).includes("▰ ▱"), true);
+  assert.equal(createLine(500).includes("▰ _"), true);
+});
+
+runTest("renderSubagentWidgetLines animates running spinner frames", () => {
+  const createLine = (now: number): string => renderSubagentWidgetLines({
     sessions: [
       {
         id: "63db3446-1111-2222-3333-444444444444",
         agent: "code",
-        agentColor: "#4A90E2",
         status: "running",
         startedAt: 0,
       },
@@ -207,17 +255,46 @@ runTest("renderSubagentWidgetLines retains bright custom agent colors without ba
     getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
     truncate: (text, width, marker) =>
       text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
+    now,
+    icons: widgetIcons,
+  })[0] || "";
+
+  assert.equal(createLine(0).includes("◜ code"), true);
+  assert.equal(createLine(80).includes("◠ code"), true);
+});
+
+runTest("renderSubagentWidgetLines applies configured frontmatter agent colors", () => {
+  const line = renderSubagentWidgetLines({
+    sessions: [
+      {
+        id: "63db3446-1111-2222-3333-444444444444",
+        agent: "code",
+        agentColor: "#4A90E2",
+        status: "running",
+        startedAt: 0,
+      },
+    ],
+    width: 500,
+    theme: {
+      fg: (color, text) => `<${color}>${text}</${color}>`,
+    },
+    formatDuration: (milliseconds) => `${Math.round(milliseconds / 1000)}s`,
+    getStatusDisplay: () => ({ label: "Running", color: "warning" as const }),
+    truncate: (text, width, marker) =>
+      text.length > width ? `${text.slice(0, Math.max(0, width - marker.length))}${marker}` : text,
     now: 42_000,
     icons: widgetIcons,
   });
 
   assert.equal(line.length, 1);
+  assert.equal(line[0].includes("<dim>▱</dim>"), true);
+  assert.equal(line[0].includes("code"), true);
   assert.equal(line[0].includes("\u001b[1;38;5;"), true);
-  assert.equal(line[0].includes("\u001b[48;"), false);
+  assert.equal(line[0].includes("<toolOutput>code</toolOutput>"), false);
   assert.equal(line[0].includes("63db3446"), false);
 });
 
-runTest("renderSubagentWidgetLines falls back to status styling for invalid agent colors", () => {
+runTest("renderSubagentWidgetLines keeps theme styling when agent colors are invalid", () => {
   const line = renderSubagentWidgetLines({
     sessions: [
       {
@@ -241,7 +318,8 @@ runTest("renderSubagentWidgetLines falls back to status styling for invalid agen
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes("<warning>code</warning>"), true);
+  assert.equal(line[0].includes("<toolTitle>◞</toolTitle>"), true);
+  assert.equal(line[0].includes("<toolOutput>code</toolOutput>"), true);
   assert.equal(line[0].includes("\u001b[38;5;"), false);
 });
 

@@ -10,9 +10,9 @@ function runTest(name: string, testFn: () => void): void {
   console.log(`[PASS] ${name}`);
 }
 
-runTest("formatAttachSubagentOutputHint omits nerdfont icon prefix", () => {
+runTest("formatAttachSubagentOutputHint renders explicit attach instruction", () => {
   const hint = formatAttachSubagentOutputHint("abcdef1234567890");
-  assert.equal(hint, "/attach abcdef12 view subagent output");
+  assert.equal(hint, "⌨ Type /attach abcdef12 to view output");
   assert.equal(hint?.startsWith("󰘍"), false);
 });
 

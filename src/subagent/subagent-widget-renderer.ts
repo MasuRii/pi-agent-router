@@ -1,3 +1,4 @@
+import { getCircularSpinnerFrame } from "../progress-spinner";
 import {
   colorizeWithHex,
   normalizeHexColor,
@@ -10,21 +11,17 @@ type WidgetTheme = {
 
 type StatusColor = "success" | "warning" | "error";
 
-type WidgetTone = StatusColor | "dim";
+type WidgetTone = StatusColor | "dim" | "accent" | "toolOutput" | "toolTitle";
 
 type SessionBucketKey =
   | "completed"
   | "running"
   | "queued"
-  | "aborted"
   | "failed";
 
 type SessionBuckets = Record<SessionBucketKey, SubagentWidgetSession[]>;
 
-type ActiveDetailStyle = {
-  includeRuntime: boolean;
-  maxAgentWidth?: number;
-};
+type DetailMode = "full" | "noTimers" | "iconsOnly";
 
 export type SubagentWidgetStatusDisplay = {
   label: string;
@@ -42,41 +39,12 @@ export type SubagentWidgetSession = {
 
 const SEGMENT_SEPARATOR = " · ";
 const DETAIL_SEPARATOR = " │ ";
-const ACTIVE_DETAIL_STYLES: readonly ActiveDetailStyle[] = [
-  { includeRuntime: true },
-  { includeRuntime: false },
-  { includeRuntime: false, maxAgentWidth: 18 },
-  { includeRuntime: false, maxAgentWidth: 12 },
-  { includeRuntime: false, maxAgentWidth: 8 },
-];
+const MAX_GEOMETRIC_TRACK_WIDTH = 10;
+const TRACK_PULSE_INTERVAL_MS = 500;
 
 function normalizeAgentName(agentName: string): string {
   const normalized = typeof agentName === "string" ? agentName.trim() : "";
   return normalized || "agent";
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`): string {
-  return count === 1 ? singular : plural;
-}
-
-function getStatusIcon(status: string, icons: SubagentWidgetIcons): string {
-  if (status === "running") {
-    return icons.running;
-  }
-
-  if (status === "queued") {
-    return icons.queued;
-  }
-
-  if (status === "finished") {
-    return "✓";
-  }
-
-  if (status === "aborted") {
-    return "!";
-  }
-
-  return "✗";
 }
 
 function bucketSessionStatus(status: string): SessionBucketKey {
@@ -92,10 +60,6 @@ function bucketSessionStatus(status: string): SessionBucketKey {
     return "queued";
   }
 
-  if (status === "aborted") {
-    return "aborted";
-  }
-
   return "failed";
 }
 
@@ -106,7 +70,6 @@ function buildSessionBuckets(
     completed: [],
     running: [],
     queued: [],
-    aborted: [],
     failed: [],
   };
 
@@ -115,30 +78,6 @@ function buildSessionBuckets(
   }
 
   return buckets;
-}
-
-function summarizeAgentNames(
-  sessions: readonly SubagentWidgetSession[],
-  maxNames = 2,
-): string {
-  if (sessions.length === 0) {
-    return "";
-  }
-
-  const normalizedMaxNames = Math.max(1, Math.trunc(maxNames));
-  const uniqueNames = [...new Set(sessions.map((session) => normalizeAgentName(session.agent)))];
-  const visibleNames = uniqueNames.slice(0, normalizedMaxNames);
-  const hiddenCount = Math.max(0, uniqueNames.length - visibleNames.length);
-
-  if (visibleNames.length === 0) {
-    return "";
-  }
-
-  if (hiddenCount === 0) {
-    return ` (${visibleNames.join(", ")})`;
-  }
-
-  return ` (${visibleNames.join(", ")} +${hiddenCount})`;
 }
 
 function truncateAgentName(
@@ -168,7 +107,7 @@ function formatAgentLabel(
   agentName: string,
   agentColor: string | undefined,
   theme: WidgetTheme,
-  fallbackTone: WidgetTone,
+  tone: WidgetTone,
   truncate: (text: string, width: number, overflowMarker: string) => string,
   maxWidth?: number,
 ): string {
@@ -178,7 +117,7 @@ function formatAgentLabel(
     return colorizeWithHex(normalizedAgentName, normalizedColor, { bold: true });
   }
 
-  return theme.fg(fallbackTone, normalizedAgentName);
+  return theme.fg(tone, normalizedAgentName);
 }
 
 function resolveRuntimeLabel(
@@ -215,214 +154,178 @@ function resolveSessionSpanMs(
   return Math.max(0, Math.max(...ends) - Math.min(...starts));
 }
 
-function joinSegments(theme: WidgetTheme, segments: readonly string[]): string {
-  return segments.join(theme.fg("dim", SEGMENT_SEPARATOR));
+function shouldHideActiveTrackSegment(now: number): boolean {
+  return Math.floor(now / TRACK_PULSE_INTERVAL_MS) % 2 === 1;
 }
 
-function formatStatusSegment(
-  theme: WidgetTheme,
-  tone: WidgetTone,
-  icon: string,
-  text: string,
-): string {
-  return `${theme.fg(tone, icon)} ${theme.fg(tone, text)}`;
+function resolveGeometricTrackWidth(totalSessions: number): number {
+  return Math.max(1, Math.min(MAX_GEOMETRIC_TRACK_WIDTH, Math.trunc(totalSessions)));
 }
 
-function formatSummarySegments(
-  theme: WidgetTheme,
+function renderGeometricTrack(
   buckets: SessionBuckets,
-  options: {
-    includeFailedNames: boolean;
-    includeAbortedNames: boolean;
-    icons: SubagentWidgetIcons;
-  },
-): string[] {
+  totalSessions: number,
+  theme: WidgetTheme,
+  now: number,
+  segmentSeparator: string,
+): string {
+  const trackWidth = resolveGeometricTrackWidth(totalSessions);
+  const completedSegments = Math.max(
+    0,
+    Math.min(
+      trackWidth,
+      Math.floor((buckets.completed.length / Math.max(1, totalSessions)) * trackWidth),
+    ),
+  );
+  const hasActiveWork = buckets.running.length > 0 || buckets.queued.length > 0;
+  const pulseIndex = hasActiveWork && completedSegments < trackWidth
+    ? completedSegments
+    : -1;
+  const hidePulse = shouldHideActiveTrackSegment(now);
   const segments: string[] = [];
 
-  if (buckets.running.length > 0) {
-    segments.push(
-      formatStatusSegment(
-        theme,
-        "warning",
-        options.icons.running,
-        `${buckets.running.length} running`,
-      ),
-    );
+  for (let index = 0; index < trackWidth; index += 1) {
+    if (index < completedSegments) {
+      segments.push(theme.fg("success", "▰"));
+    } else if (index === pulseIndex && hidePulse) {
+      segments.push(theme.fg("dim", "_"));
+    } else {
+      segments.push(theme.fg("dim", "▱"));
+    }
   }
 
-  if (buckets.completed.length > 0) {
-    segments.push(
-      formatStatusSegment(
-        theme,
-        "success",
-        "✓",
-        `${buckets.completed.length} completed`,
-      ),
-    );
-  }
-
-  if (buckets.failed.length > 0) {
-    const failedNames = options.includeFailedNames
-      ? summarizeAgentNames(buckets.failed)
-      : "";
-    segments.push(
-      formatStatusSegment(
-        theme,
-        "error",
-        "✗",
-        `${buckets.failed.length} failed${failedNames}`,
-      ),
-    );
-  }
-
-  if (buckets.aborted.length > 0) {
-    const abortedNames = options.includeAbortedNames
-      ? summarizeAgentNames(buckets.aborted)
-      : "";
-    segments.push(
-      formatStatusSegment(
-        theme,
-        "warning",
-        "!",
-        `${buckets.aborted.length} aborted${abortedNames}`,
-      ),
-    );
-  }
-
-  if (buckets.queued.length > 0) {
-    segments.push(
-      formatStatusSegment(
-        theme,
-        "warning",
-        options.icons.queued,
-        `${buckets.queued.length} queued`,
-      ),
-    );
-  }
-
-  return segments;
+  return segments.join(segmentSeparator);
 }
 
-function formatLiveSessionDetail(
+function buildTrackSegmentSeparators(width: number): readonly string[] {
+  if (width >= 64) {
+    return [" ", ""];
+  }
+
+  return [""];
+}
+
+function formatProgressLead(
+  buckets: SessionBuckets,
+  totalSessions: number,
+  theme: WidgetTheme,
+  now: number,
+  trackSegmentSeparator: string,
+  icon = "",
+): string {
+  return [
+    theme.fg(icon === "✓" ? "success" : "toolTitle", icon),
+    theme.fg("muted", `${buckets.completed.length}/${totalSessions}`),
+    renderGeometricTrack(buckets, totalSessions, theme, now, trackSegmentSeparator),
+  ].join(" ");
+}
+
+function formatErrorSegment(errorCount: number, theme: WidgetTheme): string | undefined {
+  if (errorCount <= 0) {
+    return undefined;
+  }
+
+  return theme.fg("error", ` ${errorCount} failed`);
+}
+
+function formatRunningDetail(
   session: SubagentWidgetSession,
+  mode: DetailMode,
   theme: WidgetTheme,
   formatDuration: (milliseconds: number) => string,
   now: number,
-  getStatusDisplay: (status: string) => SubagentWidgetStatusDisplay,
   truncate: (text: string, width: number, overflowMarker: string) => string,
-  options: ActiveDetailStyle & { icons: SubagentWidgetIcons },
+  icons: SubagentWidgetIcons,
 ): string {
-  const statusDisplay = getStatusDisplay(session.status);
-  const icon = getStatusIcon(session.status, options.icons);
+  const icon = theme.fg("toolTitle", getCircularSpinnerFrame(now) || icons.running);
+  if (mode === "iconsOnly") {
+    return icon;
+  }
+
   const label = formatAgentLabel(
     session.agent,
     session.agentColor,
     theme,
-    statusDisplay.color,
+    "toolOutput",
     truncate,
-    options.maxAgentWidth,
+    mode === "full" ? 18 : 12,
   );
-  const runtime =
-    options.includeRuntime && session.status === "running"
-      ? resolveRuntimeLabel(session, now, formatDuration)
-      : undefined;
-
-  if (!runtime) {
-    return `${theme.fg(statusDisplay.color, icon)} ${label}`;
+  if (mode === "noTimers") {
+    return `${icon} ${label}`;
   }
 
-  return `${theme.fg(statusDisplay.color, icon)} ${label} ${theme.fg("dim", runtime)}`;
+  const runtime = resolveRuntimeLabel(session, now, formatDuration);
+  return runtime ? `${icon} ${label} ${theme.fg("dim", runtime)}` : `${icon} ${label}`;
 }
 
-function buildActiveDetailSegments(
-  sessions: readonly SubagentWidgetSession[],
-  theme: WidgetTheme,
-  formatDuration: (milliseconds: number) => string,
-  now: number,
-  getStatusDisplay: (status: string) => SubagentWidgetStatusDisplay,
-  truncate: (text: string, width: number, overflowMarker: string) => string,
-  maxShown: number,
-  options: ActiveDetailStyle & { icons: SubagentWidgetIcons },
-): string[] {
-  if (sessions.length === 0) {
-    return [];
+function buildRunningDetailSegment(options: {
+  sessions: readonly SubagentWidgetSession[];
+  mode: DetailMode;
+  maxShown: number;
+  theme: WidgetTheme;
+  formatDuration: (milliseconds: number) => string;
+  now: number;
+  truncate: (text: string, width: number, overflowMarker: string) => string;
+  icons: SubagentWidgetIcons;
+}): string | undefined {
+  const visibleSessions = options.sessions.slice(0, options.maxShown);
+  if (visibleSessions.length === 0) {
+    return undefined;
   }
 
-  const normalizedMaxShown = Math.max(1, Math.min(Math.trunc(maxShown), sessions.length));
-  const visibleSessions = sessions.slice(0, normalizedMaxShown);
   const segments = visibleSessions.map((session) =>
-    formatLiveSessionDetail(
+    formatRunningDetail(
       session,
-      theme,
-      formatDuration,
-      now,
-      getStatusDisplay,
-      truncate,
-      options,
+      options.mode,
+      options.theme,
+      options.formatDuration,
+      options.now,
+      options.truncate,
+      options.icons,
     ),
   );
 
-  if (visibleSessions.length < sessions.length) {
-    segments.push(theme.fg("dim", `+${sessions.length - visibleSessions.length} more`));
+  if (visibleSessions.length < options.sessions.length && options.mode !== "iconsOnly") {
+    segments.push(options.theme.fg("dim", `+${options.sessions.length - visibleSessions.length} more`));
   }
 
-  return segments;
+  return segments.join(options.theme.fg("dim", SEGMENT_SEPARATOR));
 }
 
 function buildCompletedSummaryCandidates(
+  buckets: SessionBuckets,
   theme: WidgetTheme,
   totalSessions: number,
   durationLabel: string | undefined,
+  now: number,
+  width: number,
 ): string[] {
-  const agentLabel = `${totalSessions} ${pluralize(totalSessions, "agent")}`;
-  const baseMessage = `✓ All ${agentLabel} completed successfully`;
-  const candidates = [theme.fg("success", baseMessage)];
-
-  if (durationLabel) {
-    candidates.unshift(
-      `${theme.fg("success", baseMessage)} ${theme.fg("dim", durationLabel)}`,
+  const candidates: string[] = [];
+  for (const trackSegmentSeparator of buildTrackSegmentSeparators(width)) {
+    const lead = formatProgressLead(
+      buckets,
+      totalSessions,
+      theme,
+      now,
+      trackSegmentSeparator,
+      "✓",
     );
+    const status = durationLabel
+      ? `${theme.fg("success", "completed successfully")} ${theme.fg("dim", `(${durationLabel})`)}`
+      : theme.fg("success", "completed successfully");
+    candidates.push(` ${lead}${theme.fg("dim", DETAIL_SEPARATOR)}${status}`);
+    candidates.push(` ${lead}`);
   }
 
-  candidates.push(theme.fg("success", `✓ ${totalSessions}/${totalSessions} completed`));
   return candidates;
 }
 
-function buildSummaryVariants(
-  theme: WidgetTheme,
-  buckets: SessionBuckets,
-  icons: SubagentWidgetIcons,
-): string[] {
-  const variants: string[] = [];
-  const seen = new Set<string>();
-
-  for (const variant of [
-    joinSegments(
-      theme,
-      formatSummarySegments(theme, buckets, {
-        includeFailedNames: true,
-        includeAbortedNames: true,
-        icons,
-      }),
-    ),
-    joinSegments(
-      theme,
-      formatSummarySegments(theme, buckets, {
-        includeFailedNames: false,
-        includeAbortedNames: false,
-        icons,
-      }),
-    ),
-  ]) {
-    if (!variant || seen.has(variant)) {
-      continue;
-    }
-
-    seen.add(variant);
-    variants.push(variant);
+function buildDetailModeOrder(width: number): DetailMode[] {
+  if (width < 80) {
+    return ["noTimers", "iconsOnly"];
   }
 
-  return variants;
+  return ["full", "noTimers", "iconsOnly"];
 }
 
 export function renderSubagentWidgetLines(options: {
@@ -436,7 +339,7 @@ export function renderSubagentWidgetLines(options: {
   now?: number;
   icons: SubagentWidgetIcons;
 }): string[] {
-  const { sessions, width, theme, formatDuration, getStatusDisplay, truncate } = options;
+  const { sessions, width, theme, formatDuration, truncate } = options;
   if (sessions.length === 0) {
     return [];
   }
@@ -451,17 +354,15 @@ export function renderSubagentWidgetLines(options: {
     options.maxShown === undefined
       ? sessions.length
       : Math.max(1, Math.trunc(options.maxShown));
-  const icons = options.icons;
   const buckets = buildSessionBuckets(sessions);
-  const activeSessions = [...buckets.running, ...buckets.queued];
-  const maxVisibleActiveSessions = Math.min(activeSessions.length, maxShown);
-  const hasActiveSessions = activeSessions.length > 0;
+  const totalSessions = sessions.length;
+  const runningSessions = buckets.running;
+  const errorCount = buckets.failed.length;
   const allCompletedSuccessfully =
-    buckets.completed.length === sessions.length &&
+    buckets.completed.length === totalSessions &&
     buckets.running.length === 0 &&
     buckets.queued.length === 0 &&
-    buckets.failed.length === 0 &&
-    buckets.aborted.length === 0;
+    buckets.failed.length === 0;
 
   const fitsWidth = (line: string): boolean => truncate(line, safeWidth, "") === line;
   const candidates: string[] = [];
@@ -481,60 +382,60 @@ export function renderSubagentWidgetLines(options: {
       totalDurationMs !== undefined ? formatDuration(totalDurationMs) : undefined;
 
     for (const candidate of buildCompletedSummaryCandidates(
+      buckets,
       theme,
-      sessions.length,
+      totalSessions,
       durationLabel,
+      now,
+      safeWidth,
     )) {
-      pushCandidate(` ${candidate}`);
+      pushCandidate(candidate);
     }
   } else {
-    const summaryVariants = buildSummaryVariants(theme, buckets, icons);
+    const errorSegment = formatErrorSegment(errorCount, theme);
+    const maxVisibleRunningSessions = Math.min(runningSessions.length, maxShown);
 
-    if (summaryVariants.length > 0 && hasActiveSessions && maxVisibleActiveSessions > 0) {
-      for (let visibleCount = maxVisibleActiveSessions; visibleCount >= 1; visibleCount -= 1) {
-        for (const detailStyle of ACTIVE_DETAIL_STYLES) {
-          const activeDetails = buildActiveDetailSegments(
-            activeSessions,
-            theme,
-            formatDuration,
-            now,
-            getStatusDisplay,
-            truncate,
-            visibleCount,
-            {
-              ...detailStyle,
-              icons,
-            },
-          );
+    for (const trackSegmentSeparator of buildTrackSegmentSeparators(safeWidth)) {
+      const lead = formatProgressLead(
+        buckets,
+        totalSessions,
+        theme,
+        now,
+        trackSegmentSeparator,
+      );
 
-          if (activeDetails.length === 0) {
-            continue;
-          }
+      if (maxVisibleRunningSessions > 0) {
+        for (let visibleCount = maxVisibleRunningSessions; visibleCount >= 1; visibleCount -= 1) {
+          for (const mode of buildDetailModeOrder(safeWidth)) {
+            const runningDetails = buildRunningDetailSegment({
+              sessions: runningSessions,
+              mode,
+              maxShown: visibleCount,
+              theme,
+              formatDuration,
+              now,
+              truncate,
+              icons: options.icons,
+            });
+            if (!runningDetails) {
+              continue;
+            }
 
-          for (const summaryVariant of summaryVariants) {
+            const trailingSegments = [errorSegment, runningDetails].filter(
+              (segment): segment is string => Boolean(segment),
+            );
             pushCandidate(
-              ` ${summaryVariant}${theme.fg("dim", DETAIL_SEPARATOR)}${joinSegments(theme, activeDetails)}`,
+              ` ${lead}${trailingSegments.length > 0 ? theme.fg("dim", DETAIL_SEPARATOR) : ""}${trailingSegments.join(theme.fg("dim", DETAIL_SEPARATOR))}`,
             );
           }
         }
       }
-    }
 
-    for (const summaryVariant of summaryVariants) {
-      pushCandidate(` ${summaryVariant}`);
-    }
+      if (errorSegment) {
+        pushCandidate(` ${lead}${theme.fg("dim", DETAIL_SEPARATOR)}${errorSegment}`);
+      }
 
-    if (hasActiveSessions) {
-      const activeIcon = buckets.running.length > 0 ? icons.running : icons.queued;
-      const activeCount = activeSessions.length;
-      pushCandidate(
-        ` ${formatStatusSegment(
-          theme,
-          "warning",
-          activeIcon,
-          `${activeCount} ${pluralize(activeCount, "active session")}`,
-        )}`,
-      );
+      pushCandidate(` ${lead}`);
     }
   }
 

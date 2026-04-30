@@ -87,6 +87,57 @@ async function runAll(): Promise<void> {
     assert.equal(control.skipped, 0);
   });
 
+  await runTest("mapWithAbortAwareConcurrency continues peers after worker-local abort when fail-fast is disabled", async () => {
+    const skipped: number[] = [];
+
+    const { results, control } = await mapWithAbortAwareConcurrency({
+      items: [1, 2, 3, 4],
+      concurrency: 2,
+      abortOnWorkerError: false,
+      worker: async (item) => {
+        if (item === 2) {
+          throw createAbortError("Delegated task dismissed by user.");
+        }
+
+        await sleep(5);
+        return item;
+      },
+      onSkipped: (_item, index) => {
+        skipped.push(index);
+      },
+    });
+
+    assert.deepEqual(results, [1, undefined, 3, 4]);
+    assert.equal(control.aborted, false);
+    assert.equal(control.skipped, 0);
+    assert.deepEqual(skipped, []);
+  });
+
+  await runTest("mapWithAbortAwareConcurrency fail-fast treats worker-local aborts as worker errors", async () => {
+    const skipped: number[] = [];
+
+    const { control } = await mapWithAbortAwareConcurrency({
+      items: [1, 2, 3, 4],
+      concurrency: 2,
+      worker: async (item) => {
+        if (item === 2) {
+          throw createAbortError("Delegated task dismissed by user.");
+        }
+
+        await sleep(20);
+        return item;
+      },
+      onSkipped: (_item, index) => {
+        skipped.push(index);
+      },
+    });
+
+    assert.equal(control.aborted, true);
+    assert.equal(control.reason, "worker_error");
+    assert.equal(control.firstError?.message, "Delegated task dismissed by user.");
+    assert.equal(skipped.length >= 1, true);
+  });
+
   await runTest("mapWithAbortAwareConcurrency fail-fast aborts queued work on first worker error", async () => {
     const skipped: number[] = [];
 

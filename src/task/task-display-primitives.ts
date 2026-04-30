@@ -203,14 +203,14 @@ export function appendTaskBlock(
   const activity = normalizeDisplayText(options.activity);
   addBorderLine(container, theme, activity, getTaskStatusTone(options.status), {
     borderColorHex: options.borderColorHex,
-    firstPrefix: "└ ",
+    firstPrefix: "└─ ",
     continuationPrefix: "   ",
     maxLines: TASK_ACTIVITY_MAX_LINES,
   });
 
   for (const line of options.detailLines || []) {
-    const normalized = line.trim();
-    if (!normalized) {
+    const normalized = line.trimEnd();
+    if (!normalized.trim()) {
       continue;
     }
 

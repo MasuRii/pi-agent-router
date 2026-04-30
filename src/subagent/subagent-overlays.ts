@@ -6,6 +6,7 @@ import {
   Markdown,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
   wrapTextWithAnsi,
 } from "@mariozechner/pi-tui";
 
@@ -32,8 +33,58 @@ export type SubagentOverlaySession = {
   outputNotice?: string;
 };
 
+const CONTENT_LEFT_PADDING = "   ";
+const CONTENT_RIGHT_PADDING = " ";
+const SCROLLBAR_GAP = " ";
+
 function fitLine(text: string, width: number): string {
   return truncateToWidth(text, Math.max(1, width), "");
+}
+
+function getPaddedContentWidth(width: number): number {
+  return Math.max(
+    1,
+    width -
+      visibleWidth(CONTENT_LEFT_PADDING) -
+      visibleWidth(CONTENT_RIGHT_PADDING) -
+      visibleWidth(SCROLLBAR_GAP) -
+      1,
+  );
+}
+
+function fitPaddedLine(text: string, width: number, scrollbarChar: string): string {
+  if (width <= 8) {
+    return fitLine(text, width);
+  }
+
+  const contentWidth = getPaddedContentWidth(width);
+  const fitted = truncateToWidth(text, contentWidth, "");
+  const fillWidth = Math.max(0, contentWidth - visibleWidth(fitted));
+  return `${CONTENT_LEFT_PADDING}${fitted}${" ".repeat(fillWidth)}${CONTENT_RIGHT_PADDING}${SCROLLBAR_GAP}${scrollbarChar}`;
+}
+
+function resolveScrollbarChar(options: {
+  row: number;
+  rowCount: number;
+  totalLines: number;
+  visibleLines: number;
+  offset: number;
+}): string {
+  const { row, rowCount, totalLines, visibleLines, offset } = options;
+  if (totalLines <= visibleLines || rowCount <= 0) {
+    return " ";
+  }
+
+  const trackRows = Math.max(1, rowCount);
+  const thumbSize = Math.max(1, Math.floor((visibleLines / totalLines) * trackRows));
+  const maxThumbStart = Math.max(0, trackRows - thumbSize);
+  const maxOffset = Math.max(1, totalLines - visibleLines);
+  const thumbStart = Math.min(
+    maxThumbStart,
+    Math.floor((Math.max(0, offset) / maxOffset) * maxThumbStart),
+  );
+
+  return row >= thumbStart && row < thumbStart + thumbSize ? "█" : "░";
 }
 
 type OutputOverlayDependencies = {
@@ -247,12 +298,13 @@ export class SubagentOutputOverlay {
         )
       : "0ms";
 
-    const renderedOutputLines = this.renderOutputLines(outputView.output, safeWidth);
+    const outputContentWidth = getPaddedContentWidth(safeWidth);
+    const renderedOutputLines = this.renderOutputLines(outputView.output, outputContentWidth);
     this.lastRenderedOutputLineCount = renderedOutputLines.length;
 
     const maxVisible = this.getMaxVisibleOutputLines(Boolean(session?.taskId));
     const noticeLineCount = outputView.noticeLines.length > 0
-      ? outputView.noticeLines.flatMap((line) => wrapTextWithAnsi(line, Math.max(1, safeWidth - 2))).length + 1
+      ? outputView.noticeLines.flatMap((line) => wrapTextWithAnsi(line, outputContentWidth)).length + 1
       : 0;
     const maxVisibleOutputLines = Math.max(1, maxVisible - noticeLineCount);
     this.clampScroll(renderedOutputLines.length, maxVisibleOutputLines);
@@ -269,27 +321,24 @@ export class SubagentOutputOverlay {
         : statusDisplay.label;
 
     lines.push(
-      fitLine(
-        ` ${this.theme.fg(statusDisplay.color, statusText)} ${this.theme.fg("dim", runtime)} ${session ? this.theme.fg("dim", `#${session.id.slice(0, 8)} • ${session.agent}`) : ""}`,
-        safeWidth,
-      ),
+      `${this.theme.fg(statusDisplay.color, statusText)} ${this.theme.fg("dim", runtime)} ${session ? this.theme.fg("dim", `#${session.id.slice(0, 8)} • ${session.agent}`) : ""}`,
     );
 
     lines.push("");
 
     for (const noticeLine of outputView.noticeLines) {
-      const wrappedNotice = wrapTextWithAnsi(noticeLine, Math.max(1, safeWidth - 2));
+      const wrappedNotice = wrapTextWithAnsi(noticeLine, outputContentWidth);
       for (const wrappedLine of wrappedNotice) {
-        lines.push(fitLine(` ${this.theme.fg("warning", wrappedLine)}`, safeWidth));
+        lines.push(this.theme.fg("warning", wrappedLine));
       }
       lines.push("");
     }
 
     if (visible.length === 0) {
-      lines.push(fitLine(` ${this.theme.fg("dim", "(no output)")}`, safeWidth));
+      lines.push(this.theme.fg("dim", "(no output)"));
     } else {
       for (const outputLine of visible) {
-        lines.push(fitLine(` ${outputLine}`, safeWidth));
+        lines.push(outputLine);
       }
     }
 
@@ -299,13 +348,23 @@ export class SubagentOutputOverlay {
       renderedOutputLines.length === 0 ? 0 : this.scrollOffset + 1;
     const endLine = renderedOutputLines.length === 0 ? 0 : visibleEnd;
     lines.push(
-      fitLine(
-        ` ${this.theme.fg("dim", `Lines ${startLine}-${endLine} / ${renderedOutputLines.length}`)}`,
-        safeWidth,
-      ),
+      this.theme.fg("dim", `Lines ${startLine}-${endLine} / ${renderedOutputLines.length}`),
     );
 
-    return lines;
+    const rowCount = lines.length;
+    return lines.map((line, row) =>
+      fitPaddedLine(
+        line,
+        safeWidth,
+        resolveScrollbarChar({
+          row,
+          rowCount,
+          totalLines: renderedOutputLines.length,
+          visibleLines: maxVisibleOutputLines,
+          offset: this.scrollOffset,
+        }),
+      ),
+    );
   }
 
   invalidate(): void {

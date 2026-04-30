@@ -154,39 +154,46 @@ export function renderSingleDelegationResult(options: {
 
   const toolCalls = Math.max(outputAnalysis.toolCalls, outputAnalysis.commands.length);
 
+  const hasContractWarnings = Boolean(details?.contractWarnings?.length);
   const detailLines: string[] = [];
-  if (expanded && outputAnalysis.commands.length > 0) {
-    for (const command of outputAnalysis.commands.slice(0, 6)) {
-      detailLines.push(` ${truncatePreview(command, 160)}`);
-    }
+  const visibleCommands = expanded ? outputAnalysis.commands.slice(0, 6) : [];
+  for (let index = 0; index < visibleCommands.length; index += 1) {
+    const branch = index === visibleCommands.length - 1 ? "└─" : "├─";
+    detailLines.push(`  ${branch} ${truncatePreview(visibleCommands[index], 160)}`);
   }
 
   const hint =
-    running && details?.sessionId
-      ? formatAttachSubagentOutputHint(details.sessionId)
+    details?.sessionId && (running || hasContractWarnings)
+      ? formatAttachSubagentOutputHint(
+          details.sessionId,
+          hasContractWarnings ? "debug output" : "view output",
+        )
       : undefined;
 
   const titleAgent = toTitleCaseWords(details?.delegatedAgent || "task");
-  const description = `${truncatePreview(taskGoal, 180)} (${toolCalls} toolcalls)`;
+  const description = hasContractWarnings
+    ? truncatePreview(taskGoal, 180)
+    : `${truncatePreview(taskGoal, 180)} (${toolCalls} toolcalls)`;
   const borderColor = resolveTaskBorderColor(details?.delegatedAgent, details?.agentColor);
+  const warningActivity = details?.contractWarnings?.[0]?.trim();
 
   const container = new Container();
   appendTaskBlock(container, theme, {
-    title: `${titleAgent} Task`,
+    title: hasContractWarnings ? " Output contract incomplete" : `${titleAgent} Task`,
     description,
-    activity,
+    activity: hasContractWarnings && warningActivity ? warningActivity : activity,
     status,
-    spinner: running,
+    spinner: running && !hasContractWarnings,
     hint,
     detailLines,
     footerLine: buildFooterLine(details, expanded),
     borderColorHex: borderColor,
-    titleColorHex: borderColor,
+    titleColorHex: hasContractWarnings ? undefined : borderColor,
   });
 
-  if (details?.contractWarnings && details.contractWarnings.length > 0) {
+  if (details?.contractWarnings && details.contractWarnings.length > 1) {
     container.addChild(new Text("", 0, 0));
-    renderWarningLines(container, theme, details.contractWarnings, borderColor);
+    renderWarningLines(container, theme, details.contractWarnings.slice(1), borderColor);
   }
 
   return container;
