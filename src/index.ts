@@ -49,6 +49,7 @@ import {
   validateChainContextFromReferences,
   type TaskExecutionMode,
 } from "./task/task-chain-mode";
+import { validateCurrentBatchContextFromReferences } from "./task/task-context-references";
 
 // Modularized internal imports
 import type {
@@ -227,7 +228,7 @@ export type {
 } from "./types";
 
 const TASK_TOOL_BASE_DESCRIPTION =
-  'Delegate task batches to local agents using task-style items: tasks[{id,description,assignment,skills?,cwd?,agent,contextFrom?,retry?,retryFrom?}] with optional shared context/schema. Set mode="parallel" (default) or mode="chain" for sequential execution. In chain mode, use {previous} in later assignments to inject the prior step output (safely truncated), or per-task contextFrom to reference earlier completed items in the same chain batch by id. Use contextFrom to inject only bounded final responses/results from prior delegated sessions or earlier chain items. Use retry/retryFrom to resume prior delegated work through its retained session path when available. Each task must explicitly provide its agent. agentScope: "user" => the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project" => nearest .pi/agents, "both" => merge both. Supports live attach updates and bounded concurrency.';
+  'Delegate compact task batches to local agents. Required task fields: id, description, assignment, agent. mode defaults to "parallel"; same-batch contextFrom is valid only in mode="chain" and only from earlier task ids. Parallel and top-level contextFrom must reference retained delegated sessions only. Handoffs inject bounded final responses or validated structured results, never transcripts.';
 
 function buildTaskToolDescription(agentCatalogText: string): string {
   return [TASK_TOOL_BASE_DESCRIPTION, "", agentCatalogText].join("\n");
@@ -236,42 +237,40 @@ function buildTaskToolDescription(agentCatalogText: string): string {
 function createTaskBatchItemSchema() {
   return Type.Object({
     id: Type.String({
-      description: "CamelCase identifier, max 32 chars",
+      description: "Stable task id, max 32 chars.",
       maxLength: 32,
     }),
-    description: Type.String({ description: "Short task label for UI display." }),
+    description: Type.String({ description: "Short UI label." }),
     assignment: Type.String({
-      description: "Detailed assignment executed by the delegated agent.",
+      description: "Concise, self-contained delegated instructions.",
     }),
     skills: Type.Optional(
       Type.Array(Type.String(), {
-        description: "Optional skill names for this delegated task.",
+        description: "Optional skill names.",
       }),
     ),
     cwd: Type.Optional(
       Type.String({
-        description: "Working directory override for this task item (optional).",
+        description: "Task working directory override.",
       }),
     ),
     agent: Type.String({
-      description: "Agent name for this task (required). See the task tool description for available agents.",
+      description: "Target agent name.",
     }),
     contextFrom: Type.Optional(
       Type.Union([Type.String(), Type.Array(Type.String())], {
         description:
-          "Prior delegated task/session reference(s). In chain mode, may reference an earlier completed item in the same batch by id. Injects only bounded final response/result or validated structured result, never full transcripts or tool history.",
+          "Retained task/session refs; in chain mode only, earlier same-batch task ids. Injects bounded final results only.",
       }),
     ),
     retry: Type.Optional(
       Type.Boolean({
-        description:
-          "Resume previous delegated work for this logical task id using the retained session path when available.",
+        description: "Resume this logical task from its retained session.",
       }),
     ),
     retryFrom: Type.Optional(
       Type.String({
-        description:
-          "Task id, logical task id, session id, or session path to resume with --session. Implies retry behavior.",
+        description: "Retained task/session reference to resume.",
       }),
     ),
   });
@@ -3486,59 +3485,53 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
     parameters: Type.Object({
       tasks: Type.Array(createTaskBatchItemSchema(), {
-        description: "Task items: [{id, description, assignment, skills?, cwd?, agent, contextFrom?, retry?, retryFrom?}]",
+        description: "Task items with required id, description, assignment, and agent.",
       }),
       mode: Type.Optional(
         Type.Union([Type.Literal("parallel"), Type.Literal("chain")], {
           description:
-            "Execution strategy. parallel: run tasks concurrently (default). chain: run tasks sequentially and stop on first failure; supports {previous} replacement and per-task contextFrom references to earlier completed chain items.",
+            "parallel runs concurrently. chain runs sequentially and allows {previous} plus earlier task ids in per-task contextFrom.",
           default: "parallel",
         }),
       ),
       context: Type.Optional(
         Type.String({
-          description:
-            "Shared background prepended to each assignment. Use for global constraints, contracts, and acceptance criteria.",
+          description: "Concise shared background prepended to each task.",
         }),
       ),
       contextFrom: Type.Optional(
         Type.Union([Type.String(), Type.Array(Type.String())], {
           description:
-            "Shared prior delegated task/session reference(s) injected into every task as bounded final response/result or validated structured result only. Full transcripts and tool history are never injected.",
+            "Retained delegated task/session refs injected into every task as bounded final results; cannot reference current batch ids.",
         }),
       ),
       schema: Type.Optional(
         Type.Unknown({
-          description:
-            "Optional structured output schema for explicit submit_result payloads. Human-readable final responses remain supported in compat mode."
+          description: "Optional JSON schema for submit_result payloads."
         }),
       ),
       agentScope: Type.Optional(
         Type.Union(
           [Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
           {
-            description:
-              'Which agent directories to search. "user": the global Pi agents directory (default: ~/.pi/agent/agents, respects PI_CODING_AGENT_DIR), "project": nearest .pi/agents from cwd, "both": merge both (default).',
+            description: 'Agent directories to search: "user", "project", or "both".',
             default: "both",
           },
         ),
       ),
       attach: Type.Optional(
         Type.Boolean({
-          description:
-            "Stream live delegated output back to this tool result while it runs.",
+          description: "Stream live delegated output into this result.",
         }),
       ),
       cwd: Type.Optional(
         Type.String({
-          description:
-            "Working directory (optional, defaults to current directory)",
+          description: "Default working directory for delegated tasks.",
         }),
       ),
       timeoutMs: Type.Optional(
         Type.Number({
-          description:
-            "Inactivity timeout in milliseconds. Enforced minimum/default: 1800000 (30 minutes).",
+          description: "Inactivity timeout in milliseconds; minimum/default is 30 minutes.",
         }),
       ),
     }),
@@ -3714,6 +3707,31 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         };
       }
 
+      const sharedCurrentBatchReferenceError =
+        validateCurrentBatchContextFromReferences({
+          tasks: taskStyleMetadata,
+          references: sharedContextFromReferences.references,
+          fieldName: "contextFrom",
+          scope: "top-level",
+        });
+      if (sharedCurrentBatchReferenceError) {
+        const details = createSubagentExecutionDetails(
+          delegatedBy,
+          modeAgentLabel,
+          modeTaskLabel,
+          "failed",
+          {
+            mode: requestedMode,
+            parentSessionId,
+          },
+        );
+        return {
+          isError: true,
+          content: [{ type: "text", text: sharedCurrentBatchReferenceError }],
+          details,
+        };
+      }
+
       const sharedContextFrom = resolveContextFromText(
         sharedContextFromReferences.references,
         parentSessionId,
@@ -3767,6 +3785,31 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         if (requestedMode === "chain") {
           itemContextFromTexts[index] = "";
           continue;
+        }
+
+        const parallelCurrentBatchReferenceError =
+          validateCurrentBatchContextFromReferences({
+            tasks: taskStyleMetadata,
+            references: itemContextFromReferences.references,
+            fieldName: `tasks[${index}].contextFrom`,
+            scope: "parallel-task",
+          });
+        if (parallelCurrentBatchReferenceError) {
+          const details = createSubagentExecutionDetails(
+            delegatedBy,
+            modeAgentLabel,
+            modeTaskLabel,
+            "failed",
+            {
+              mode: requestedMode,
+              parentSessionId,
+            },
+          );
+          return {
+            isError: true,
+            content: [{ type: "text", text: parallelCurrentBatchReferenceError }],
+            details,
+          };
         }
 
         const itemContextFrom = resolveContextFromText(

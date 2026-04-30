@@ -4,6 +4,7 @@ import {
   resolveChainContextFromSources,
   validateChainContextFromReferences,
 } from "../task/task-chain-mode";
+import { validateCurrentBatchContextFromReferences } from "../task/task-context-references";
 import { renderTaskContextFromText } from "../task/task-tool-adapter";
 import type { TaskContextFromSource } from "../task/task-tool-adapter";
 
@@ -64,6 +65,38 @@ runTest("validateChainContextFromReferences rejects same-item and forward refere
       referencesByTaskIndex: [["consumer"], [], []],
     }),
     "Task delegation failed: tasks[0].contextFrom reference 'consumer' points to a later chain task; contextFrom can only reference earlier completed chain tasks or retained delegated sessions.",
+  );
+});
+
+runTest("validateCurrentBatchContextFromReferences rejects non-chain same-batch refs", () => {
+  assert.equal(
+    validateCurrentBatchContextFromReferences({
+      tasks: chainTasks,
+      references: ["consumer"],
+      fieldName: "contextFrom",
+      scope: "top-level",
+    }),
+    "Task delegation failed: contextFrom reference 'consumer' matches current batch task 'consumer'. Top-level contextFrom only accepts retained delegated sessions; use per-task contextFrom in mode=\"chain\" for earlier same-batch results.",
+  );
+
+  assert.equal(
+    validateCurrentBatchContextFromReferences({
+      tasks: chainTasks,
+      references: ["agnosticSanitizerPlan"],
+      fieldName: "tasks[1].contextFrom",
+      scope: "parallel-task",
+    }),
+    "Task delegation failed: tasks[1].contextFrom reference 'agnosticSanitizerPlan' matches current batch task 'agnosticSanitizerPlan'. Parallel tasks cannot read same-batch results; use mode=\"chain\" with an earlier task id, or reference a retained delegated session.",
+  );
+
+  assert.equal(
+    validateCurrentBatchContextFromReferences({
+      tasks: chainTasks,
+      references: ["retained-session-id"],
+      fieldName: "tasks[1].contextFrom",
+      scope: "parallel-task",
+    }),
+    undefined,
   );
 });
 

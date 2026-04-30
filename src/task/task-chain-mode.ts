@@ -1,5 +1,6 @@
 import { normalizeInputText } from "../input-normalization";
 
+import { buildTaskReferenceIndexById } from "./task-context-references";
 import type { TaskContextFromSource } from "./task-tool-adapter";
 
 export type TaskExecutionMode = "parallel" | "chain";
@@ -16,23 +17,6 @@ export type RetainedContextReferenceResolver = (
   reference: string,
   fieldName: string,
 ) => { source?: TaskContextFromSource; error?: string };
-
-function buildChainTaskIndexById(
-  tasks: readonly ChainTaskReference[],
-): Map<string, number> {
-  const indexById = new Map<string, number>();
-
-  for (let index = 0; index < tasks.length; index += 1) {
-    const normalizedId = normalizeInputText(tasks[index]?.id).toLowerCase();
-    if (!normalizedId || indexById.has(normalizedId)) {
-      continue;
-    }
-
-    indexById.set(normalizedId, index);
-  }
-
-  return indexById;
-}
 
 export function resolveTaskExecutionMode(value: unknown): {
   mode: TaskExecutionMode;
@@ -59,7 +43,7 @@ export function validateChainContextFromReferences(options: {
   tasks: readonly ChainTaskReference[];
   referencesByTaskIndex: readonly (readonly string[])[];
 }): string | undefined {
-  const indexById = buildChainTaskIndexById(options.tasks);
+  const indexById = buildTaskReferenceIndexById(options.tasks);
 
   for (let taskIndex = 0; taskIndex < options.referencesByTaskIndex.length; taskIndex += 1) {
     const references = options.referencesByTaskIndex[taskIndex] || [];
@@ -99,7 +83,7 @@ export function resolveChainContextFromSources(options: {
     };
   }
 
-  const indexById = buildChainTaskIndexById(options.tasks);
+  const indexById = buildTaskReferenceIndexById(options.tasks);
   const sources: TaskContextFromSource[] = [];
 
   for (const reference of options.references) {

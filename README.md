@@ -64,7 +64,7 @@ The extension registers controlled task delegation for the orchestrator agent. D
 
 Parallel delegation uses the configured concurrency limit. Chain delegation always executes one step at a time so each step can receive prior-step context.
 
-Task items use `id` as the stable logical task reference. Use `retry: true` (or `retryFrom: "<taskId|logicalId|sessionId|sessionPath>"`) to resume prior delegated work with the retained Pi `--session` path when available. Use top-level or per-task `contextFrom` to hand off only bounded final responses/results or validated `submit_result` payloads from previous delegated sessions; in `mode: "chain"`, a per-task `contextFrom` may also reference an earlier completed item in the same batch by `id`. Full transcripts, session context, and tool history are not injected.
+Task items use `id` as the stable logical task reference. Use `retry: true` (or `retryFrom: "<taskId|logicalId|sessionId|sessionPath>"`) to resume prior delegated work with the retained Pi `--session` path when available. Use top-level or parallel per-task `contextFrom` only for retained delegated sessions; in `mode: "chain"`, per-task `contextFrom` may also reference earlier completed same-batch items by `id`. Only bounded final responses/results or validated `submit_result` payloads are injected; full transcripts, session context, and tool history are not injected.
 
 ### Session attachment
 

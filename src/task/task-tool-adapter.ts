@@ -139,9 +139,9 @@ export function validateTaskBatchItems(items: readonly TaskBatchItemInput[]): st
   return undefined;
 }
 
-export const TASK_AGENT_CATALOG_MAX_CHARS = 4_096;
+export const TASK_AGENT_CATALOG_MAX_CHARS = 2_048;
 
-const TASK_AGENT_DESCRIPTION_MAX_CHARS = 160;
+const TASK_AGENT_DESCRIPTION_MAX_CHARS = 96;
 const TASK_AGENT_CATALOG_TRUNCATION_NOTICE = "\n… catalog truncated.";
 
 function normalizeCatalogText(value: unknown): string {
