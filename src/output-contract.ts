@@ -20,6 +20,7 @@ export type DelegatedOutputSource =
   | "submit_result"
   | "streamed_output"
   | "assistant_output"
+  | "assistant_error"
   | "empty";
 
 export type DelegatedOutputFormat = "structured" | "human_text" | "empty";
@@ -133,6 +134,56 @@ function formatOutputValue(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+const DELEGATED_ERROR_OUTPUT_MAX_CHARS = 1_200;
+const IMPORTANT_ERROR_LINE_PATTERN = /^(?:multi-auth rotation failed|provider:|model:|credentials tried:|reason:|action:|delegated credential|manual active account|all credentials|provider request failed|rotation exhausted|error:)/i;
+
+function compactDelegatedErrorMessage(rawMessage: string): string {
+  const sanitized = sanitizeSubagentFinalResponseForHandoff(rawMessage, {
+    allowPreToolTextWhenNoTrailingFinal: false,
+  }) || sanitizeSubagentResultForDisplay(rawMessage);
+  const normalizedLines = sanitized
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => Boolean(line));
+  const importantLines = normalizedLines.filter((line) =>
+    IMPORTANT_ERROR_LINE_PATTERN.test(line),
+  );
+  const selectedLines = importantLines.length > 0
+    ? importantLines.slice(0, 8)
+    : normalizedLines.slice(0, 6);
+  const compact = selectedLines.join("\n").trim() || "Delegated assistant returned an error.";
+
+  if (compact.length <= DELEGATED_ERROR_OUTPUT_MAX_CHARS) {
+    return compact;
+  }
+
+  return `${compact.slice(0, DELEGATED_ERROR_OUTPUT_MAX_CHARS - 28).trimEnd()}\n...[error summary truncated]`;
+}
+
+function findLatestAssistantError(messages: readonly Message[]): string | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const messageRecord = asRecord(messages[messageIndex]);
+    if (!messageRecord || messageRecord.role !== "assistant") {
+      continue;
+    }
+
+    const errorMessage = normalizeInputText(messageRecord.errorMessage);
+    if (errorMessage) {
+      return compactDelegatedErrorMessage(errorMessage);
+    }
+
+    const stopReason = normalizeInputText(messageRecord.stopReason).toLowerCase();
+    if (stopReason && stopReason !== "stop" && stopReason !== "done") {
+      return compactDelegatedErrorMessage(`Delegated assistant stopped with reason: ${stopReason}`);
+    }
+
+    return undefined;
+  }
+
+  return undefined;
 }
 
 function resolveFallbackOutput(
@@ -379,6 +430,17 @@ export function normalizeDelegatedOutput(options: {
   let outputText = fallback.outputText;
   let source = fallback.source;
   let format: DelegatedOutputFormat = fallback.outputText ? "human_text" : "empty";
+
+  const assistantError = !hasSubmitResult ? findLatestAssistantError(messages) : undefined;
+  if (assistantError) {
+    return {
+      outputText: assistantError,
+      warnings,
+      error: assistantError,
+      source: "assistant_error",
+      format: "human_text",
+    };
+  }
 
   if (hasSubmitResult) {
     outputText = formatOutputValue(submitResult);

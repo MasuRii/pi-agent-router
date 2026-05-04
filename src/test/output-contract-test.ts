@@ -377,4 +377,33 @@ runTest("normalizeDelegatedOutput omits ambiguous streamed transcripts without t
   assert.equal(result.warnings.includes("No handoff-safe terminal final response was available; omitted ambiguous streamed transcript text."), true);
 });
 
+runTest("normalizeDelegatedOutput surfaces compact assistant error messages", () => {
+  const result = normalizeDelegatedOutput({
+    messages: [
+      {
+        role: "assistant",
+        content: [],
+        timestamp: Date.now(),
+        stopReason: "error",
+        errorMessage: [
+          "Multi-auth rotation failed",
+          "Provider: openai-codex",
+          "Model: gpt-5.5",
+          "Reason: Provider request failed after credential rotation was exhausted.",
+          "Action: Review the provider response below, then retry with another credential/provider if needed.",
+          "Verbose provider response: " + "x".repeat(5_000),
+        ].join("\n"),
+      } as Message,
+    ],
+  });
+
+  assert.equal(result.source, "assistant_error");
+  assert.equal(result.format, "human_text");
+  assert.equal(result.error, result.outputText);
+  assert.equal(result.outputText.includes("Multi-auth rotation failed"), true);
+  assert.equal(result.outputText.includes("Provider: openai-codex"), true);
+  assert.equal(result.outputText.includes("x".repeat(1_000)), false);
+  assert.equal(result.outputText.length <= 1_200, true);
+});
+
 console.log("All output-contract tests passed.");

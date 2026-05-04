@@ -215,6 +215,7 @@ export type SubagentSession = {
   fullOutput?: string;
   lastOutput?: string;
   lastFinalResponseText?: string;
+  failureSummary?: string;
   toolInvocations?: SubagentToolInvocation[];
   stderr: string;
   exitCode?: number;
@@ -251,7 +252,7 @@ export type SubagentTaskRegistryEntry = {
   lastFinalResponseText?: string;
   lastStructuredResult?: unknown;
   lastOutputFormat?: "structured" | "human_text" | "empty";
-  lastOutputSource?: "submit_result" | "streamed_output" | "assistant_output" | "empty";
+  lastOutputSource?: "submit_result" | "streamed_output" | "assistant_output" | "assistant_error" | "empty";
   lastError?: string;
   lastExitCode?: number;
   lastTimedOut?: boolean;

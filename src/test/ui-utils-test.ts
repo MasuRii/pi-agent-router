@@ -59,7 +59,7 @@ runTest("renderSubagentWidgetLines shows aggregate progress with live running an
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(" 1/3"), true);
+  assert.equal(line[0].includes("⠋ 1/3"), true);
   assert.equal(line[0].includes("▰ ▱ ▱"), true);
   assert.equal(line[0].includes("◜ code 24s"), true);
   assert.equal(line[0].includes("ask"), false);
@@ -156,7 +156,7 @@ runTest("renderSubagentWidgetLines summarizes mixed terminal outcomes without pi
   });
 
   assert.equal(line.length, 1);
-  assert.equal(line[0].includes(" 1/3"), true);
+  assert.equal(line[0].includes("⠹ 1/3"), true);
   assert.equal(line[0].includes("▰ ▱ ▱"), true);
   assert.equal(line[0].includes("✕"), false);
   assert.equal(line[0].includes(" 2 failed"), true);
@@ -215,7 +215,7 @@ runTest("renderSubagentWidgetLines keeps aggregate status on narrow widths", () 
   assert.equal(line[0].includes("COMPLETED"), false);
 });
 
-runTest("renderSubagentWidgetLines pulses the first active track segment", () => {
+runTest("renderSubagentWidgetLines keeps active track segments steady", () => {
   const createLine = (now: number): string => renderSubagentWidgetLines({
     sessions: [
       { id: "11111111-aaaa", agent: "done", status: "finished", startedAt: 0, finishedAt: 1_000 },
@@ -234,7 +234,8 @@ runTest("renderSubagentWidgetLines pulses the first active track segment", () =>
   })[0] || "";
 
   assert.equal(createLine(0).includes("▰ ▱"), true);
-  assert.equal(createLine(500).includes("▰ _"), true);
+  assert.equal(createLine(500).includes("▰ ▱"), true);
+  assert.equal(createLine(500).includes("▰ _"), false);
 });
 
 runTest("renderSubagentWidgetLines animates running spinner frames", () => {
@@ -259,6 +260,8 @@ runTest("renderSubagentWidgetLines animates running spinner frames", () => {
     icons: widgetIcons,
   })[0] || "";
 
+  assert.equal(createLine(0).includes("⠋ 0/1"), true);
+  assert.equal(createLine(80).includes("⠙ 0/1"), true);
   assert.equal(createLine(0).includes("◜ code"), true);
   assert.equal(createLine(80).includes("◠ code"), true);
 });

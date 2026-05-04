@@ -26,6 +26,7 @@ export type DelegatedExtensionSkipCondition = "directEnvAuthAvailable";
 export interface DelegatedExtensionConfigEntry {
   candidates: string[];
   skipWhen: DelegatedExtensionSkipCondition[];
+  optional: boolean;
 }
 
 export type DelegatedExtensionsConfig = DelegatedExtensionConfigEntry[];
@@ -68,7 +69,6 @@ const DEFAULT_PROVIDER_ENV_KEYS: Record<string, string> = {
   anthropic: "ANTHROPIC_API_KEY",
   openai: "OPENAI_API_KEY",
   "openai-codex": "OPENAI_API_KEY",
-  "google-gemini-cli": "GOOGLE_API_KEY",
 };
 
 const DEFAULT_DIRECT_ENV_DELEGATION_PROVIDER_IDS = [
@@ -144,6 +144,7 @@ function cloneDelegatedExtensionEntries(
   return entries.map((entry) => ({
     candidates: cloneStringArray(entry.candidates),
     skipWhen: [...entry.skipWhen],
+    optional: entry.optional,
   }));
 }
 
@@ -496,7 +497,7 @@ function normalizeDelegatedExtensionEntry(
 ): DelegatedExtensionConfigEntry | undefined {
   if (typeof value === "string" || Array.isArray(value)) {
     const candidates = normalizeDelegatedExtensionCandidates(value, field, warnings);
-    return candidates.length > 0 ? { candidates, skipWhen: [] } : undefined;
+    return candidates.length > 0 ? { candidates, skipWhen: [], optional: false } : undefined;
   }
 
   const record = asRecord(value);
@@ -526,6 +527,7 @@ function normalizeDelegatedExtensionEntry(
       `${field}.skipWhen`,
       warnings,
     ),
+    optional: record.optional === true,
   };
 }
 
@@ -536,7 +538,7 @@ function dedupeDelegatedExtensionEntries(
   const deduped: DelegatedExtensionConfigEntry[] = [];
 
   for (const entry of entries) {
-    const key = `${entry.candidates.join("\u0000")}\u0001${entry.skipWhen.join("\u0000")}`;
+    const key = `${entry.candidates.join("\u0000")}\u0001${entry.skipWhen.join("\u0000")}\u0001${entry.optional}`;
     if (seen.has(key)) {
       continue;
     }
@@ -591,7 +593,7 @@ function normalizeLegacyDelegatedExtensionsConfig(
     warnings,
   )
     .map(expandDelegatedExtensionCandidateAliases)
-    .map((candidates) => ({ candidates, skipWhen: toSkipWhen(candidates) }));
+    .map((candidates) => ({ candidates, skipWhen: toSkipWhen(candidates), optional: false }));
 
   const optionalEntries = normalizeStringList(
     record.optionalExtensionNames,
@@ -601,6 +603,7 @@ function normalizeLegacyDelegatedExtensionsConfig(
   ).map((extensionName) => ({
     candidates: [extensionName],
     skipWhen: toSkipWhen([extensionName]),
+    optional: true,
   }));
 
   return dedupeDelegatedExtensionEntries([...requiredEntries, ...optionalEntries]);

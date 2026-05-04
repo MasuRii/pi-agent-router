@@ -193,6 +193,17 @@ runTest("delegated subagents disable automatic extension discovery before applyi
   assert.equal(routerSource.includes('"--no-extensions"'), true);
 });
 
+runTest("resource reload is wired to the shared router cache invalidator", () => {
+  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const reloadSource = readFileSync(new URL("./router-reload.ts", import.meta.url), "utf8");
+  assert.equal(routerSource.includes('pi.on("resources_discover"'), true);
+  assert.equal(routerSource.includes("invalidateRouterReloadCaches();"), true);
+  assert.equal(reloadSource.includes("invalidateAgentDiscoveryCaches();"), true);
+  assert.equal(reloadSource.includes("invalidateTaskControlsCache();"), true);
+  assert.equal(reloadSource.includes("resetProviderEnvKeyCacheState();"), true);
+  assert.equal(reloadSource.includes("invalidateDelegatedExtensionRuntimeCaches();"), true);
+});
+
 runTest("windows command-shell invocation truncates multiline args while direct invocation preserves them", () => {
   if (process.platform !== "win32") {
     console.log("[SKIP] Windows-only argument propagation test");

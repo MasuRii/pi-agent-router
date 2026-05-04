@@ -1,4 +1,7 @@
-import { getCircularSpinnerFrame } from "../progress-spinner";
+import {
+  getBrailleSpinnerFrame,
+  getCircularSpinnerFrame,
+} from "../progress-spinner";
 import {
   colorizeWithHex,
   normalizeHexColor,
@@ -39,8 +42,6 @@ export type SubagentWidgetSession = {
 
 const SEGMENT_SEPARATOR = " · ";
 const DETAIL_SEPARATOR = " │ ";
-const MAX_GEOMETRIC_TRACK_WIDTH = 10;
-const TRACK_PULSE_INTERVAL_MS = 500;
 
 function normalizeAgentName(agentName: string): string {
   const normalized = typeof agentName === "string" ? agentName.trim() : "";
@@ -154,44 +155,56 @@ function resolveSessionSpanMs(
   return Math.max(0, Math.max(...ends) - Math.min(...starts));
 }
 
-function shouldHideActiveTrackSegment(now: number): boolean {
-  return Math.floor(now / TRACK_PULSE_INTERVAL_MS) % 2 === 1;
+function resolveGeometricTrackWidth(totalSessions: number): number {
+  return Math.max(1, Math.trunc(totalSessions));
 }
 
-function resolveGeometricTrackWidth(totalSessions: number): number {
-  return Math.max(1, Math.min(MAX_GEOMETRIC_TRACK_WIDTH, Math.trunc(totalSessions)));
+function resolveTotalSessionCount(
+  visibleSessionCount: number,
+  totalCount: number | undefined,
+): number {
+  if (typeof totalCount !== "number" || !Number.isFinite(totalCount)) {
+    return visibleSessionCount;
+  }
+
+  return Math.max(visibleSessionCount, Math.trunc(totalCount));
+}
+
+function resolveCompletedTrackSegments(
+  completedSessionCount: number,
+  totalSessions: number,
+  trackWidth: number,
+): number {
+  if (completedSessionCount <= 0) {
+    return 0;
+  }
+
+  const proportionalSegments = Math.floor(
+    (completedSessionCount / Math.max(1, totalSessions)) * trackWidth,
+  );
+  return Math.max(1, Math.min(trackWidth, proportionalSegments));
 }
 
 function renderGeometricTrack(
   buckets: SessionBuckets,
   totalSessions: number,
   theme: WidgetTheme,
-  now: number,
   segmentSeparator: string,
 ): string {
   const trackWidth = resolveGeometricTrackWidth(totalSessions);
-  const completedSegments = Math.max(
-    0,
-    Math.min(
-      trackWidth,
-      Math.floor((buckets.completed.length / Math.max(1, totalSessions)) * trackWidth),
-    ),
+  const completedSegments = resolveCompletedTrackSegments(
+    buckets.completed.length,
+    totalSessions,
+    trackWidth,
   );
-  const hasActiveWork = buckets.running.length > 0 || buckets.queued.length > 0;
-  const pulseIndex = hasActiveWork && completedSegments < trackWidth
-    ? completedSegments
-    : -1;
-  const hidePulse = shouldHideActiveTrackSegment(now);
   const segments: string[] = [];
 
   for (let index = 0; index < trackWidth; index += 1) {
-    if (index < completedSegments) {
-      segments.push(theme.fg("success", "▰"));
-    } else if (index === pulseIndex && hidePulse) {
-      segments.push(theme.fg("dim", "_"));
-    } else {
-      segments.push(theme.fg("dim", "▱"));
-    }
+    segments.push(
+      index < completedSegments
+        ? theme.fg("success", "▰")
+        : theme.fg("dim", "▱"),
+    );
   }
 
   return segments.join(segmentSeparator);
@@ -211,12 +224,13 @@ function formatProgressLead(
   theme: WidgetTheme,
   now: number,
   trackSegmentSeparator: string,
-  icon = "",
+  icon?: string,
 ): string {
+  const progressIcon = icon ?? getBrailleSpinnerFrame(now);
   return [
-    theme.fg(icon === "✓" ? "success" : "toolTitle", icon),
+    theme.fg(progressIcon === "✓" ? "success" : "toolTitle", progressIcon),
     theme.fg("muted", `${buckets.completed.length}/${totalSessions}`),
-    renderGeometricTrack(buckets, totalSessions, theme, now, trackSegmentSeparator),
+    renderGeometricTrack(buckets, totalSessions, theme, trackSegmentSeparator),
   ].join(" ");
 }
 
@@ -337,6 +351,7 @@ export function renderSubagentWidgetLines(options: {
   truncate: (text: string, width: number, overflowMarker: string) => string;
   maxShown?: number;
   now?: number;
+  totalCount?: number;
   icons: SubagentWidgetIcons;
 }): string[] {
   const { sessions, width, theme, formatDuration, truncate } = options;
@@ -355,7 +370,7 @@ export function renderSubagentWidgetLines(options: {
       ? sessions.length
       : Math.max(1, Math.trunc(options.maxShown));
   const buckets = buildSessionBuckets(sessions);
-  const totalSessions = sessions.length;
+  const totalSessions = resolveTotalSessionCount(sessions.length, options.totalCount);
   const runningSessions = buckets.running;
   const errorCount = buckets.failed.length;
   const allCompletedSuccessfully =

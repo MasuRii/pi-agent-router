@@ -29,6 +29,7 @@ export type SubagentOverlaySession = {
   agent: string;
   fullOutput?: string;
   lastOutput?: string;
+  failureSummary?: string;
   stderr: string;
   outputNotice?: string;
 };
@@ -199,6 +200,18 @@ export class SubagentOutputOverlay {
     const noticeLines = session?.outputNotice?.trim()
       ? [session.outputNotice.trim()]
       : [];
+
+    const terminalFailure =
+      session?.status === "failed" ||
+      session?.status === "timed_out" ||
+      session?.status === "aborted" ||
+      session?.status === "killed";
+    if (terminalFailure && session?.failureSummary?.trim()) {
+      return {
+        output: this.deps.sanitizeOutput(session.failureSummary),
+        noticeLines,
+      };
+    }
 
     const retainedOutput = session?.fullOutput || session?.lastOutput;
     if (retainedOutput?.trim()) {

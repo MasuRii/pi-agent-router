@@ -139,12 +139,12 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 }
 
 type RetryableCredentialFailure = {
-  kind: "quota" | "transient";
+  kind: "quota" | "credential_auth" | "transient";
   message: string;
 };
 
 type SubagentProcessLifecycleRetryEvent = {
-  kind: "lock" | "quota" | "transient";
+  kind: "lock" | "quota" | "credential_auth" | "transient";
   attempt: number;
   delayMs: number;
   maxAttempts: number;
@@ -176,9 +176,11 @@ type RunSubagentProcessLifecycleOptions = {
   isLockRetryableFailure: (run: SubagentRunResult) => boolean;
   sleep: (delayMs: number) => Promise<void>;
   getLastAcquiredCredentialId: () => string | undefined;
-  clearTransientCredentialError: (credentialId: string) => void;
-  reportQuotaCredentialError: (message: string, credentialId: string) => void;
-  reportTransientCredentialError: (message: string, credentialId: string) => void;
+  getQuotaCredentialRetryLimit?: () => number | Promise<number>;
+  clearTransientCredentialError: (credentialId: string) => void | Promise<void>;
+  reportQuotaCredentialError: (message: string, credentialId: string) => void | Promise<void>;
+  reportCredentialAuthError: (message: string, credentialId: string) => void | Promise<void>;
+  reportTransientCredentialError: (message: string, credentialId: string) => void | Promise<void>;
   onRetry?: (event: SubagentProcessLifecycleRetryEvent) => void;
 };
 
@@ -191,6 +193,13 @@ const QUOTA_RETRY_JITTER_MAX_MS = 500;
 const TRANSIENT_RETRY_MAX_RETRIES = 2;
 const TRANSIENT_RETRY_BASE_DELAY_MS = 1_000;
 const TRANSIENT_RETRY_JITTER_MAX_MS = 250;
+
+function normalizeCredentialRetryLimit(value: number | undefined, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(0, Math.trunc(value));
+}
 
 export function createSubagentProcessLifecycle(
   options: CreateSubagentProcessLifecycleOptions,
@@ -296,7 +305,44 @@ export function createSubagentProcessLifecycle(
     let lockRetryCount = 0;
     let quotaRetryCount = 0;
     let transientRetryCount = 0;
+    let quotaRetryLimit: number | undefined;
     let richestAttemptRun: SubagentRunResult | undefined;
+
+    const getQuotaRetryLimit = async (): Promise<number> => {
+      if (quotaRetryLimit !== undefined) {
+        return quotaRetryLimit;
+      }
+
+      const resolvedLimit = retryOptions.getQuotaCredentialRetryLimit
+        ? await retryOptions.getQuotaCredentialRetryLimit()
+        : undefined;
+      quotaRetryLimit = normalizeCredentialRetryLimit(
+        resolvedLimit,
+        QUOTA_RETRY_MAX_RETRIES,
+      );
+      return quotaRetryLimit;
+    };
+
+    const reportRetryableCredentialFailure = async (
+      failure: RetryableCredentialFailure | undefined,
+      credentialId: string | undefined,
+    ): Promise<void> => {
+      if (!failure || !credentialId) {
+        return;
+      }
+
+      if (failure.kind === "quota") {
+        await retryOptions.reportQuotaCredentialError(failure.message, credentialId);
+        return;
+      }
+
+      if (failure.kind === "credential_auth") {
+        await retryOptions.reportCredentialAuthError(failure.message, credentialId);
+        return;
+      }
+
+      await retryOptions.reportTransientCredentialError(failure.message, credentialId);
+    };
 
     try {
       while (true) {
@@ -330,7 +376,7 @@ export function createSubagentProcessLifecycle(
           !retryableFailure &&
           lastAcquiredCredentialId
         ) {
-          retryOptions.clearTransientCredentialError(lastAcquiredCredentialId);
+          await retryOptions.clearTransientCredentialError(lastAcquiredCredentialId);
         }
 
         if (
@@ -364,34 +410,38 @@ export function createSubagentProcessLifecycle(
           continue;
         }
 
+        const usesCredentialPoolRetry =
+          retryableFailure?.kind === "quota" || retryableFailure?.kind === "credential_auth";
+        const activeQuotaRetryLimit = usesCredentialPoolRetry
+          ? await getQuotaRetryLimit()
+          : 0;
         if (
-          retryableFailure?.kind === "quota" &&
-          quotaRetryCount < QUOTA_RETRY_MAX_RETRIES &&
+          usesCredentialPoolRetry &&
+          retryableFailure &&
+          quotaRetryCount < activeQuotaRetryLimit &&
           options.session.status === "running" &&
           !options.session.timedOut
         ) {
-          if (lastAcquiredCredentialId) {
-            retryOptions.reportQuotaCredentialError(
-              retryableFailure.message,
-              lastAcquiredCredentialId,
-            );
-          }
+          await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
           accumulatedStderr = runWithAccumulatedStderr.stderr;
           quotaRetryCount += 1;
           const delay =
             QUOTA_RETRY_BASE_DELAY_MS * quotaRetryCount +
             Math.floor(Math.random() * QUOTA_RETRY_JITTER_MAX_MS);
+          const failureLabel = retryableFailure.kind === "credential_auth"
+            ? "Credential authentication error"
+            : "Quota/rate-limit error";
           const retryMessage =
-            `[pi-agent-router] Quota/rate-limit error for delegated task ${options.session.id.slice(0, 8)} ` +
-            `(quota retry ${quotaRetryCount}/${QUOTA_RETRY_MAX_RETRIES}). Rotating credential and retrying in ${delay}ms.`;
+            `[pi-agent-router] ${failureLabel} for delegated task ${options.session.id.slice(0, 8)} ` +
+            `(credential retry ${quotaRetryCount}/${activeQuotaRetryLimit}). Rotating credential and retrying in ${delay}ms.`;
 
           accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
           options.session.stderr = accumulatedStderr;
           retryOptions.onRetry?.({
-            kind: "quota",
+            kind: retryableFailure.kind,
             attempt: quotaRetryCount,
             delayMs: delay,
-            maxAttempts: QUOTA_RETRY_MAX_RETRIES,
+            maxAttempts: activeQuotaRetryLimit,
             message: retryMessage,
             sessionId: options.session.id,
           });
@@ -407,12 +457,7 @@ export function createSubagentProcessLifecycle(
           options.session.status === "running" &&
           !options.session.timedOut
         ) {
-          if (lastAcquiredCredentialId) {
-            retryOptions.reportTransientCredentialError(
-              retryableFailure.message,
-              lastAcquiredCredentialId,
-            );
-          }
+          await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
           accumulatedStderr = runWithAccumulatedStderr.stderr;
           transientRetryCount += 1;
           const delay =
@@ -436,6 +481,14 @@ export function createSubagentProcessLifecycle(
 
           await retryOptions.sleep(delay);
           continue;
+        }
+
+        if (
+          retryableFailure &&
+          options.session.status === "running" &&
+          !options.session.timedOut
+        ) {
+          await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
         }
 
         const finalRun =

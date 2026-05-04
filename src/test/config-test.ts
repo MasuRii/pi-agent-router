@@ -89,6 +89,10 @@ await runTest("loadPiAgentRouterConfig accepts unified delegated extension entri
             candidates: ["pi-multi-auth", "multi-auth"],
             skipWhen: "directEnvAuthAvailable",
           },
+          {
+            candidates: ["pi-permission-system"],
+            optional: true,
+          },
         ],
       }, null, 2)}\n`,
       "utf-8",
@@ -97,12 +101,14 @@ await runTest("loadPiAgentRouterConfig accepts unified delegated extension entri
     const result = loadPiAgentRouterConfig(configPath);
     assert.equal(result.warning, undefined);
     assert.deepEqual(result.config.delegatedExtensions, [
-      { candidates: ["pi-fast-mode"], skipWhen: [] },
-      { candidates: ["pi-context-injector", "context-injector"], skipWhen: [] },
+      { candidates: ["pi-fast-mode"], skipWhen: [], optional: false },
+      { candidates: ["pi-context-injector", "context-injector"], skipWhen: [], optional: false },
       {
         candidates: ["pi-multi-auth", "multi-auth"],
         skipWhen: ["directEnvAuthAvailable"],
+        optional: false,
       },
+      { candidates: ["pi-permission-system"], skipWhen: [], optional: true },
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -129,8 +135,8 @@ await runTest("loadPiAgentRouterConfig converts legacy delegated extension confi
     const result = loadPiAgentRouterConfig(configPath);
     assert.equal(result.warning, undefined);
     assert.deepEqual(result.config.delegatedExtensions, [
-      { candidates: ["pi-permission-system"], skipWhen: [] },
-      { candidates: ["pi-multi-auth"], skipWhen: ["directEnvAuthAvailable"] },
+      { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
+      { candidates: ["pi-multi-auth"], skipWhen: ["directEnvAuthAvailable"], optional: true },
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

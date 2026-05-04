@@ -17,8 +17,7 @@
   "providerEnvKeys": {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "openai-codex": "OPENAI_API_KEY",
-    "google-gemini-cli": "GOOGLE_API_KEY"
+    "openai-codex": "OPENAI_API_KEY"
   },
   "directEnvDelegationProviderIds": [
     "amazon-bedrock",

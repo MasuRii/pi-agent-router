@@ -10,6 +10,7 @@ import { join } from "node:path";
 import {
   computeExponentialBackoffMs,
   getWeeklyQuotaCooldownMs,
+  parseRetryAfterCooldownMs,
   TRANSIENT_COOLDOWN_BASE_MS,
   TRANSIENT_COOLDOWN_MAX_MS,
 } from "./credential-backoff";
@@ -34,6 +35,30 @@ type KeyDistributionConfigSlices = {
   providerCredentialFallbackPolicies: Readonly<Record<string, CredentialFallbackPolicy>>;
 };
 
+function isRemovedLegacyGoogleProviderId(providerId: string | undefined): boolean {
+  const normalizedProviderId = providerId?.trim().toLowerCase();
+  return (
+    normalizedProviderId === ["google", "gemini", "cli"].join("-") ||
+    normalizedProviderId === ["google", "antigravity"].join("-")
+  );
+}
+
+function filterRemovedLegacyProviderEnvKeys(
+  providerEnvKeys: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const filteredProviderEnvKeys: Record<string, string> = {};
+  for (const [providerId, envKey] of Object.entries(providerEnvKeys)) {
+    if (!isRemovedLegacyGoogleProviderId(providerId)) {
+      filteredProviderEnvKeys[providerId] = envKey;
+    }
+  }
+  return filteredProviderEnvKeys;
+}
+
+function filterRemovedLegacyProviderIds(providerIds: readonly string[]): string[] {
+  return providerIds.filter((providerId) => !isRemovedLegacyGoogleProviderId(providerId));
+}
+
 let cachedKeyDistributionConfigSlices: KeyDistributionConfigSlices | undefined;
 
 function getConfiguredKeyDistributionSlices(): KeyDistributionConfigSlices {
@@ -43,8 +68,10 @@ function getConfiguredKeyDistributionSlices(): KeyDistributionConfigSlices {
 
   const config = loadPiAgentRouterConfig().config;
   cachedKeyDistributionConfigSlices = {
-    providerEnvKeys: { ...config.providerEnvKeys },
-    directEnvDelegationProviderIds: new Set(config.directEnvDelegationProviderIds),
+    providerEnvKeys: filterRemovedLegacyProviderEnvKeys(config.providerEnvKeys),
+    directEnvDelegationProviderIds: new Set(
+      filterRemovedLegacyProviderIds(config.directEnvDelegationProviderIds),
+    ),
     providerCredentialFallbackPolicies: {
       ...config.providerCredentialFallbackPolicies,
     },
@@ -77,6 +104,10 @@ function extractProviderEnvKeys(parsed: unknown): Record<string, string> | null 
   const envKeys: Record<string, string> = {};
 
   for (const [providerId, providerConfig] of Object.entries(providers)) {
+    if (isRemovedLegacyGoogleProviderId(providerId)) {
+      continue;
+    }
+
     if (
       providerConfig &&
       typeof providerConfig === "object" &&
@@ -199,8 +230,6 @@ export const PROVIDER_ENV_KEYS: Record<string, string> = new Proxy({} as Record<
 
 const PROVIDER_ID_ALIASES: Record<string, string> = {
   codex: "openai-codex",
-  google: "google-gemini-cli",
-  gemini: "google-gemini-cli",
 };
 
 function getDirectEnvDelegationProviderIds(): ReadonlySet<string> {
@@ -328,7 +357,7 @@ function normalizeProviderId(providerId: string | undefined): string | undefined
   }
 
   const normalized = providerId.trim().toLowerCase();
-  if (!normalized) {
+  if (!normalized || isRemovedLegacyGoogleProviderId(normalized)) {
     return undefined;
   }
 
@@ -610,6 +639,56 @@ export function shouldInheritParentCredentialEnvForProvider(
   providerId: string | undefined,
 ): boolean {
   return shouldInheritParentCredentialEnv(providerId);
+}
+
+export async function resolveSubagentQuotaCredentialRetryLimit(
+  sessionId: string,
+  providerId: string | undefined,
+  options: {
+    requestedModel?: string;
+    modelContext?: {
+      providerId?: string;
+      modelId?: string;
+      modelRef?: string;
+      api?: string;
+    };
+    parentSessionId?: string;
+  } = {},
+): Promise<number> {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!normalizedProviderId) {
+    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
+  }
+
+  const distributor = getGlobalKeyDistributor();
+  if (!distributor?.getDelegatedCredentialRoutingCapabilities) {
+    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
+  }
+
+  const abortController = new AbortController();
+  const request = resolveDelegatedCredentialRequest({
+    sessionId,
+    providerId: normalizedProviderId,
+    requestedModel: options.requestedModel,
+    modelContext: options.modelContext,
+    parentSessionId: options.parentSessionId,
+    signal: abortController.signal,
+  });
+
+  const capabilities = await getRoutingCapabilitiesSafe(distributor, request);
+  const eligibleCredentialCount = capabilities?.credentialCounts.modelEligible;
+  if (typeof eligibleCredentialCount !== "number" || !Number.isFinite(eligibleCredentialCount)) {
+    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
+  }
+
+  if (eligibleCredentialCount <= 1) {
+    return 0;
+  }
+
+  return Math.max(
+    1,
+    Math.min(MAX_QUOTA_CREDENTIAL_RETRY_LIMIT, Math.trunc(eligibleCredentialCount) - 1),
+  );
 }
 
 export async function tryAcquireKeyForSubagent(
@@ -919,6 +998,14 @@ const WEEKLY_QUOTA_PATTERNS: RegExp[] = [
   /upgrade for higher limits/i,
 ];
 
+const CREDENTIAL_AUTH_PATTERNS: RegExp[] = [
+  /authentication\s+token\s+has\s+been\s+invalidated/i,
+  /auth(?:entication)?\s+token[^\n]*(?:invalid|invalidated|revoked|expired)/i,
+  /token[_\s-]?revoked/i,
+  /invalid[_\s-]?grant/i,
+  /please\s+(?:try\s+)?sign(?:ing)?\s+in\s+again/i,
+];
+
 const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
   /\b5\d\d\b/i,
   /internal[_\s-]?server[_\s-]?error/i,
@@ -952,7 +1039,10 @@ const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
   /unknown model/i,
 ];
 
-const DEFAULT_QUOTA_COOLDOWN_MS = 60_000; // 1 minute for regular quota errors
+const DEFAULT_QUOTA_COOLDOWN_MS = 60_000; // 1 minute for regular quota errors when no reset hint is available
+const RETRY_AFTER_WEEKLY_THRESHOLD_MS = 36 * 60 * 60 * 1000;
+const DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT = 3;
+const MAX_QUOTA_CREDENTIAL_RETRY_LIMIT = 32;
 export const KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES = 1_024;
 
 /**
@@ -974,6 +1064,14 @@ export function isQuotaOrRateLimitError(errorText: string): boolean {
 /**
  * Checks whether an error message indicates a retryable transient transport/provider failure.
  */
+export function isRetryableCredentialAuthError(errorText: string): boolean {
+  if (!errorText) {
+    return false;
+  }
+
+  return CREDENTIAL_AUTH_PATTERNS.some((pattern) => pattern.test(errorText));
+}
+
 export function isTransientCredentialError(errorText: string): boolean {
   if (!errorText) {
     return false;
@@ -1025,12 +1123,87 @@ function isWeeklyQuotaError(errorText: string): boolean {
   return WEEKLY_QUOTA_PATTERNS.some((pattern) => pattern.test(errorText));
 }
 
+function isLongRetryAfterQuotaCooldown(cooldownMs: number | undefined): boolean {
+  return typeof cooldownMs === "number" && cooldownMs >= RETRY_AFTER_WEEKLY_THRESHOLD_MS;
+}
+
 /**
  * Weekly quota and transient provider attempt tracking for exponential backoff.
  * Bounded by credentialId to prevent unbounded long-lived process growth.
  */
 const weeklyQuotaAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
 const transientProviderAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
+
+export async function reportSubagentCredentialAuthError(
+  sessionId: string,
+  credentialId: string,
+  errorMessage: string,
+): Promise<void> {
+  if (!credentialId) {
+    return;
+  }
+
+  const distributor = getGlobalKeyDistributor();
+  if (!distributor?.disableCredential && !distributor?.applyCooldown) {
+    return;
+  }
+
+  weeklyQuotaAttempts.delete(credentialId);
+  transientProviderAttempts.delete(credentialId);
+  const reason = `Subagent ${sessionId.slice(0, 8)} credential authentication error: ${errorMessage.slice(0, 200)}`;
+
+  if (distributor.disableCredential) {
+    try {
+      await distributor.disableCredential(credentialId, reason, undefined);
+      void piAgentRouterDebugLogger.info("subagent.credential_auth_disabled", {
+        credentialId,
+        message:
+          `[pi-agent-router] Disabled credential ${credentialId} for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
+        sessionId,
+      });
+      return;
+    } catch (error) {
+      const message = getErrorMessage(error);
+      void piAgentRouterDebugLogger.warn("subagent.credential_auth_disable_failed", {
+        credentialId,
+        error: message,
+        message: `[pi-agent-router] Failed to disable credential ${credentialId}: ${message}.`,
+        sessionId,
+      });
+    }
+  }
+
+  if (!distributor.applyCooldown) {
+    return;
+  }
+
+  const fallbackCooldownMs = 72 * 60 * 60 * 1000;
+  try {
+    await distributor.applyCooldown(
+      credentialId,
+      fallbackCooldownMs,
+      reason,
+      undefined,
+      false,
+      errorMessage.slice(0, 500),
+    );
+    void piAgentRouterDebugLogger.info("subagent.credential_auth_cooldown_applied", {
+      cooldownMs: fallbackCooldownMs,
+      credentialId,
+      message:
+        `[pi-agent-router] Applied 72h cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
+      sessionId,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    void piAgentRouterDebugLogger.warn("subagent.credential_auth_cooldown_failed", {
+      credentialId,
+      error: message,
+      message: `[pi-agent-router] Failed to apply credential authentication cooldown for ${credentialId}: ${message}.`,
+      sessionId,
+    });
+  }
+}
 
 /**
  * Reports a quota/rate-limit error on a credential to the global KeyDistributor
@@ -1044,11 +1217,11 @@ const transientProviderAttempts = createBoundedCache<string, number>(KEY_DISTRIB
  * - 3rd consecutive: 48 hours
  * - 4th+: 72 hours (max)
  */
-export function reportSubagentKeyError(
+export async function reportSubagentKeyError(
   sessionId: string,
   credentialId: string,
   errorMessage: string,
-): void {
+): Promise<void> {
   if (!credentialId) {
     return;
   }
@@ -1058,8 +1231,9 @@ export function reportSubagentKeyError(
     return;
   }
 
+  const retryAfterCooldownMs = parseRetryAfterCooldownMs(errorMessage);
   const isBalanceExhausted = isBalanceExhaustedError(errorMessage);
-  const isWeekly = isWeeklyQuotaError(errorMessage);
+  const isWeekly = isWeeklyQuotaError(errorMessage) || isLongRetryAfterQuotaCooldown(retryAfterCooldownMs);
 
   // Balance exhaustion: disable credential permanently (requires manual re-enable)
   if (isBalanceExhausted) {
@@ -1068,7 +1242,7 @@ export function reportSubagentKeyError(
 
     if (distributor.disableCredential) {
       try {
-        distributor.disableCredential(credentialId, reason, undefined);
+        await distributor.disableCredential(credentialId, reason, undefined);
         void piAgentRouterDebugLogger.info("subagent.credential_disabled", {
           credentialId,
           message:
@@ -1088,7 +1262,7 @@ export function reportSubagentKeyError(
       // Fallback: apply a very long cooldown if disableCredential is not available
       const fallbackCooldownMs = 72 * 60 * 60 * 1000; // 72 hours
       try {
-        distributor.applyCooldown(
+        await distributor.applyCooldown(
           credentialId,
           fallbackCooldownMs,
           reason,
@@ -1123,7 +1297,16 @@ export function reportSubagentKeyError(
   let cooldownMs: number;
   let reasonPrefix: string;
 
-  if (isWeekly) {
+  if (retryAfterCooldownMs !== undefined) {
+    if (isWeekly) {
+      const attempts = (weeklyQuotaAttempts.get(credentialId) ?? 0) + 1;
+      weeklyQuotaAttempts.set(credentialId, attempts);
+    } else {
+      weeklyQuotaAttempts.delete(credentialId);
+    }
+    cooldownMs = retryAfterCooldownMs;
+    reasonPrefix = `Subagent ${sessionId.slice(0, 8)} quota/rate-limit reset hint`;
+  } else if (isWeekly) {
     // Exponential backoff for weekly quota
     const attempts = (weeklyQuotaAttempts.get(credentialId) ?? 0) + 1;
     weeklyQuotaAttempts.set(credentialId, attempts);
@@ -1138,7 +1321,7 @@ export function reportSubagentKeyError(
 
   try {
     const reason = `${reasonPrefix}: ${errorMessage.slice(0, 200)}`;
-    distributor.applyCooldown(
+    await distributor.applyCooldown(
       credentialId,
       cooldownMs,
       reason,
@@ -1151,8 +1334,9 @@ export function reportSubagentKeyError(
       cooldownMs,
       credentialId,
       isWeekly,
+      retryAfterCooldownMs,
       message:
-        `[pi-agent-router] Reported ${isWeekly ? 'weekly ' : ''}cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} (${cooldownMs / (60 * 60 * 1000)}h).`,
+        `[pi-agent-router] Reported ${isWeekly ? "weekly " : ""}cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} (${cooldownMs / (60 * 60 * 1000)}h).`,
       sessionId,
     });
   } catch (error) {
@@ -1170,11 +1354,11 @@ export function reportSubagentKeyError(
  * Reports a retryable transient provider/transport error and applies a short cooldown
  * so the next delegated retry prefers a different credential when available.
  */
-export function reportSubagentTransientKeyError(
+export async function reportSubagentTransientKeyError(
   sessionId: string,
   credentialId: string,
   errorMessage: string,
-): void {
+): Promise<void> {
   if (!credentialId) {
     return;
   }
@@ -1196,7 +1380,7 @@ export function reportSubagentTransientKeyError(
   const reason = `Subagent ${sessionId.slice(0, 8)} transient provider error: ${errorMessage.slice(0, 200)}`;
 
   try {
-    distributor.applyCooldown(
+    await distributor.applyCooldown(
       credentialId,
       cooldownMs,
       reason,

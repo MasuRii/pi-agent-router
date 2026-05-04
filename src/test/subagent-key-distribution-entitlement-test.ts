@@ -17,8 +17,10 @@ import {
   clearSubagentTransientKeyError,
   clearWeeklyQuotaAttempts,
   detectSubagentProviderIdAsync,
+  isRetryableCredentialAuthError,
   shouldInheritParentCredentialEnvForProvider,
   releaseKeyLeasesForParentSession,
+  reportSubagentCredentialAuthError,
   reportSubagentKeyError,
   reportSubagentTransientKeyError,
   resetProviderEnvKeyCacheState,
@@ -65,6 +67,11 @@ type MockDistributor = {
     providerId?: string,
     isWeekly?: boolean,
     errorMessage?: string,
+  ) => Promise<void> | void;
+  disableCredential?: (
+    credentialId: string,
+    reason: string,
+    providerId?: string,
   ) => Promise<void> | void;
   clearTransientError?: (credentialId: string, providerId?: string) => Promise<void> | void;
 };
@@ -545,7 +552,36 @@ try {
     assert.equal(shouldSkip, false);
   });
 
-  await runTest("key error attempt tracking is bounded and preserves cached attempts", () => {
+  await runTest("credential auth errors are retryable and disable the failed credential", async () => {
+    const disabledCredentials: Array<{ credentialId: string; reason: string }> = [];
+
+    globalScope.__piMultiAuthKeyDistributor = {
+      acquireForSubagent: async () => null,
+      releaseFromSubagent: () => undefined,
+      disableCredential: (credentialId, reason) => {
+        disabledCredentials.push({ credentialId, reason });
+      },
+    };
+
+    assert.equal(
+      isRetryableCredentialAuthError(
+        "Your authentication token has been invalidated. Please try signing in again.",
+      ),
+      true,
+    );
+
+    await reportSubagentCredentialAuthError(
+      "session-auth",
+      "auth-invalidated",
+      "Your authentication token has been invalidated. Please try signing in again.",
+    );
+
+    assert.equal(disabledCredentials.length, 1);
+    assert.equal(disabledCredentials[0]?.credentialId, "auth-invalidated");
+    assert.equal(disabledCredentials[0]?.reason.includes("session-"), true);
+  });
+
+  await runTest("key error attempt tracking is bounded and preserves cached attempts", async () => {
     const cooldownsByCredential = new Map<string, number[]>();
 
     globalScope.__piMultiAuthKeyDistributor = {
@@ -559,48 +595,48 @@ try {
       clearTransientError: () => undefined,
     };
 
-    reportSubagentKeyError("session-weekly", "weekly-preserved", "weekly usage limit reached");
-    reportSubagentKeyError("session-weekly", "weekly-preserved", "weekly usage limit reached");
+    await reportSubagentKeyError("session-weekly", "weekly-preserved", "weekly usage limit reached");
+    await reportSubagentKeyError("session-weekly", "weekly-preserved", "weekly usage limit reached");
     const preservedWeeklyCooldowns = cooldownsByCredential.get("weekly-preserved") ?? [];
     assert.equal(preservedWeeklyCooldowns.length, 2);
     assert.equal(preservedWeeklyCooldowns[1] > preservedWeeklyCooldowns[0], true);
 
-    reportSubagentTransientKeyError("session-transient", "transient-preserved", "internal server error");
-    reportSubagentTransientKeyError("session-transient", "transient-preserved", "internal server error");
+    await reportSubagentTransientKeyError("session-transient", "transient-preserved", "internal server error");
+    await reportSubagentTransientKeyError("session-transient", "transient-preserved", "internal server error");
     const preservedTransientCooldowns = cooldownsByCredential.get("transient-preserved") ?? [];
     assert.equal(preservedTransientCooldowns.length, 2);
     assert.equal(preservedTransientCooldowns[1] > preservedTransientCooldowns[0], true);
 
     const firstWeeklyCredential = "weekly-bounded-0";
-    reportSubagentKeyError("session-weekly", firstWeeklyCredential, "weekly usage limit reached");
+    await reportSubagentKeyError("session-weekly", firstWeeklyCredential, "weekly usage limit reached");
     const firstWeeklyCooldown = cooldownsByCredential.get(firstWeeklyCredential)?.[0];
     assert.equal(typeof firstWeeklyCooldown, "number");
 
     for (let index = 1; index <= KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES; index += 1) {
-      reportSubagentKeyError(
+      await reportSubagentKeyError(
         "session-weekly",
         `weekly-bounded-${index}`,
         "weekly usage limit reached",
       );
     }
 
-    reportSubagentKeyError("session-weekly", firstWeeklyCredential, "weekly usage limit reached");
+    await reportSubagentKeyError("session-weekly", firstWeeklyCredential, "weekly usage limit reached");
     assert.equal(cooldownsByCredential.get(firstWeeklyCredential)?.[1], firstWeeklyCooldown);
 
     const firstTransientCredential = "transient-bounded-0";
-    reportSubagentTransientKeyError("session-transient", firstTransientCredential, "internal server error");
+    await reportSubagentTransientKeyError("session-transient", firstTransientCredential, "internal server error");
     const firstTransientCooldown = cooldownsByCredential.get(firstTransientCredential)?.[0];
     assert.equal(typeof firstTransientCooldown, "number");
 
     for (let index = 1; index <= KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES; index += 1) {
-      reportSubagentTransientKeyError(
+      await reportSubagentTransientKeyError(
         "session-transient",
         `transient-bounded-${index}`,
         "internal server error",
       );
     }
 
-    reportSubagentTransientKeyError("session-transient", firstTransientCredential, "internal server error");
+    await reportSubagentTransientKeyError("session-transient", firstTransientCredential, "internal server error");
     assert.equal(cooldownsByCredential.get(firstTransientCredential)?.[1], firstTransientCooldown);
 
     clearWeeklyQuotaAttempts("weekly-preserved");
