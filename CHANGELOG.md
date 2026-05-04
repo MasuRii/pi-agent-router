@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-04
+
+### Added
+- Added `delegatedExtensions[].optional` so compatibility extensions can be explicitly optional while security companion entries remain fail-closed by default.
+- Added delegated runtime follow-up status handling so queued or running task delegations continue through hidden orchestrator reminder and completion turns.
+
+### Changed
+- Delegated extension loading now merges extension-provided runtime metadata with router config `skipWhen` rules before deciding whether to load a companion extension.
+- Updated Pi peer dependency ranges to `@mariozechner/*` `^0.72.0` and `typebox` `^1.1.37`.
+
+### Fixed
+- Blocked missing delegated security companions such as `pi-permission-system`, `pi-sensitive-guard`, and `env-protection` unless the config entry is intentionally marked optional.
+- Compacted delegated failure summaries and runtime status displays so failed batches remain readable.
+
 ## [0.4.0] - 2026-04-30
 
 ### Added
