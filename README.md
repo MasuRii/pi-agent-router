@@ -13,6 +13,7 @@ Active-agent routing and controlled subagent delegation for the [Pi coding agent
 - **Parallel and chain execution modes** for delegated task batches
 - **Configurable parallel delegation concurrency** through `maxParallelDelegationConcurrency`
 - **Tracked delegated sessions** with attach and dismiss workflows
+- **Delegated runtime safety controls** for optional compatibility extensions and fail-closed security companions
 - **Compact task result rendering** for running, completed, failed, and aborted delegation batches
 - **Output contract warnings** that surface malformed or incomplete delegated results
 - **Debug logging control** through `debug`, with logs written only under the extension-local `debug/` directory when enabled
@@ -66,6 +67,8 @@ Parallel delegation uses the configured concurrency limit. Chain delegation alwa
 
 Task items use `id` as the stable logical task reference. Use `retry: true` (or `retryFrom: "<taskId|logicalId|sessionId|sessionPath>"`) to resume prior delegated work with the retained Pi `--session` path when available. Use top-level or parallel per-task `contextFrom` only for retained delegated sessions; in `mode: "chain"`, per-task `contextFrom` may also reference earlier completed same-batch items by `id`. Only bounded final responses/results or validated `submit_result` payloads are injected; full transcripts, session context, and tool history are not injected.
 
+When delegated work is still queued or running after a `task` tool result, the router schedules hidden follow-up turns that remind the orchestrator to continue dispatching independent work and later report delegated runtime status once the tracked jobs finish. This prevents premature final responses while preserving compact visible output.
+
 ### Session attachment
 
 Open or dismiss tracked delegated-task output:
@@ -96,7 +99,7 @@ A starter template is included at `config/config.example.json`.
 |--------|------|---------|-------------|
 | `debug` | boolean | `false` | Enables extension debug logging to `debug/pi-agent-router-debug.jsonl`; no debug log file is opened when disabled |
 | `maxParallelDelegationConcurrency` | integer | `4` | Maximum number of delegated tasks that can run at the same time in parallel mode; valid range is `1` to `16` |
-| `delegatedExtensions` | array | `[]` | Extra extensions to load into delegated subagent runtimes when installed. Entries can be a string, an alias/candidate array, or an object with `candidates` and `skipWhen`. Missing entries are skipped without failing delegation. |
+| `delegatedExtensions` | array | `[]` | Extra extensions to load into delegated subagent runtimes when installed. Entries can be a string, an alias/candidate array, or an object with `candidates`, `skipWhen`, and `optional`. Missing security companion entries fail closed unless marked optional; other missing entries are skipped with a warning. |
 
 ### Example config
 
@@ -123,7 +126,8 @@ Use `delegatedExtensions` when you intentionally want delegated subagents to loa
     ["pi-context-injector", "context-injector"],
     {
       "candidates": ["pi-multi-auth", "multi-auth"],
-      "skipWhen": ["directEnvAuthAvailable"]
+      "skipWhen": ["directEnvAuthAvailable"],
+      "optional": true
     }
   ]
 }
@@ -135,7 +139,7 @@ Entry formats:
 |-------------|---------|
 | `"extension-name"` | Load this extension if `$PI_CODING_AGENT_DIR/extensions/extension-name` exists. |
 | `["name-a", "name-b"]` | Treat names as candidates for the same compatibility extension and load the first installed candidate. |
-| `{ "candidates": [...], "skipWhen": [...] }` | Load the first installed candidate unless a generic skip rule applies. |
+| `{ "candidates": [...], "skipWhen": [...], "optional": true }` | Load the first installed candidate unless a generic skip rule applies; treat missing candidates as intentional when `optional` is `true`. |
 
 Supported `skipWhen` values:
 
@@ -155,7 +159,7 @@ Extensions can also declare their own delegated-runtime metadata in `package.jso
 }
 ```
 
-Router config rules and extension metadata rules are merged. The legacy object shape with `requiredExtensionCandidates`, `optionalExtensionNames`, and `delegatedMultiAuthExtensionNames` is still accepted for compatibility and normalized into the unified list internally.
+Router config rules and extension metadata rules are merged. Security companion candidates named `pi-permission-system`, `pi-sensitive-guard`, or `env-protection` are required by default because delegated subagents run with `--no-extensions`; delegation fails closed when those candidates are missing unless the entry sets `optional: true`. The legacy object shape with `requiredExtensionCandidates`, `optionalExtensionNames`, and `delegatedMultiAuthExtensionNames` is still accepted for compatibility and normalized into the unified list internally.
 
 ### Additional task controls
 
