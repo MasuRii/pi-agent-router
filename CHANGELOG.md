@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-22
+
+### Added
+- Added task retry controls, task reference resolution, and session-history recovery for delegated task follow-ups.
+- Added delegated runtime artifacts, model readiness checks, router reload handling, and launch coordination for safer subagent execution.
+
+### Changed
+- Improved subagent delegation, key distribution, live widget batching, and task result rendering for parallel and chain task workflows.
+- Updated Pi peer dependencies and runtime import expectations to the `@earendil-works` scope.
+
+### Fixed
+- Hardened delegated output sanitization, debug log redaction, and session integrity checks so task summaries remain safe and recoverable.
+
 ## [0.5.0] - 2026-05-04
 
 ### Added

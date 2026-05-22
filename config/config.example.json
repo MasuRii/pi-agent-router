@@ -11,9 +11,13 @@
       "{home}/.omp/agents",
       "{agentDir}/agents",
       "{home}/.claude/agents"
-    ]
+    ],
+    "maxMarkdownBytes": 262144
   },
-  "delegatedExtensions": [],
+  "delegatedExtensions": [
+    "pi-permission-system",
+    ["pi-sensitive-guard", "env-protection"]
+  ],
   "providerEnvKeys": {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",

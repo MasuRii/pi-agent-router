@@ -99,7 +99,8 @@ A starter template is included at `config/config.example.json`.
 |--------|------|---------|-------------|
 | `debug` | boolean | `false` | Enables extension debug logging to `debug/pi-agent-router-debug.jsonl`; no debug log file is opened when disabled |
 | `maxParallelDelegationConcurrency` | integer | `4` | Maximum number of delegated tasks that can run at the same time in parallel mode; valid range is `1` to `16` |
-| `delegatedExtensions` | array | `[]` | Extra extensions to load into delegated subagent runtimes when installed. Entries can be a string, an alias/candidate array, or an object with `candidates`, `skipWhen`, and `optional`. Missing security companion entries fail closed unless marked optional; other missing entries are skipped with a warning. |
+| `delegatedExtensions` | array | required security companions | Extensions to load into delegated subagent runtimes. The generated default requires `pi-permission-system` plus one of `pi-sensitive-guard` or `env-protection`; entries can be a string, an alias/candidate array, or an object with `candidates`, `skipWhen`, and `optional`. Missing security companion entries fail closed unless marked optional; other missing entries are skipped with a warning. |
+| `agentDiscovery.maxMarkdownBytes` | integer | `262144` | Maximum bytes read from each agent Markdown file during discovery; larger files are skipped to keep startup and reload bounded. |
 
 ### Example config
 
@@ -107,7 +108,13 @@ A starter template is included at `config/config.example.json`.
 {
   "debug": false,
   "maxParallelDelegationConcurrency": 4,
-  "delegatedExtensions": []
+  "agentDiscovery": {
+    "maxMarkdownBytes": 262144
+  },
+  "delegatedExtensions": [
+    "pi-permission-system",
+    ["pi-sensitive-guard", "env-protection"]
+  ]
 }
 ```
 
@@ -115,7 +122,7 @@ Invalid `maxParallelDelegationConcurrency` values are rejected with task control
 
 ### Delegated extension compatibility
 
-By default, delegated subagents run with Pi's automatic extension discovery disabled and only receive router-generated runtime extensions. This keeps published installs portable for users who do not have local companion extensions.
+By default, delegated subagents run with Pi's automatic extension discovery disabled and receive router-generated runtime extensions plus required security companion entries. If a deployment intentionally does not use those companions, mark the relevant entry `optional: true`; otherwise missing security companions fail closed before delegation starts.
 
 Use `delegatedExtensions` when you intentionally want delegated subagents to load extra installed extensions:
 
@@ -161,6 +168,8 @@ Extensions can also declare their own delegated-runtime metadata in `package.jso
 
 Router config rules and extension metadata rules are merged. Security companion candidates named `pi-permission-system`, `pi-sensitive-guard`, or `env-protection` are required by default because delegated subagents run with `--no-extensions`; delegation fails closed when those candidates are missing unless the entry sets `optional: true`. The legacy object shape with `requiredExtensionCandidates`, `optionalExtensionNames`, and `delegatedMultiAuthExtensionNames` is still accepted for compatibility and normalized into the unified list internally.
 
+When a delegated model has already been resolved and is launched with `--model`, the router marks the subagent runtime with `PI_MODEL_DISCOVERY_CACHE_ONLY=1`. Compatible `model-discovery` versions still register cached provider metadata but skip startup background discovery and catalog HTTP requests in that subagent.
+
 ### Additional task controls
 
 The extension also respects existing Pi task control settings from global `settings.json`, nearest project `.pi/settings.json`, and environment variables. Those controls remain available for advanced automation and are applied after the extension config:
@@ -173,6 +182,9 @@ The extension also respects existing Pi task control settings from global `setti
 - `PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY`
 - `PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS`
 - `PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS`
+- `agentRouter.task.retry.enabled`, `taskRouter.retry.enabled`, or `task.retry.enabled` (`true`/`false`)
+- `agentRouter.task.retry.maxRetries`, `taskRouter.retry.maxRetries`, or `task.retry.maxRetries` (integer `0` through `32`)
+- `agentRouter.task.retry.baseDelayMs`, `taskRouter.retry.baseDelayMs`, or `task.retry.baseDelayMs` (integer `0` through `3600000` milliseconds)
 
 ## Troubleshooting
 
@@ -216,13 +228,16 @@ pi-agent-router/
 ## Development
 
 ```bash
-# Build/type generation check used by this extension
+# Build/type-safety check used by this extension
 npm run build
 
 # Strict type check
 npm run lint
 
-# Run regression tests
+# Verify Bun is installed for the Bun-based regression suite
+npm run test:runtime
+
+# Run regression tests (requires Bun on PATH; see https://bun.sh/docs/installation)
 npm run test
 
 # Full verification
