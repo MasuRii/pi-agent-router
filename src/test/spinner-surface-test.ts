@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { Container } from "@mariozechner/pi-tui";
+import { Container } from "@earendil-works/pi-tui";
 
 import { appendTaskBlock } from "../task/task-display-primitives";
 import { createAnimatedRenderSurface } from "../ui/animated-render-surface";

@@ -15,6 +15,8 @@ import {
   invalidateAgentDiscoveryCaches,
   isPrimaryAgent,
   loadAgents,
+  loadAgentsFromDir,
+  loadAgentsFromDirAsync,
   resetAgentDiscoveryCacheState,
 } from "../agent/agent-discovery";
 
@@ -51,6 +53,28 @@ function withRouterConfig(config: Record<string, unknown>, testFn: () => void): 
     writeRouterConfig(config);
     resetAgentDiscoveryCacheState();
     testFn();
+  } finally {
+    if (previousConfig === undefined) {
+      rmSync(CONFIG_PATH, { force: true });
+    } else {
+      writeFileSync(CONFIG_PATH, previousConfig, "utf-8");
+    }
+    resetAgentDiscoveryCacheState();
+  }
+}
+
+async function withRouterConfigAsync(
+  config: Record<string, unknown>,
+  testFn: () => Promise<void>,
+): Promise<void> {
+  const previousConfig = existsSync(CONFIG_PATH)
+    ? readFileSync(CONFIG_PATH, "utf-8")
+    : undefined;
+
+  try {
+    writeRouterConfig(config);
+    resetAgentDiscoveryCacheState();
+    await testFn();
   } finally {
     if (previousConfig === undefined) {
       rmSync(CONFIG_PATH, { force: true });
@@ -118,6 +142,40 @@ await runTest("agent markdown parsing uses a bounded positive concurrency limit"
   assert.equal(Number.isInteger(AGENT_MARKDOWN_PARSE_CONCURRENCY), true);
   assert.equal(AGENT_MARKDOWN_PARSE_CONCURRENCY > 0, true);
   assert.equal(AGENT_MARKDOWN_PARSE_CONCURRENCY < AGENT_DISCOVERY_CACHE_MAX_ENTRIES, true);
+});
+
+await runTest("agent discovery skips markdown files above configured size cap", async () => {
+  resetAgentDiscoveryCacheState();
+  const root = mkdtempSync(join(tmpdir(), "agent-discovery-size-cap-"));
+  const agentDir = join(root, "agents");
+
+  try {
+    writeAgent(agentDir, "small", "within-limit");
+    writeFileSync(
+      join(agentDir, "huge.md"),
+      `---\nname: huge\ndescription: too-large\n---\n\n${"x".repeat(2048)}`,
+      "utf-8",
+    );
+
+    await withRouterConfigAsync(
+      {
+        agentDiscovery: {
+          maxMarkdownBytes: 512,
+        },
+      },
+      async () => {
+        const syncAgents = loadAgentsFromDir(agentDir);
+        assert.deepEqual(syncAgents.map((agent) => agent.name), ["small"]);
+
+        invalidateAgentDiscoveryCaches();
+
+        const asyncAgents = await loadAgentsFromDirAsync(agentDir);
+        assert.deepEqual(asyncAgents.map((agent) => agent.name), ["small"]);
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 await runTest("discoverAgentsAsync caches hits and rehydrates after invalidation", async () => {

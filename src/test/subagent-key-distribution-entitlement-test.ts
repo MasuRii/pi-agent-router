@@ -17,7 +17,9 @@ import {
   clearSubagentTransientKeyError,
   clearWeeklyQuotaAttempts,
   detectSubagentProviderIdAsync,
+  isQuotaOrRateLimitError,
   isRetryableCredentialAuthError,
+  isTransientCredentialError,
   shouldInheritParentCredentialEnvForProvider,
   releaseKeyLeasesForParentSession,
   reportSubagentCredentialAuthError,
@@ -101,6 +103,16 @@ function writeKeyDistributionRouterConfig(
       2,
     )}\n`,
     "utf-8",
+  );
+}
+
+function writeDefaultCredentialFallbackRouterConfig(): void {
+  writeKeyDistributionRouterConfig(
+    {
+      openai: "OPENAI_API_KEY",
+      "openai-codex": "OPENAI_API_KEY",
+    },
+    ["openai"],
   );
 }
 
@@ -240,55 +252,64 @@ try {
   });
 
   await runTest("tryAcquireKeyForSubagent fails closed for Codex without model context", async () => {
-    let acquireCalls = 0;
+    await withExtensionRouterConfig(async () => {
+      writeDefaultCredentialFallbackRouterConfig();
+      let acquireCalls = 0;
 
-    globalScope.__piMultiAuthKeyDistributor = {
-      acquireForSubagent: async () => {
-        acquireCalls += 1;
-        return {
-          credentialId: "openai-codex-1",
-          apiKey: "test-distributed-key",
-        };
-      },
-      releaseFromSubagent: () => undefined,
-    };
+      globalScope.__piMultiAuthKeyDistributor = {
+        acquireForSubagent: async () => {
+          acquireCalls += 1;
+          return {
+            credentialId: "openai-codex-1",
+            apiKey: "test-distributed-key",
+          };
+        },
+        releaseFromSubagent: () => undefined,
+      };
 
-    await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
-      const lease = await tryAcquireKeyForSubagent("session-missing-model", "openai-codex", {
-        timeoutMs: 25,
+      await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
+        const lease = await tryAcquireKeyForSubagent("session-missing-model", "openai-codex", {
+          timeoutMs: 25,
+        });
+        assert.equal(lease, null);
+        assert.equal(acquireCalls, 0);
+        assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
       });
-      assert.equal(lease, null);
-      assert.equal(acquireCalls, 0);
-      assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
     });
   });
 
   await runTest("provider credential fallback policy defaults Codex to distributed-only", async () => {
-    await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
-      assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
-      assert.equal(shouldInheritParentCredentialEnvForProvider("openai"), true);
+    await withExtensionRouterConfig(async () => {
+      writeDefaultCredentialFallbackRouterConfig();
+      await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
+        assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
+        assert.equal(shouldInheritParentCredentialEnvForProvider("openai"), true);
+      });
     });
   });
 
   await runTest("tryAcquireKeyForSubagent enforces distributed-only timeout fallback policy", async () => {
-    let acquireCalls = 0;
+    await withExtensionRouterConfig(async () => {
+      writeDefaultCredentialFallbackRouterConfig();
+      let acquireCalls = 0;
 
-    globalScope.__piMultiAuthKeyDistributor = {
-      acquireForSubagent: async () => {
-        acquireCalls += 1;
-        return new Promise(() => undefined);
-      },
-      releaseFromSubagent: () => undefined,
-    };
+      globalScope.__piMultiAuthKeyDistributor = {
+        acquireForSubagent: async () => {
+          acquireCalls += 1;
+          return new Promise(() => undefined);
+        },
+        releaseFromSubagent: () => undefined,
+      };
 
-    await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
-      const lease = await tryAcquireKeyForSubagent("session-timeout", "openai-codex", {
-        requestedModel: "openai-codex/gpt-5.4",
-        timeoutMs: 5,
+      await withEnv({ OPENAI_API_KEY: "parent-env-key" }, async () => {
+        const lease = await tryAcquireKeyForSubagent("session-timeout", "openai-codex", {
+          requestedModel: "openai-codex/gpt-5.4",
+          timeoutMs: 5,
+        });
+        assert.equal(lease, null);
+        assert.equal(acquireCalls, 1);
+        assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
       });
-      assert.equal(lease, null);
-      assert.equal(acquireCalls, 1);
-      assert.equal(shouldInheritParentCredentialEnvForProvider("openai-codex"), false);
     });
   });
 
@@ -329,7 +350,56 @@ try {
     assert.equal(acquireCalls, 0);
   });
 
+  await runTest("tryAcquireKeyForSubagent excludes failed session credential during retry acquisition", async () => {
+    let leaseLookupSessionId: string | undefined;
+    let acquireArgs: unknown[] | undefined;
+
+    globalScope.__piMultiAuthKeyDistributor = {
+      acquireForSubagent: async (...args: unknown[]) => {
+        acquireArgs = args;
+        return {
+          credentialId: "openai-codex-2",
+          apiKey: "fresh-api-key",
+        };
+      },
+      getLeaseForSession: async (sessionId) => {
+        leaseLookupSessionId = sessionId;
+        return {
+          credentialId: "openai-codex-1",
+          apiKey: "stale-api-key",
+        };
+      },
+      releaseFromSubagent: () => undefined,
+    };
+
+    const lease = await tryAcquireKeyForSubagent("session-refresh", "openai-codex", {
+      requestedModel: "openai-codex/gpt-5.4",
+      timeoutMs: 25,
+      parentSessionId: "parent-refresh",
+      excludedCredentialIds: ["openai-codex-1"],
+    });
+
+    assert.deepEqual(lease, {
+      providerId: "openai-codex",
+      envKey: "OPENAI_API_KEY",
+      credentialId: "openai-codex-2",
+      apiKey: "fresh-api-key",
+    });
+    assert.equal(leaseLookupSessionId, "session-refresh");
+    assert.equal(acquireArgs?.[0], "session-refresh");
+    assert.equal(acquireArgs?.[1], "openai-codex");
+    assert.deepEqual(
+      (acquireArgs?.[2] as { excludedIds?: readonly string[] } | undefined)?.excludedIds,
+      ["openai-codex-1"],
+    );
+    assert.equal(
+      (acquireArgs?.[2] as { parentSessionId?: string } | undefined)?.parentSessionId,
+      "parent-refresh",
+    );
+  });
+
   await runTest("tryAcquireKeyForSubagent bypasses delegated acquisition when only one eligible credential exists", async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "subagent-single-credential-"));
     let acquireCalls = 0;
     let bypassCheck:
       | {
@@ -338,35 +408,64 @@ try {
         }
       | undefined;
 
-    globalScope.__piMultiAuthKeyDistributor = {
-      acquireForSubagent: async () => {
-        acquireCalls += 1;
-        return {
-          credentialId: "cline",
-          apiKey: "should-not-be-used",
-        };
-      },
-      shouldBypassDelegatedSubagentAcquisition: async (providerId, options) => {
-        bypassCheck = {
-          providerId,
-          modelId: options?.modelId,
-        };
-        return true;
-      },
-      releaseFromSubagent: () => undefined,
-    };
+    try {
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "models.json"),
+        JSON.stringify(
+          {
+            providers: {
+              cline: {
+                apiKey: "CLINE_API_KEY",
+              },
+            },
+          },
+          null,
+          2,
+        ),
+        "utf-8",
+      );
 
-    const lease = await tryAcquireKeyForSubagent("session-single-credential", "cline", {
-      requestedModel: "cline/moonshotai/kimi-k2.6",
-      timeoutMs: 25,
-    });
+      globalScope.__piMultiAuthKeyDistributor = {
+        acquireForSubagent: async () => {
+          acquireCalls += 1;
+          return {
+            credentialId: "cline",
+            apiKey: "should-not-be-used",
+          };
+        },
+        shouldBypassDelegatedSubagentAcquisition: async (providerId, options) => {
+          bypassCheck = {
+            providerId,
+            modelId: options?.modelId,
+          };
+          return true;
+        },
+        releaseFromSubagent: () => undefined,
+      };
 
-    assert.equal(lease, null);
-    assert.deepEqual(bypassCheck, {
-      providerId: "cline",
-      modelId: "moonshotai/kimi-k2.6",
-    });
-    assert.equal(acquireCalls, 0);
+      await withEnv(
+        {
+          PI_CODING_AGENT_DIR: agentDir,
+          CLINE_API_KEY: "parent-cline-key",
+        },
+        async () => {
+          const lease = await tryAcquireKeyForSubagent("session-single-credential", "cline", {
+            requestedModel: "cline/moonshotai/kimi-k2.6",
+            timeoutMs: 25,
+          });
+
+          assert.equal(lease, null);
+          assert.deepEqual(bypassCheck, {
+            providerId: "cline",
+            modelId: "moonshotai/kimi-k2.6",
+          });
+          assert.equal(acquireCalls, 0);
+        },
+      );
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
+    }
   });
 
   await runTest("releaseKeyLeasesForParentSession forwards lightweight session lease release to multi-auth", () => {
@@ -532,16 +631,19 @@ try {
         "utf-8",
       );
 
-      await withEnv(
-        {
-          PI_CODING_AGENT_DIR: agentDir,
-          CLINE_API_KEY: undefined,
-        },
-        async () => {
-          assert.equal(await shouldSkipDelegatedMultiAuthForProviderAsync("openai-codex"), false);
-          assert.equal(await shouldSkipDelegatedMultiAuthForProviderAsync("cline"), false);
-        },
-      );
+      await withExtensionRouterConfig(async () => {
+        writeDefaultCredentialFallbackRouterConfig();
+        await withEnv(
+          {
+            PI_CODING_AGENT_DIR: agentDir,
+            CLINE_API_KEY: undefined,
+          },
+          async () => {
+            assert.equal(await shouldSkipDelegatedMultiAuthForProviderAsync("openai-codex"), false);
+            assert.equal(await shouldSkipDelegatedMultiAuthForProviderAsync("cline"), false);
+          },
+        );
+      });
     } finally {
       rmSync(agentDir, { recursive: true, force: true });
     }
@@ -579,6 +681,44 @@ try {
     assert.equal(disabledCredentials.length, 1);
     assert.equal(disabledCredentials[0]?.credentialId, "auth-invalidated");
     assert.equal(disabledCredentials[0]?.reason.includes("session-"), true);
+  });
+
+  await runTest("transient classifier covers reference-derived provider errors", () => {
+    const retryableErrors = [
+      "provider returned error: overloaded; retry-after: 2",
+      "server disconnected before completion",
+      "ZlibError: incorrect header check",
+      "HTTP 408 request timeout",
+      "Kiro request timed out after 300000ms.",
+      "connection reset by peer",
+      "please try again shortly",
+      "400 The selected provider failed this request (HTTP 400).",
+    ];
+
+    for (const message of retryableErrors) {
+      assert.equal(isTransientCredentialError(message), true, message);
+    }
+  });
+
+  await runTest("quota classifier covers Kiro generic reached-limit errors", () => {
+    assert.equal(isQuotaOrRateLimitError("You have reached the limit."), true);
+  });
+
+  await runTest("context overflow is not classified as retryable credential failure even with retry-looking phrases", () => {
+    const overflowErrors = [
+      "context_length_exceeded: maximum context length exceeded",
+      "input is too long for the model context window",
+      "maximum context tokens exceeded",
+      "context_length_exceeded: maximum context length exceeded; retry delay 5s; please try again shortly",
+      "Provider returned error 400: context window exceeded after upstream timeout",
+      "maximum context tokens exceeded; please sign in again",
+    ];
+
+    for (const message of overflowErrors) {
+      assert.equal(isRetryableCredentialAuthError(message), false, message);
+      assert.equal(isQuotaOrRateLimitError(message), false, message);
+      assert.equal(isTransientCredentialError(message), false, message);
+    }
   });
 
   await runTest("key error attempt tracking is bounded and preserves cached attempts", async () => {

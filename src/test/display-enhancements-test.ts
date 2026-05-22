@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 
 import { formatModelReferenceForFooter, MODEL_FOOTER_ICON } from "../model-display";
 import {

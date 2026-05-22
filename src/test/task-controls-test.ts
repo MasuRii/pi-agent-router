@@ -12,6 +12,7 @@ import {
   getTaskControlsCacheSnapshot,
   invalidateTaskControlsCache,
   resetTaskControlsCacheState,
+  resolveRetryControlsAsync,
   resolveTaskControls,
   resolveTaskControlsAsync,
 } from "../task/task-controls";
@@ -222,6 +223,76 @@ await runTest("resolveTaskControlsAsync caches hits and refreshes after invalida
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await runTest("resolveRetryControlsAsync follows Pi retry settings defaults and project overrides", async () => {
+  const root = mkdtempSync(join(tmpdir(), "retry-controls-"));
+  const nested = join(root, "workspace", "feature");
+
+  try {
+    mkdirSync(nested, { recursive: true });
+    const globalSettingsPath = join(root, "settings.json");
+    writeFileSync(globalSettingsPath, JSON.stringify({ retry: { enabled: true, maxRetries: 8, baseDelayMs: 2000 } }), "utf-8");
+    writeProjectTaskSettings(root, { retry: { maxRetries: 5 } });
+
+    const { controls, warnings } = await resolveRetryControlsAsync(nested, { globalSettingsPath });
+    assert.deepEqual(controls, { enabled: true, maxRetries: 5, baseDelayMs: 2000 });
+    assert.equal(warnings.length, 0);
+
+    const defaults = await resolveRetryControlsAsync(nested, {
+      globalSettingsPath: join(root, "missing-settings.json"),
+      projectSettingsPath: join(root, "missing-project-settings.json"),
+    });
+    assert.deepEqual(defaults.controls, { enabled: true, maxRetries: 3, baseDelayMs: 2000 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await runTest("resolveRetryControlsAsync falls back and warns for invalid retry number settings", async () => {
+  const cases: Array<{
+    name: string;
+    retry: Record<string, unknown>;
+    expectedControls: { maxRetries: number; baseDelayMs: number };
+    warningIncludes: string[];
+  }> = [
+    {
+      name: "non-number maxRetries",
+      retry: { maxRetries: "8" },
+      expectedControls: { maxRetries: 3, baseDelayMs: 2000 },
+      warningIncludes: ["retry.maxRetries", "finite number"],
+    },
+    {
+      name: "negative maxRetries",
+      retry: { maxRetries: -1 },
+      expectedControls: { maxRetries: 3, baseDelayMs: 2000 },
+      warningIncludes: ["retry.maxRetries", "between 0 and 32"],
+    },
+    {
+      name: "out-of-range baseDelayMs",
+      retry: { baseDelayMs: 999999999 },
+      expectedControls: { maxRetries: 3, baseDelayMs: 2000 },
+      warningIncludes: ["retry.baseDelayMs", "between 0 and 3600000"],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const root = mkdtempSync(join(tmpdir(), `retry-controls-invalid-${testCase.name.replace(/\W+/g, "-")}-`));
+    try {
+      writeProjectTaskSettings(root, { retry: testCase.retry });
+      const { controls, warnings } = await resolveRetryControlsAsync(root, {
+        globalSettingsPath: join(root, "missing-settings.json"),
+      });
+
+      assert.equal(controls.enabled, true);
+      assert.equal(controls.maxRetries, testCase.expectedControls.maxRetries);
+      assert.equal(controls.baseDelayMs, testCase.expectedControls.baseDelayMs);
+      assert.equal(warnings.length, 1);
+      assert.equal(testCase.warningIncludes.every((fragment) => warnings[0]?.includes(fragment)), true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

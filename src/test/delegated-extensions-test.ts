@@ -55,6 +55,26 @@ await runTest("delegated extension directory resolution is cached until invalida
   assert.equal(probeCount, 4);
 });
 
+await runTest("delegated extension directory resolution rejects path-like candidates", async () => {
+  invalidateDelegatedExtensionRuntimeCaches();
+  const extensionsRootDir = join(tmpdir(), "pi-agent-router-delegated-safe-root");
+  const installedExtensionDir = join(extensionsRootDir, "installed-extension");
+  const probedPaths: string[] = [];
+
+  const resolved = await resolveDelegatedExtensionDirectoryAsync(
+    extensionsRootDir,
+    ["../escape", "nested/extension", "C:\\escape", "installed-extension"],
+    async (path: string): Promise<boolean> => {
+      probedPaths.push(path);
+      return path === installedExtensionDir;
+    },
+  );
+
+  assert.equal(resolved, installedExtensionDir);
+  assert.deepEqual(probedPaths, [installedExtensionDir]);
+  invalidateDelegatedExtensionRuntimeCaches();
+});
+
 await runTest("delegated extension metadata reads are cached until invalidated", async () => {
   invalidateDelegatedExtensionRuntimeCaches();
   const extensionDir = mkdtempSync(join(tmpdir(), "pi-agent-router-delegated-metadata-"));

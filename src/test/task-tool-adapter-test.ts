@@ -152,7 +152,7 @@ runTest("renderTaskContextFromText extracts fallback final responses without str
 });
 
 runTest("renderTaskContextFromText prefers validated structured results and bounds oversized context", () => {
-  const oversized = "A".repeat(12_000);
+  const oversized = "A".repeat(40_000);
   const contextText = renderTaskContextFromText([
     {
       reference: "StructuredTask",
@@ -206,6 +206,14 @@ runTest("renderTaskBatchSummary renders task-summary envelope", () => {
         description: "First task",
         agent: "code",
         status: "completed",
+        sessionId: "session-one",
+        exitCode: 0,
+        toolCalls: 2,
+        latestToolCall: "read src/index.ts",
+        toolInvocations: [
+          { name: "read", argumentsPreview: "src/index.ts", count: 1 },
+          { name: "bash", argumentsPreview: "npm run typecheck", count: 1 },
+        ],
         output: "Done",
       },
       {
@@ -220,6 +228,9 @@ runTest("renderTaskBatchSummary renders task-summary envelope", () => {
 
   assert.equal(summary.includes("<task-summary>"), true);
   assert.equal(summary.includes('<task id="TaskOne" agent="code">'), true);
+  assert.equal(summary.includes("<session>session-one</session>"), true);
+  assert.equal(summary.includes('<tool-calls count="2" latest="read src/index.ts">'), true);
+  assert.equal(summary.includes('<tool-call name="bash" count="1" arguments="npm run typecheck" />'), true);
   assert.equal(summary.includes("Missing file"), true);
 });
 

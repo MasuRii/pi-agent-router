@@ -4,6 +4,7 @@ import {
   sanitizeStructuredSubagentResultForHandoff,
   sanitizeSubagentFinalResponseForHandoff,
   sanitizeSubagentResultForDisplay,
+  sanitizeSubagentResultForHandoff,
   stripSubagentThinkingContent,
 } from "../output-sanitizer";
 
@@ -72,6 +73,21 @@ runTest("sanitizeSubagentResultForDisplay preserves unsupported JSON payloads", 
 
 runTest("sanitizeSubagentResultForDisplay preserves plain output without thinking markers", () => {
   assert.equal(sanitizeSubagentResultForDisplay("Completed successfully."), "Completed successfully.");
+});
+
+runTest("sanitizeSubagentResultForHandoff preserves explicit reasoning context", () => {
+  const rawText = [
+    "<task_result>",
+    "## Summary",
+    "Done.",
+    "<analysis>Chose the safer migration because the old API is still referenced.</analysis>",
+    "reasoning: Retained this final-response rationale for orchestration handoff.",
+    "</task_result>",
+  ].join("\n");
+
+  const handoff = sanitizeSubagentResultForHandoff(rawText);
+  assert.equal(handoff.includes("Chose the safer migration"), true);
+  assert.equal(handoff.includes("reasoning: Retained this final-response rationale"), true);
 });
 
 runTest("sanitizeSubagentFinalResponseForHandoff removes streamed tool transcript prefixes", () => {

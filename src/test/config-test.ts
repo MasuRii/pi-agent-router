@@ -24,6 +24,10 @@ await runTest("loadPiAgentRouterConfig creates default config when absent", () =
 
     const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as unknown;
     assert.deepEqual(persisted, DEFAULT_PI_AGENT_ROUTER_CONFIG);
+    assert.deepEqual(result.config.delegatedExtensions, [
+      { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
+      { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -74,6 +78,70 @@ await runTest("loadPiAgentRouterConfig warns and preserves default concurrency f
   }
 });
 
+await runTest("loadPiAgentRouterConfig normalizes agent discovery markdown size cap", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
+  const configPath = join(root, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ agentDiscovery: { maxMarkdownBytes: 1024 } }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const result = loadPiAgentRouterConfig(configPath);
+    assert.equal(result.warning, undefined);
+    assert.equal(result.config.agentDiscovery.maxMarkdownBytes, 1024);
+
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ agentDiscovery: { maxMarkdownBytes: 0 } }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const invalidResult = loadPiAgentRouterConfig(configPath);
+    assert.equal(
+      invalidResult.config.agentDiscovery.maxMarkdownBytes,
+      DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.maxMarkdownBytes,
+    );
+    assert.match(invalidResult.warning || "", /agentDiscovery\.maxMarkdownBytes/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await runTest("loadPiAgentRouterConfig normalizes subagent widget icon mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
+  const configPath = join(root, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ subagentWidgetIconMode: " NERD " }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const result = loadPiAgentRouterConfig(configPath);
+    assert.equal(result.config.subagentWidgetIconMode, "nerd");
+    assert.equal(result.warning, undefined);
+
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ subagentWidgetIconMode: "emoji" }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const invalidResult = loadPiAgentRouterConfig(configPath);
+    assert.equal(
+      invalidResult.config.subagentWidgetIconMode,
+      DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode,
+    );
+    assert.match(invalidResult.warning || "", /subagentWidgetIconMode/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 await runTest("loadPiAgentRouterConfig accepts unified delegated extension entries", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
   const configPath = join(root, "config.json");
@@ -115,6 +183,32 @@ await runTest("loadPiAgentRouterConfig accepts unified delegated extension entri
   }
 });
 
+await runTest("loadPiAgentRouterConfig rejects unsafe delegated extension candidates", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
+  const configPath = join(root, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        delegatedExtensions: [
+          "../escape",
+          ["pi-fast-mode", "nested/extension"],
+        ],
+      }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const result = loadPiAgentRouterConfig(configPath);
+    assert.deepEqual(result.config.delegatedExtensions, [
+      { candidates: ["pi-fast-mode"], skipWhen: [], optional: false },
+    ]);
+    assert.match(result.warning || "", /safe delegated extension names/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 await runTest("loadPiAgentRouterConfig converts legacy delegated extension config", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
   const configPath = join(root, "config.json");
@@ -138,6 +232,29 @@ await runTest("loadPiAgentRouterConfig converts legacy delegated extension confi
       { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
       { candidates: ["pi-multi-auth"], skipWhen: ["directEnvAuthAvailable"], optional: true },
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await runTest("loadPiAgentRouterConfig makes custom direct-env credential fallback explicit", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
+  const configPath = join(root, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        directEnvDelegationProviderIds: ["custom-provider"],
+        providerCredentialFallbackPolicies: {},
+      }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const result = loadPiAgentRouterConfig(configPath);
+    assert.equal(result.config.providerCredentialFallbackPolicies["custom-provider"], "parent-env");
+    assert.match(result.warning || "", /providerCredentialFallbackPolicies\.custom-provider/);
+    assert.match(result.warning || "", /parent-env/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

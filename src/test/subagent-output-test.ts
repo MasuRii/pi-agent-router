@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 
 import {
   appendBoundedOutputSection,
@@ -13,6 +14,7 @@ import {
   summarizeSubagentToolInvocations,
 } from "../subagent/subagent-output";
 import {
+  SUBAGENT_SESSIONS_DIR,
   SUBAGENT_TOOL_ARGUMENT_PREVIEW_MAX_CHARS,
 } from "../constants";
 import { createSubagentJsonEventState } from "../subagent/subagent-usage";
@@ -51,6 +53,74 @@ runTest("processSubagentJsonEventLine accepts assistant messages with string con
   assert.equal(state.usage.input, 12);
   assert.equal(state.usage.output, 34);
   assert.equal(getSubagentLiveOutputFromMessages(state.messages), "Visible answer");
+});
+
+runTest("processSubagentJsonEventLine rejects unsafe session event identifiers", () => {
+  const state = createSubagentJsonEventState({
+    sessionDir: join(SUBAGENT_SESSIONS_DIR, "--subagent-output-safe-events--"),
+  });
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "session",
+      id: "../escape",
+      timestamp: "2026-02-23T10:12:35.420Z",
+      cwd: "/tmp",
+    }),
+    state,
+  );
+
+  assert.equal(state.sessionPath, undefined);
+  assert.equal(state.malformedEventCount, 1);
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "session",
+      id: "session-1",
+      timestamp: "2026-02-23T10:12:35.420Z",
+      cwd: "/tmp",
+    }),
+    state,
+  );
+
+  assert.equal(state.malformedEventCount, 1);
+  assert.equal(state.sessionPath?.endsWith("2026-02-23T10-12-35-420Z_session-1.jsonl"), true);
+});
+
+runTest("processSubagentJsonEventLine tracks overflow compaction recovery", () => {
+  const state = createSubagentJsonEventState();
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "compaction_end",
+      reason: "overflow",
+      result: {
+        summary: "Compacted history",
+        firstKeptEntryId: "kept-entry",
+        tokensBefore: 120000,
+      },
+      aborted: false,
+      willRetry: true,
+    }),
+    state,
+  );
+
+  processSubagentJsonEventLine(
+    JSON.stringify({
+      type: "compaction_end",
+      reason: "threshold",
+      result: {
+        summary: "Compacted history",
+        firstKeptEntryId: "kept-entry",
+        tokensBefore: 120000,
+      },
+      aborted: false,
+      willRetry: false,
+    }),
+    state,
+  );
+
+  assert.equal(state.overflowCompactionRecoveryCount, 1);
 });
 
 runTest("getSubagentLiveOutputFromMessages preserves string assistant content and tool results", () => {

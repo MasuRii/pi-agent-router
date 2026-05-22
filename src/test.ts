@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import {
@@ -18,15 +17,30 @@ import {
   SUBAGENT_OUTPUT_ANALYSIS_RAW_CACHE_KEY_MAX_CHARS,
 } from "./text-formatting";
 import { DEFAULT_PI_AGENT_ROUTER_CONFIG } from "./config";
+import { shouldInvalidateRouterReloadCaches } from "./router-reload-handler";
 import {
   SESSIONS_DIR,
   SUBAGENT_STDOUT_CAPTURE_MAX_CHARS,
   SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS,
 } from "./constants";
+import {
+  buildDelegatedAgentColorFallbackMap,
+  resolveDelegatedAgentColor,
+} from "./agent/delegated-agent-presentation";
+import {
+  resolveDelegatedThinkingLevel,
+  shouldForceDelegatedThinkingOff,
+} from "./agent/thinking-policy";
+import {
+  logTaskPartialUpdateRenderFailure,
+  TASK_PARTIAL_UPDATE_RENDER_FAILED_EVENT,
+} from "./task/task-partial-update-logging";
+import type { Agent } from "./types";
 import { parseModelReference } from "./model-resolution";
 import { parseDelegatedExtensionRuntimeMetadata } from "./subagent/delegated-extensions";
 import { formatDuration } from "./subagent/subagent-execution";
 import { buildSessionPathFromHeader, encodeSessionDirectoryForCwd } from "./subagent/session-paths";
+import { createDelegatedSubagentBaseArgs } from "./subagent/subagent-launch-command";
 import { appendToBoundedTextCapture, createBoundedTextCapture } from "./subagent/subagent-usage";
 
 function runTest(name: string, testFn: () => void): void {
@@ -78,6 +92,87 @@ runTest("parseModelReference enforces provider/modelId format", () => {
   assert.equal(parseModelReference("/gpt-4.1"), undefined);
   assert.equal(parseModelReference("openai/"), undefined);
   assert.equal(parseModelReference("gpt-4.1"), undefined);
+});
+
+runTest("delegated thinking is forced off for Xiaomi Anthropic-compatible providers", () => {
+  const agent = { thinkingLevel: "xhigh" } as Agent;
+  const xiaomiAnthropicModel = { provider: "xiaomi", api: "anthropic-messages" } as never;
+  const xiaomiRegionalAnthropicModel = { provider: "xiaomi-cn", api: "anthropic-messages" } as never;
+
+  assert.equal(shouldForceDelegatedThinkingOff(xiaomiAnthropicModel), true);
+  assert.equal(shouldForceDelegatedThinkingOff(xiaomiRegionalAnthropicModel), true);
+  assert.equal(resolveDelegatedThinkingLevel(agent, xiaomiAnthropicModel), "off");
+  assert.equal(resolveDelegatedThinkingLevel(agent, xiaomiRegionalAnthropicModel), "off");
+});
+
+runTest("delegated thinking follows agent config for non-Xiaomi providers", () => {
+  const agent = { thinkingLevel: "high" } as Agent;
+  const anthropicModel = { provider: "anthropic", api: "anthropic-messages" } as never;
+  const xiaomiOpenAiModel = { provider: "xiaomi", api: "openai-completions" } as never;
+
+  assert.equal(shouldForceDelegatedThinkingOff(anthropicModel), false);
+  assert.equal(shouldForceDelegatedThinkingOff(xiaomiOpenAiModel), false);
+  assert.equal(shouldForceDelegatedThinkingOff(undefined), false);
+  assert.equal(resolveDelegatedThinkingLevel(agent, anthropicModel), "high");
+  assert.equal(resolveDelegatedThinkingLevel(agent, xiaomiOpenAiModel), "high");
+});
+
+runTest("delegated agent color resolution prefers configured, user fallback, then built-in colors", () => {
+  const fallbackUserAgentColors = buildDelegatedAgentColorFallbackMap([
+    { name: "custom", color: "#123456" },
+    { name: "empty", color: "" },
+  ] as Agent[]);
+
+  assert.equal(
+    resolveDelegatedAgentColor({
+      agentName: "custom",
+      agent: { color: " #abcdef " } as Agent,
+      fallbackUserAgentColors,
+    }),
+    "#abcdef",
+  );
+  assert.equal(
+    resolveDelegatedAgentColor({
+      agentName: "custom",
+      agent: undefined,
+      fallbackUserAgentColors,
+    }),
+    "#123456",
+  );
+  assert.equal(
+    resolveDelegatedAgentColor({
+      agentName: "architect",
+      agent: undefined,
+      fallbackUserAgentColors,
+    }),
+    "#50E3C2",
+  );
+  assert.equal(
+    resolveDelegatedAgentColor({
+      agentName: "unknown",
+      agent: undefined,
+      fallbackUserAgentColors,
+    }),
+    undefined,
+  );
+});
+
+runTest("partial update render failures are routed to debug logging metadata", () => {
+  let loggedEvent: string | undefined;
+  let loggedPayload: Record<string, unknown> | undefined;
+
+  logTaskPartialUpdateRenderFailure(
+    {
+      warn(event, payload) {
+        loggedEvent = event;
+        loggedPayload = payload;
+      },
+    },
+    new Error("render callback failed"),
+  );
+
+  assert.equal(loggedEvent, TASK_PARTIAL_UPDATE_RENDER_FAILED_EVENT);
+  assert.deepEqual(loggedPayload, { message: "render callback failed" });
 });
 
 runTest("formatDuration uses human-friendly units", () => {
@@ -169,10 +264,11 @@ runTest("subagent output analysis cache keys do not retain oversized raw output"
   assert.deepEqual(firstAnalysis.commands, ["read src/index.ts"]);
 });
 
-runTest("delegated subagents do not load local extensions by default", () => {
-  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  assert.equal(routerSource.includes("routerConfig.delegatedExtensions"), true);
-  assert.deepEqual(DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions, []);
+runTest("default delegated extension config requires security companions", () => {
+  assert.deepEqual(DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions, [
+    { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
+    { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
+  ]);
 });
 
 runTest("delegated extension metadata declares generic runtime skip rules", () => {
@@ -189,19 +285,24 @@ runTest("delegated extension metadata declares generic runtime skip rules", () =
 });
 
 runTest("delegated subagents disable automatic extension discovery before applying the curated extension set", () => {
-  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  assert.equal(routerSource.includes('"--no-extensions"'), true);
+  const args = createDelegatedSubagentBaseArgs({
+    sessionDir: "/tmp/pi-agent-router-sessions",
+  });
+
+  assert.deepEqual(args.slice(0, 6), [
+    "--mode",
+    "json",
+    "-p",
+    "--no-extensions",
+    "--session-dir",
+    "/tmp/pi-agent-router-sessions",
+  ]);
 });
 
-runTest("resource reload is wired to the shared router cache invalidator", () => {
-  const routerSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  const reloadSource = readFileSync(new URL("./router-reload.ts", import.meta.url), "utf8");
-  assert.equal(routerSource.includes('pi.on("resources_discover"'), true);
-  assert.equal(routerSource.includes("invalidateRouterReloadCaches();"), true);
-  assert.equal(reloadSource.includes("invalidateAgentDiscoveryCaches();"), true);
-  assert.equal(reloadSource.includes("invalidateTaskControlsCache();"), true);
-  assert.equal(reloadSource.includes("resetProviderEnvKeyCacheState();"), true);
-  assert.equal(reloadSource.includes("invalidateDelegatedExtensionRuntimeCaches();"), true);
+runTest("resource reload predicate only invalidates shared caches for reload events", () => {
+  assert.equal(shouldInvalidateRouterReloadCaches({ reason: "reload" }), true);
+  assert.equal(shouldInvalidateRouterReloadCaches({ reason: "startup" }), false);
+  assert.equal(shouldInvalidateRouterReloadCaches(undefined), false);
 });
 
 runTest("windows command-shell invocation truncates multiline args while direct invocation preserves them", () => {
