@@ -13,21 +13,46 @@ import {
 
 type PiAgentRouterDebugLogLevel = "info" | "warn";
 
+const SENSITIVE_KEY_PATTERN = /api[_-]?key|authorization|access|refresh|id[_-]?token|token|secret|password|client[_-]?secret|credential|code[_-]?verifier|verifier|state|^code$|key$/i;
+const TOKEN_QUERY_PARAM = /([?&](?:access_token|refresh_token|id_token|token|api_key|apikey|client_secret|code|state|code_verifier|verifier)=)[^&#\s]+/gi;
+const AUTHORIZATION_VALUE = /\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+/gi;
+const BEARER_VALUE = /\bbearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const JWT_LIKE_VALUE = /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}\b/g;
+const TOKEN_ASSIGNMENT = /\b((?:access|refresh|id)[_-]?token|api[_-]?key|apikey|client[_-]?secret|token|code[_-]?verifier|verifier|state|code)\s*[:=]\s*["']?[^"'\s&,;]+/gi;
+
 export interface PiAgentRouterDebugLoggerOptions {
   configPath?: string;
   debugDir?: string;
   logPath?: string;
 }
 
+function redactSensitiveString(value: string): string {
+  return value
+    .replace(TOKEN_QUERY_PARAM, "$1[REDACTED]")
+    .replace(AUTHORIZATION_VALUE, "$1[REDACTED]")
+    .replace(BEARER_VALUE, "Bearer [REDACTED]")
+    .replace(TOKEN_ASSIGNMENT, "$1=[REDACTED]")
+    .replace(JWT_LIKE_VALUE, "[REDACTED]");
+}
+
 function safeJsonStringify(value: unknown): string {
   const seen = new WeakSet<object>();
-  return JSON.stringify(value, (_key, currentValue) => {
+  return JSON.stringify(value, (key, currentValue) => {
+    if (key !== "" && SENSITIVE_KEY_PATTERN.test(key)) {
+      return "[REDACTED]";
+    }
+
     if (currentValue instanceof Error) {
       return {
         name: currentValue.name,
-        message: currentValue.message,
-        stack: currentValue.stack,
+        message: redactSensitiveString(currentValue.message),
+        stack: currentValue.stack ? redactSensitiveString(currentValue.stack) : undefined,
+        cause: currentValue.cause,
       };
+    }
+
+    if (typeof currentValue === "string") {
+      return redactSensitiveString(currentValue);
     }
 
     if (typeof currentValue === "bigint") {
@@ -62,6 +87,14 @@ export class PiAgentRouterDebugLogger {
           extension: PI_AGENT_ROUTER_EXTENSION_ID,
           event: "debug_log_overflow",
           droppedEntries,
+        })}\n`,
+      createDroppedWriteFailuresLine: (metadata) =>
+        `${safeJsonStringify({
+          timestamp: new Date().toISOString(),
+          level: "warn",
+          extension: PI_AGENT_ROUTER_EXTENSION_ID,
+          event: "debug_log_write_failures_dropped",
+          ...metadata,
         })}\n`,
     });
   }
@@ -108,6 +141,10 @@ export class PiAgentRouterDebugLogger {
 
   flush(): Promise<void> {
     return this.writer.flush();
+  }
+
+  dispose(): Promise<void> {
+    return this.writer.dispose();
   }
 }
 

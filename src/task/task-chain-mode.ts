@@ -6,7 +6,7 @@ import type { TaskContextFromSource } from "./task-tool-adapter";
 export type TaskExecutionMode = "parallel" | "chain";
 
 const DEFAULT_TASK_EXECUTION_MODE: TaskExecutionMode = "parallel";
-const CHAIN_PREVIOUS_OUTPUT_MAX_CHARS = 8_000;
+const CHAIN_PREVIOUS_OUTPUT_MAX_CHARS = 32_000;
 const PREVIOUS_PLACEHOLDER_TOKEN = "{previous}";
 
 export type ChainTaskReference = {

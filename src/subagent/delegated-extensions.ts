@@ -1,14 +1,13 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
-import type {
-  DelegatedExtensionConfigEntry,
-  DelegatedExtensionSkipCondition,
+import {
+  isSafeDelegatedExtensionCandidateName,
+  VALID_DELEGATED_EXTENSION_SKIP_CONDITIONS,
+  type DelegatedExtensionConfigEntry,
+  type DelegatedExtensionSkipCondition,
 } from "../config";
 import { asRecord } from "../record-utils";
-
-const VALID_DELEGATED_EXTENSION_SKIP_CONDITIONS: ReadonlySet<DelegatedExtensionSkipCondition> =
-  new Set(["directEnvAuthAvailable"]);
 
 const REQUIRED_SECURITY_DELEGATED_EXTENSION_NAMES: ReadonlySet<string> = new Set([
   "pi-permission-system",
@@ -18,6 +17,11 @@ const REQUIRED_SECURITY_DELEGATED_EXTENSION_NAMES: ReadonlySet<string> = new Set
 
 const directoryResolutionCache = new Map<string, Promise<string | undefined>>();
 const runtimeMetadataCache = new Map<string, Promise<DelegatedExtensionMetadataParseResult>>();
+
+function isPathInsideDirectory(parentDir: string, candidatePath: string): boolean {
+  const relativePath = relative(parentDir, candidatePath);
+  return Boolean(relativePath) && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
 
 export interface DelegatedExtensionRuntimeMetadata {
   skipWhen: DelegatedExtensionSkipCondition[];
@@ -142,8 +146,17 @@ export async function resolveDelegatedExtensionDirectoryAsync(
   }
 
   const resolutionPromise = (async () => {
+    const resolvedExtensionsRootDir = resolve(extensionsRootDir);
     for (const extensionName of extensionCandidates) {
-      const extensionDir = join(extensionsRootDir, extensionName);
+      if (!isSafeDelegatedExtensionCandidateName(extensionName)) {
+        continue;
+      }
+
+      const extensionDir = resolve(resolvedExtensionsRootDir, extensionName);
+      if (!isPathInsideDirectory(resolvedExtensionsRootDir, extensionDir)) {
+        continue;
+      }
+
       if (await isDirectoryAsync(extensionDir)) {
         return extensionDir;
       }

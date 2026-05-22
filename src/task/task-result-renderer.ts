@@ -1,4 +1,4 @@
-import { Container, Text } from "@mariozechner/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 
 import { formatDuration } from "../subagent/subagent-execution";
 import {
@@ -105,7 +105,11 @@ function buildFooterLine(
     compactSegments.push(`${MODEL_FOOTER_ICON} ${modelLabel}`);
   }
 
-  const thinkingDisplay = formatThinkingLevelForDisplay(details.thinkingLevel, details.model);
+  const thinkingDisplay = formatThinkingLevelForDisplay(
+    details.thinkingLevel,
+    details.model,
+    details.thinkingLevelMap,
+  );
   if (thinkingDisplay) {
     compactSegments.push(` ${thinkingDisplay}`);
   }

@@ -63,6 +63,93 @@ export function parseRetryAfterCooldownMs(message: string): number | undefined {
   return Number.isFinite(cooldownMs) && cooldownMs > 0 ? cooldownMs : undefined;
 }
 
+export type ProviderRetryDelayHint = {
+  delayMs: number;
+  source: "retry-after-ms" | "retry-after";
+  rawValue: string;
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findRetryHeaderValue(message: string, headerName: string): string | undefined {
+  const pattern = new RegExp(
+    `(?:^|[\\s,{;])["']?${escapeRegExp(headerName)}["']?\\s*[:=]\\s*(["']?)([^\\n\\r]+)`,
+    "i",
+  );
+  const match = pattern.exec(message);
+  if (!match) {
+    return undefined;
+  }
+
+  const quote = match[1] || "";
+  let value = (match[2] || "").trim();
+  if (quote) {
+    const quoteEnd = value.indexOf(quote);
+    if (quoteEnd >= 0) {
+      value = value.slice(0, quoteEnd);
+    }
+  }
+
+  value = value.replace(/[;,}\]]\s*$/, "").trim();
+  return value || undefined;
+}
+
+function parsePositiveNumber(value: string): number | undefined {
+  const numericMatch = /^\s*(\d+(?:\.\d+)?)/.exec(value);
+  if (!numericMatch) {
+    return undefined;
+  }
+
+  const parsed = Number.parseFloat(numericMatch[1] || "");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+export function parseProviderRetryDelayHint(
+  message: string,
+  nowMs: number = Date.now(),
+): ProviderRetryDelayHint | undefined {
+  const normalizedMessage = message.trim();
+  if (!normalizedMessage) {
+    return undefined;
+  }
+
+  const retryAfterMsValue = findRetryHeaderValue(normalizedMessage, "retry-after-ms");
+  if (retryAfterMsValue) {
+    const retryAfterMs = parsePositiveNumber(retryAfterMsValue);
+    if (retryAfterMs !== undefined) {
+      const delayMs = Math.ceil(retryAfterMs);
+      return delayMs > 0
+        ? { delayMs, source: "retry-after-ms", rawValue: retryAfterMsValue }
+        : undefined;
+    }
+  }
+
+  const retryAfterValue = findRetryHeaderValue(normalizedMessage, "retry-after");
+  if (!retryAfterValue) {
+    return undefined;
+  }
+
+  const retryAfterSeconds = parsePositiveNumber(retryAfterValue);
+  if (retryAfterSeconds !== undefined) {
+    const delayMs = Math.ceil(retryAfterSeconds * 1_000);
+    return delayMs > 0
+      ? { delayMs, source: "retry-after", rawValue: retryAfterValue }
+      : undefined;
+  }
+
+  const retryAfterDateMs = Date.parse(retryAfterValue);
+  if (!Number.isFinite(retryAfterDateMs)) {
+    return undefined;
+  }
+
+  const delayMs = Math.ceil(retryAfterDateMs - nowMs);
+  return delayMs > 0
+    ? { delayMs, source: "retry-after", rawValue: retryAfterValue }
+    : undefined;
+}
+
 export function computeExponentialBackoffMs(
   baseMs: number,
   attempt: number,

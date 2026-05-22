@@ -1,4 +1,4 @@
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 
 import { normalizeInputText } from "../input-normalization";
 import { asRecord } from "../record-utils";

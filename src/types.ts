@@ -6,12 +6,13 @@
  */
 
 // External type imports for type-only references
-import type { Message, Model, Api, AssistantMessageEventStream, Context as LlmContext, SimpleStreamOptions } from "@mariozechner/pi-ai";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { Message, Model, Api, AssistantMessageEventStream, Context as LlmContext, SimpleStreamOptions, ThinkingLevelMap } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ChildProcess } from "node:child_process";
 
 export type AgentMode = "primary" | "subagent" | "all";
 export type AgentThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type AgentThinkingLevelMap = ThinkingLevelMap;
 export type AgentScope = "user" | "project" | "both";
 
 export type Agent = {
@@ -92,6 +93,7 @@ export type SubagentRunResult = {
   messages?: Message[];
   usage?: SubagentUsage;
   malformedEventCount?: number;
+  overflowCompactionRecoveryCount?: number;
   outputText?: string;
   finalResponseText?: string;
   toolInvocations?: SubagentToolInvocation[];
@@ -120,6 +122,7 @@ export type SubagentExecutionDetails = {
   agentColor?: string;
   model?: string;
   thinkingLevel?: string;
+  thinkingLevelMap?: AgentThinkingLevelMap;
   duration?: number;
   status: SubagentExecutionStatus;
   attached?: boolean;
@@ -149,6 +152,7 @@ export type SubagentExecutionDetails = {
     taskDescription?: string;
     model?: string;
     thinkingLevel?: string;
+    thinkingLevelMap?: AgentThinkingLevelMap;
     duration?: number;
     status: SubagentExecutionStatus;
     sessionId?: string;
@@ -157,6 +161,7 @@ export type SubagentExecutionDetails = {
     usage?: SubagentUsage;
     toolCalls?: number;
     latestToolCall?: string;
+    toolInvocations?: SubagentToolInvocation[];
     output?: string;
     error?: string;
     resultSummary?: string;
@@ -185,6 +190,7 @@ export type SubagentJsonEventState = {
   outputTextMaxChars: number;
   usage: SubagentUsage;
   malformedEventCount: number;
+  overflowCompactionRecoveryCount: number;
   latestToolCall?: string;
   committedLatestToolCall?: string;
   liveLatestToolCall?: string;
@@ -205,6 +211,9 @@ export type SubagentSession = {
   delegatedBy: string;
   agent: string;
   agentColor?: string;
+  model?: string;
+  thinkingLevel?: string;
+  thinkingLevelMap?: AgentThinkingLevelMap;
   task: string;
   cwd: string;
   status: SubagentExecutionStatus;

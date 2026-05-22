@@ -1,56 +1,53 @@
-import type { Api } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 
-const OPENAI_RESPONSES_APIS = new Set<Api>([
-  "openai-responses",
+const OPENAI_COMPATIBLE_TEMPERATURE_RESTRICTED_APIS = new Set<string>([
   "azure-openai-responses",
-]);
-const TEMPERATURE_UNSUPPORTED_APIS = new Set<Api>([
   "openai-codex-responses",
-]);
-const TEMPERATURE_UNSUPPORTED_PROVIDERS = new Set<string>([
-  "openai-codex",
+  "openai-completions",
+  "openai-responses",
 ]);
 
-function normalizeIdentifier(value: string | undefined): string {
-  return (value ?? "").trim().toLowerCase();
+function getModelId(model: Model<Api>): string {
+  const id = typeof model.id === "string" ? model.id : "";
+  const tail = id.includes("/") ? id.split("/").pop() : id;
+  return (tail || id).toLowerCase();
 }
 
-function hasModelToken(modelId: string | undefined, token: string): boolean {
-  return normalizeIdentifier(modelId).split(/[^a-z0-9]+/).includes(token);
+function getModelReference(model: Model<Api>): string {
+  const provider = typeof model.provider === "string" ? model.provider : "unknown";
+  const id = typeof model.id === "string" ? model.id : "unknown";
+  return `${provider}/${id}`;
 }
 
-type TemperatureCapabilityModel = {
-  api: Api;
-  id?: string;
-  provider?: string;
-  reasoning?: boolean;
-};
+function isOpenAIReasoningModel(model: Model<Api>): boolean {
+  if (!OPENAI_COMPATIBLE_TEMPERATURE_RESTRICTED_APIS.has(String(model.api))) {
+    return false;
+  }
+
+  const id = getModelId(model);
+
+  if (id.startsWith("gpt-5-chat")) {
+    return false;
+  }
+
+  return Boolean(
+    model.reasoning ||
+      /^o\d(?:$|[-.])/.test(id) ||
+      /^gpt-5(?:$|[-.])/.test(id) ||
+      /(?:^|[-.])codex(?:$|[-.])/.test(id),
+  );
+}
 
 export function getRuntimeTemperatureUnsupportedReason(
-  model: TemperatureCapabilityModel,
+  model: Model<Api>,
 ): string | undefined {
-  if (TEMPERATURE_UNSUPPORTED_APIS.has(model.api)) {
-    return `api '${model.api}' does not support runtime temperature`;
-  }
-
-  const provider = normalizeIdentifier(model.provider);
-  if (TEMPERATURE_UNSUPPORTED_PROVIDERS.has(provider)) {
-    return `provider '${model.provider}' does not support runtime temperature`;
-  }
-
-  if (OPENAI_RESPONSES_APIS.has(model.api) && hasModelToken(model.id, "codex")) {
-    return `model '${model.id}' does not support runtime temperature`;
-  }
-
-  if (OPENAI_RESPONSES_APIS.has(model.api) && model.reasoning) {
-    return `reasoning model '${model.id}' accepts only the provider default temperature`;
+  if (isOpenAIReasoningModel(model)) {
+    return `model '${getModelReference(model)}' uses OpenAI-compatible reasoning controls, which reject runtime temperature options`;
   }
 
   return undefined;
 }
 
-export function supportsRuntimeTemperatureOption(
-  model: TemperatureCapabilityModel,
-): boolean {
-  return getRuntimeTemperatureUnsupportedReason(model) === undefined;
+export function supportsRuntimeTemperatureOption(model: Model<Api>): boolean {
+  return !getRuntimeTemperatureUnsupportedReason(model);
 }

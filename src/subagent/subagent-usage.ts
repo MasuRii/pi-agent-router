@@ -67,6 +67,7 @@ export function createSubagentJsonEventState(options: {
     ),
     usage: createEmptySubagentUsage(),
     malformedEventCount: 0,
+    overflowCompactionRecoveryCount: 0,
     latestToolCall: undefined,
     committedLatestToolCall: undefined,
     liveLatestToolCall: undefined,

@@ -59,7 +59,11 @@ export function stripSubagentThinkingContent(rawText: string): string {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-export function extractHumanReadableSubagentOutput(value: unknown, depth = 0): string | undefined {
+function extractHumanReadableSubagentOutputInternal(
+  value: unknown,
+  options: { stripReasoningContent: boolean },
+  depth = 0,
+): string | undefined {
   if (depth > MAX_EXTRACTION_DEPTH) {
     return undefined;
   }
@@ -68,10 +72,12 @@ export function extractHumanReadableSubagentOutput(value: unknown, depth = 0): s
     const normalized = unwrapTaskResultEnvelope(value);
     const parsed = parseJsonObjectString(normalized);
     if (parsed) {
-      return extractHumanReadableSubagentOutput(parsed, depth + 1);
+      return extractHumanReadableSubagentOutputInternal(parsed, options, depth + 1);
     }
 
-    return stripSubagentThinkingContent(normalized);
+    return options.stripReasoningContent
+      ? stripSubagentThinkingContent(normalized)
+      : normalized.trim();
   }
 
   const record = asRecord(value);
@@ -84,7 +90,7 @@ export function extractHumanReadableSubagentOutput(value: unknown, depth = 0): s
       continue;
     }
 
-    const extracted = extractHumanReadableSubagentOutput(record[key], depth + 1);
+    const extracted = extractHumanReadableSubagentOutputInternal(record[key], options, depth + 1);
     if (extracted !== undefined) {
       return extracted;
     }
@@ -95,13 +101,29 @@ export function extractHumanReadableSubagentOutput(value: unknown, depth = 0): s
       continue;
     }
 
-    const extracted = extractHumanReadableSubagentOutput(record[key], depth + 1);
+    const extracted = extractHumanReadableSubagentOutputInternal(record[key], options, depth + 1);
     if (extracted !== undefined) {
       return extracted;
     }
   }
 
   return undefined;
+}
+
+export function extractHumanReadableSubagentOutput(value: unknown, depth = 0): string | undefined {
+  return extractHumanReadableSubagentOutputInternal(
+    value,
+    { stripReasoningContent: true },
+    depth,
+  );
+}
+
+export function extractHumanReadableSubagentOutputForHandoff(value: unknown, depth = 0): string | undefined {
+  return extractHumanReadableSubagentOutputInternal(
+    value,
+    { stripReasoningContent: false },
+    depth,
+  );
 }
 
 export function sanitizeSubagentResultForDisplay(rawText: string): string {
@@ -116,6 +138,20 @@ export function sanitizeSubagentResultForDisplay(rawText: string): string {
   }
 
   return stripSubagentThinkingContent(unwrapTaskResultEnvelope(text));
+}
+
+export function sanitizeSubagentResultForHandoff(rawText: string): string {
+  if (!rawText.trim()) {
+    return "";
+  }
+
+  const text = rawText.replace(/\r\n/g, "\n").trim();
+  const extracted = extractHumanReadableSubagentOutputForHandoff(text);
+  if (extracted !== undefined) {
+    return extracted;
+  }
+
+  return unwrapTaskResultEnvelope(text);
 }
 
 function trimEmptyBoundaryLines(lines: readonly string[]): string[] {
@@ -164,7 +200,7 @@ function sanitizeStructuredStringForHandoff(value: string): string {
     }
   }
 
-  const sanitized = sanitizeSubagentResultForDisplay(value);
+  const sanitized = sanitizeSubagentResultForHandoff(value);
   if (!sanitized) {
     return "";
   }
@@ -270,7 +306,7 @@ export function sanitizeSubagentFinalResponseForHandoff(
   rawText: string,
   options: FinalResponseHandoffSanitizerOptions = {},
 ): string {
-  const sanitized = sanitizeSubagentResultForDisplay(rawText);
+  const sanitized = sanitizeSubagentResultForHandoff(rawText);
   if (!sanitized) {
     return "";
   }

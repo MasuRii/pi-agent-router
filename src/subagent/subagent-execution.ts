@@ -10,6 +10,8 @@ import type {
   SubagentExecutionDetails,
   SubagentSession,
   SubagentRunResult,
+  SubagentToolInvocation,
+  AgentThinkingLevelMap,
 } from "../types";
 import {
   DEFAULT_AGENT,
@@ -22,6 +24,7 @@ import {
   extractTaskDescriptionFromDelegatedPrompt,
   truncatePreview,
 } from "../text-formatting";
+import type { ProviderRetryDelayHint } from "./credential-backoff";
 
 function asFiniteNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -109,38 +112,16 @@ export function resolveSubagentTimeoutMs(timeoutMs: unknown): number {
   return Math.max(SUBAGENT_MIN_TIMEOUT_MS, Math.trunc(timeoutMs));
 }
 
-export async function mapWithConcurrencyLimit<TIn, TOut>(
-  items: readonly TIn[],
-  concurrency: number,
-  fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-  if (items.length === 0) {
-    return [];
-  }
-
-  const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = Array.from({ length: items.length });
-  let nextIndex = 0;
-
-  const workers = Array.from({ length: limit }, async () => {
-    while (true) {
-      const current = nextIndex;
-      nextIndex += 1;
-      if (current >= items.length) {
-        return;
-      }
-
-      results[current] = await fn(items[current], current);
-    }
-  });
-
-  await Promise.all(workers);
-  return results;
-}
-
 type RetryableCredentialFailure = {
   kind: "quota" | "credential_auth" | "transient";
   message: string;
+  retryAfter?: ProviderRetryDelayHint;
+};
+
+export type SubagentAutoRetrySettings = {
+  enabled: boolean;
+  maxRetries: number;
+  baseDelayMs: number;
 };
 
 type SubagentProcessLifecycleRetryEvent = {
@@ -149,7 +130,24 @@ type SubagentProcessLifecycleRetryEvent = {
   delayMs: number;
   maxAttempts: number;
   message: string;
+  reason: string;
   sessionId: string;
+  defaultDelayMs: number;
+  usedProviderRetryDelay: boolean;
+  providerRetryDelayMs?: number;
+  providerRetryDelaySource?: ProviderRetryDelayHint["source"];
+  providerRetryDelayCapped?: boolean;
+};
+
+type SubagentProcessLifecycleRetryExhaustedEvent = {
+  kind: "quota" | "credential_auth" | "transient";
+  attempts: number;
+  maxAttempts: number;
+  message: string;
+  reason: string;
+  sessionId: string;
+  providerRetryDelayMs?: number;
+  providerRetryDelaySource?: ProviderRetryDelayHint["source"];
 };
 
 type CreateSubagentProcessLifecycleOptions = {
@@ -177,11 +175,19 @@ type RunSubagentProcessLifecycleOptions = {
   sleep: (delayMs: number) => Promise<void>;
   getLastAcquiredCredentialId: () => string | undefined;
   getQuotaCredentialRetryLimit?: () => number | Promise<number>;
+  transientRetrySettings?: SubagentAutoRetrySettings;
+  prepareRetryAttempt?: (event: {
+    run: SubagentRunResult;
+    failure: RetryableCredentialFailure;
+    attempt: number;
+    maxAttempts: number;
+  }) => void | Promise<void>;
   clearTransientCredentialError: (credentialId: string) => void | Promise<void>;
   reportQuotaCredentialError: (message: string, credentialId: string) => void | Promise<void>;
   reportCredentialAuthError: (message: string, credentialId: string) => void | Promise<void>;
   reportTransientCredentialError: (message: string, credentialId: string) => void | Promise<void>;
   onRetry?: (event: SubagentProcessLifecycleRetryEvent) => void;
+  onRetryExhausted?: (event: SubagentProcessLifecycleRetryExhaustedEvent) => void;
 };
 
 const LOCK_RETRY_MAX_RETRIES = 3;
@@ -190,9 +196,55 @@ const LOCK_RETRY_JITTER_MAX_MS = 100;
 const QUOTA_RETRY_MAX_RETRIES = 3;
 const QUOTA_RETRY_BASE_DELAY_MS = 1_500;
 const QUOTA_RETRY_JITTER_MAX_MS = 500;
-const TRANSIENT_RETRY_MAX_RETRIES = 2;
-const TRANSIENT_RETRY_BASE_DELAY_MS = 1_000;
-const TRANSIENT_RETRY_JITTER_MAX_MS = 250;
+export const DEFAULT_TRANSIENT_RETRY_SETTINGS: SubagentAutoRetrySettings = {
+  enabled: true,
+  maxRetries: 3,
+  baseDelayMs: 2_000,
+};
+
+export const TRANSIENT_RETRY_DELAY_CAP_MS = 5 * 60 * 1000;
+
+export function calculateTransientRetryDelayMs(settings: SubagentAutoRetrySettings, attempt: number): number {
+  const retryAttempt = Number.isFinite(attempt) ? Math.max(1, Math.trunc(attempt)) : 1;
+  const baseDelayMs = Number.isFinite(settings.baseDelayMs) ? Math.max(0, Math.trunc(settings.baseDelayMs)) : 0;
+  return Math.min(baseDelayMs * 2 ** (retryAttempt - 1), TRANSIENT_RETRY_DELAY_CAP_MS);
+}
+
+export type RetryDelaySelection = {
+  delayMs: number;
+  defaultDelayMs: number;
+  usedProviderRetryDelay: boolean;
+  providerRetryDelayMs?: number;
+  providerRetryDelaySource?: ProviderRetryDelayHint["source"];
+  providerRetryDelayCapped?: boolean;
+};
+
+export function selectRetryDelayMs(
+  defaultDelayMs: number,
+  retryAfter: ProviderRetryDelayHint | undefined,
+  maxDelayMs: number = TRANSIENT_RETRY_DELAY_CAP_MS,
+): RetryDelaySelection {
+  const fallbackDelayMs = Number.isFinite(defaultDelayMs) ? Math.max(0, Math.trunc(defaultDelayMs)) : 0;
+  if (!retryAfter || !Number.isFinite(retryAfter.delayMs) || retryAfter.delayMs <= 0) {
+    return {
+      delayMs: fallbackDelayMs,
+      defaultDelayMs: fallbackDelayMs,
+      usedProviderRetryDelay: false,
+    };
+  }
+
+  const capMs = Number.isFinite(maxDelayMs) ? Math.max(0, Math.trunc(maxDelayMs)) : TRANSIENT_RETRY_DELAY_CAP_MS;
+  const providerRetryDelayMs = Math.ceil(retryAfter.delayMs);
+  const delayMs = Math.min(providerRetryDelayMs, capMs);
+  return {
+    delayMs,
+    defaultDelayMs: fallbackDelayMs,
+    usedProviderRetryDelay: true,
+    providerRetryDelayMs,
+    providerRetryDelaySource: retryAfter.source,
+    providerRetryDelayCapped: delayMs < providerRetryDelayMs,
+  };
+}
 
 function normalizeCredentialRetryLimit(value: number | undefined, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -344,6 +396,70 @@ export function createSubagentProcessLifecycle(
       await retryOptions.reportTransientCredentialError(failure.message, credentialId);
     };
 
+    const formatRetryReason = (reason: string): string =>
+      truncatePreview(reason.replace(/\s+/g, " ").trim(), 220);
+
+    const formatProviderRetryHintSuffix = (selection: RetryDelaySelection): string => {
+      if (!selection.usedProviderRetryDelay) {
+        return ` Default retry delay ${selection.defaultDelayMs}ms selected.`;
+      }
+
+      const cappedText = selection.providerRetryDelayCapped ? " capped" : "";
+      return ` Provider ${selection.providerRetryDelaySource} hint selected${cappedText}: ` +
+        `${selection.providerRetryDelayMs}ms requested, ${selection.delayMs}ms chosen ` +
+        `(default ${selection.defaultDelayMs}ms).`;
+    };
+
+    const getFailureLabel = (kind: RetryableCredentialFailure["kind"]): string => {
+      if (kind === "credential_auth") {
+        return "Credential authentication error";
+      }
+      if (kind === "quota") {
+        return "Quota/rate-limit error";
+      }
+      return "Transient provider error";
+    };
+
+    const appendRetryExhaustion = async (
+      run: SubagentRunResult,
+      failure: RetryableCredentialFailure,
+    ): Promise<SubagentRunResult> => {
+      const transientRetrySettings = retryOptions.transientRetrySettings ?? DEFAULT_TRANSIENT_RETRY_SETTINGS;
+      const maxAttempts = failure.kind === "transient"
+        ? (transientRetrySettings.enabled ? transientRetrySettings.maxRetries : 0)
+        : await getQuotaRetryLimit();
+      const attempts = failure.kind === "transient" ? transientRetryCount : quotaRetryCount;
+      const disabledSuffix = failure.kind === "transient" && !transientRetrySettings.enabled
+        ? " because transient auto-retry is disabled"
+        : "";
+      const retryMessage =
+        `[pi-agent-router] ${getFailureLabel(failure.kind)} for delegated task ${options.session.id.slice(0, 8)} ` +
+        `exhausted after ${attempts}/${maxAttempts} retries${disabledSuffix}. ` +
+        `Reason: ${formatRetryReason(failure.message)}.`;
+
+      const stderr = options.mergeCapturedText(run.stderr, retryMessage);
+      if (richestAttemptRun) {
+        richestAttemptRun = {
+          ...richestAttemptRun,
+          stderr: options.mergeCapturedText(richestAttemptRun.stderr, retryMessage),
+        };
+      }
+      accumulatedStderr = stderr;
+      options.session.stderr = stderr;
+      retryOptions.onRetryExhausted?.({
+        kind: failure.kind,
+        attempts,
+        maxAttempts,
+        message: retryMessage,
+        reason: failure.message,
+        sessionId: options.session.id,
+        providerRetryDelayMs: failure.retryAfter?.delayMs,
+        providerRetryDelaySource: failure.retryAfter?.source,
+      });
+      options.requestUiRender();
+      return { ...run, stderr };
+    };
+
     try {
       while (true) {
         if (options.session.status !== "running") {
@@ -401,7 +517,10 @@ export function createSubagentProcessLifecycle(
             delayMs: delay,
             maxAttempts: LOCK_RETRY_MAX_RETRIES + 1,
             message: retryMessage,
+            reason: "lock contention",
             sessionId: options.session.id,
+            defaultDelayMs: delay,
+            usedProviderRetryDelay: false,
           });
           options.requestUiRender();
           lockRetryCount += 1;
@@ -425,15 +544,24 @@ export function createSubagentProcessLifecycle(
           await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
           accumulatedStderr = runWithAccumulatedStderr.stderr;
           quotaRetryCount += 1;
-          const delay =
+          const fallbackDelay =
             QUOTA_RETRY_BASE_DELAY_MS * quotaRetryCount +
             Math.floor(Math.random() * QUOTA_RETRY_JITTER_MAX_MS);
-          const failureLabel = retryableFailure.kind === "credential_auth"
-            ? "Credential authentication error"
-            : "Quota/rate-limit error";
+          const delaySelection = selectRetryDelayMs(fallbackDelay, retryableFailure.retryAfter);
+          const delay = delaySelection.delayMs;
+          await retryOptions.prepareRetryAttempt?.({
+            run: attemptRun,
+            failure: retryableFailure,
+            attempt: quotaRetryCount,
+            maxAttempts: activeQuotaRetryLimit,
+          });
+          const failureLabel = getFailureLabel(retryableFailure.kind);
           const retryMessage =
             `[pi-agent-router] ${failureLabel} for delegated task ${options.session.id.slice(0, 8)} ` +
-            `(credential retry ${quotaRetryCount}/${activeQuotaRetryLimit}). Rotating credential and retrying in ${delay}ms.`;
+            `(credential retry ${quotaRetryCount}/${activeQuotaRetryLimit}). ` +
+            `Rotating credential and retrying in ${delay}ms. ` +
+            `Reason: ${formatRetryReason(retryableFailure.message)}.` +
+            formatProviderRetryHintSuffix(delaySelection);
 
           accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
           options.session.stderr = accumulatedStderr;
@@ -443,7 +571,13 @@ export function createSubagentProcessLifecycle(
             delayMs: delay,
             maxAttempts: activeQuotaRetryLimit,
             message: retryMessage,
+            reason: retryableFailure.message,
             sessionId: options.session.id,
+            defaultDelayMs: delaySelection.defaultDelayMs,
+            usedProviderRetryDelay: delaySelection.usedProviderRetryDelay,
+            providerRetryDelayMs: delaySelection.providerRetryDelayMs,
+            providerRetryDelaySource: delaySelection.providerRetryDelaySource,
+            providerRetryDelayCapped: delaySelection.providerRetryDelayCapped,
           });
           options.requestUiRender();
 
@@ -451,21 +585,31 @@ export function createSubagentProcessLifecycle(
           continue;
         }
 
+        const transientRetrySettings = retryOptions.transientRetrySettings ?? DEFAULT_TRANSIENT_RETRY_SETTINGS;
         if (
           retryableFailure?.kind === "transient" &&
-          transientRetryCount < TRANSIENT_RETRY_MAX_RETRIES &&
+          transientRetrySettings.enabled &&
+          transientRetryCount < transientRetrySettings.maxRetries &&
           options.session.status === "running" &&
           !options.session.timedOut
         ) {
           await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
           accumulatedStderr = runWithAccumulatedStderr.stderr;
           transientRetryCount += 1;
-          const delay =
-            TRANSIENT_RETRY_BASE_DELAY_MS * transientRetryCount +
-            Math.floor(Math.random() * TRANSIENT_RETRY_JITTER_MAX_MS);
+          const fallbackDelay = calculateTransientRetryDelayMs(transientRetrySettings, transientRetryCount);
+          const delaySelection = selectRetryDelayMs(fallbackDelay, retryableFailure.retryAfter);
+          const delay = delaySelection.delayMs;
+          await retryOptions.prepareRetryAttempt?.({
+            run: attemptRun,
+            failure: retryableFailure,
+            attempt: transientRetryCount,
+            maxAttempts: transientRetrySettings.maxRetries,
+          });
           const retryMessage =
             `[pi-agent-router] Transient provider error for delegated task ${options.session.id.slice(0, 8)} ` +
-            `(retry ${transientRetryCount}/${TRANSIENT_RETRY_MAX_RETRIES}). Retrying with credential rotation in ${delay}ms.`;
+            `(auto retry ${transientRetryCount}/${transientRetrySettings.maxRetries}). ` +
+            `Retrying in ${delay}ms. Reason: ${formatRetryReason(retryableFailure.message)}.` +
+            formatProviderRetryHintSuffix(delaySelection);
 
           accumulatedStderr = options.mergeCapturedText(accumulatedStderr, retryMessage);
           options.session.stderr = accumulatedStderr;
@@ -473,9 +617,15 @@ export function createSubagentProcessLifecycle(
             kind: "transient",
             attempt: transientRetryCount,
             delayMs: delay,
-            maxAttempts: TRANSIENT_RETRY_MAX_RETRIES,
+            maxAttempts: transientRetrySettings.maxRetries,
             message: retryMessage,
+            reason: retryableFailure.message,
             sessionId: options.session.id,
+            defaultDelayMs: delaySelection.defaultDelayMs,
+            usedProviderRetryDelay: delaySelection.usedProviderRetryDelay,
+            providerRetryDelayMs: delaySelection.providerRetryDelayMs,
+            providerRetryDelaySource: delaySelection.providerRetryDelaySource,
+            providerRetryDelayCapped: delaySelection.providerRetryDelayCapped,
           });
           options.requestUiRender();
 
@@ -483,18 +633,20 @@ export function createSubagentProcessLifecycle(
           continue;
         }
 
+        let runToFinalize = runWithAccumulatedStderr;
         if (
           retryableFailure &&
           options.session.status === "running" &&
           !options.session.timedOut
         ) {
           await reportRetryableCredentialFailure(retryableFailure, lastAcquiredCredentialId);
+          runToFinalize = await appendRetryExhaustion(runToFinalize, retryableFailure);
         }
 
         const finalRun =
-          retryableFailure && runWithAccumulatedStderr.code === 0
-            ? { ...runWithAccumulatedStderr, code: 1 }
-            : runWithAccumulatedStderr;
+          retryableFailure && runToFinalize.code === 0
+            ? { ...runToFinalize, code: 1 }
+            : runToFinalize;
         finalizeRun(retryOptions.preferRicherRunResult(finalRun, richestAttemptRun));
         return;
       }
@@ -601,6 +753,8 @@ const EXECUTION_DETAILS_LIVE_OUTPUT_MAX_CHARS = 320;
 const EXECUTION_DETAILS_TOOL_CALL_MAX_CHARS = 220;
 const EXECUTION_DETAILS_WARNING_MAX_CHARS = 220;
 const EXECUTION_DETAILS_WARNING_MAX_ENTRIES = 8;
+const EXECUTION_DETAILS_TOOL_INVOCATION_MAX_ENTRIES = 24;
+const THINKING_LEVEL_MAP_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 
 function compactExecutionText(value: string | undefined, maxChars: number): string | undefined {
   const normalized = normalizeInputText(value);
@@ -625,6 +779,115 @@ function compactExecutionWarnings(warnings: readonly string[] | undefined): stri
   }
 
   return compacted.slice(0, EXECUTION_DETAILS_WARNING_MAX_ENTRIES);
+}
+
+function compactToolInvocations(
+  invocations: readonly SubagentToolInvocation[] | undefined,
+): SubagentToolInvocation[] | undefined {
+  if (!invocations || invocations.length === 0) {
+    return undefined;
+  }
+
+  const compacted: SubagentToolInvocation[] = [];
+  for (const invocation of invocations) {
+    const name = compactExecutionText(invocation.name, EXECUTION_DETAILS_TOOL_CALL_MAX_CHARS);
+    if (!name) {
+      continue;
+    }
+
+    const compactInvocation: SubagentToolInvocation = {
+      name,
+      count: Math.max(0, Math.trunc(asFiniteNumber(invocation.count))),
+    };
+    const argumentsPreview = compactExecutionText(
+      invocation.argumentsPreview,
+      EXECUTION_DETAILS_TOOL_CALL_MAX_CHARS,
+    );
+    if (argumentsPreview) {
+      compactInvocation.argumentsPreview = argumentsPreview;
+    }
+    compacted.push(compactInvocation);
+  }
+
+  return compacted.length > 0
+    ? compacted.slice(0, EXECUTION_DETAILS_TOOL_INVOCATION_MAX_ENTRIES)
+    : undefined;
+}
+
+function parseToolInvocations(value: unknown): SubagentToolInvocation[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const parsed: SubagentToolInvocation[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const name = parseOptionalText(record.name);
+    if (!name) {
+      continue;
+    }
+
+    const parsedInvocation: SubagentToolInvocation = {
+      name,
+      count: Math.max(0, Math.trunc(asFiniteNumber(record.count))),
+    };
+    const argumentsPreview = parseOptionalText(record.argumentsPreview ?? record.arguments_preview);
+    if (argumentsPreview) {
+      parsedInvocation.argumentsPreview = argumentsPreview;
+    }
+    parsed.push(parsedInvocation);
+  }
+
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function compactThinkingLevelMap(value: AgentThinkingLevelMap | undefined): AgentThinkingLevelMap | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const compacted: AgentThinkingLevelMap = {};
+  for (const key of THINKING_LEVEL_MAP_KEYS) {
+    const mapped = value[key];
+    if (mapped === null) {
+      compacted[key] = null;
+      continue;
+    }
+
+    const normalized = normalizeInputText(mapped);
+    if (normalized) {
+      compacted[key] = normalized;
+    }
+  }
+
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function parseThinkingLevelMap(value: unknown): AgentThinkingLevelMap | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const parsed: AgentThinkingLevelMap = {};
+  for (const key of THINKING_LEVEL_MAP_KEYS) {
+    const mapped = record[key];
+    if (mapped === null) {
+      parsed[key] = null;
+      continue;
+    }
+
+    const normalized = typeof mapped === "string" ? normalizeInputText(mapped) : "";
+    if (normalized) {
+      parsed[key] = normalized;
+    }
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
 function compactDelegatedTask(
@@ -663,6 +926,8 @@ function compactExecutionResults(
       result.latestToolCall,
       EXECUTION_DETAILS_TOOL_CALL_MAX_CHARS,
     ),
+    toolInvocations: compactToolInvocations(result.toolInvocations),
+    thinkingLevelMap: compactThinkingLevelMap(result.thinkingLevelMap),
     output: compactExecutionText(result.output, EXECUTION_DETAILS_OUTPUT_MAX_CHARS),
     error: compactExecutionText(result.error, EXECUTION_DETAILS_ERROR_MAX_CHARS),
     resultSummary: compactExecutionText(
@@ -694,6 +959,7 @@ export function createSubagentExecutionDetails(
     agentColor?: string;
     model?: string;
     thinkingLevel?: string;
+    thinkingLevelMap?: AgentThinkingLevelMap;
     duration?: number;
     usage?: SubagentUsage;
     summary?: SubagentExecutionDetails["summary"];
@@ -710,6 +976,7 @@ export function createSubagentExecutionDetails(
     agentColor: options.agentColor,
     model: options.model,
     thinkingLevel: options.thinkingLevel,
+    thinkingLevelMap: compactThinkingLevelMap(options.thinkingLevelMap),
     duration: options.duration,
     status,
     attached: options.attached,
@@ -744,6 +1011,7 @@ export function parseSubagentExecutionDetails(value: unknown): SubagentExecution
   const agentColor = parseOptionalText(record.agentColor ?? record.agent_color);
   const model = parseOptionalText(record.model);
   const thinkingLevel = parseOptionalText(record.thinkingLevel ?? record.thinking_level);
+  const thinkingLevelMap = parseThinkingLevelMap(record.thinkingLevelMap ?? record.thinking_level_map);
   const duration = parseOptionalDurationMs(record.duration ?? record.durationMs ?? record.duration_ms);
   const status = parseSubagentExecutionStatus(record.status);
 
@@ -802,6 +1070,7 @@ export function parseSubagentExecutionDetails(value: unknown): SubagentExecution
           taskDescription: typeof taskRecord.taskDescription === "string" ? taskRecord.taskDescription : undefined,
           model: parseOptionalText(taskRecord.model),
           thinkingLevel: parseOptionalText(taskRecord.thinkingLevel ?? taskRecord.thinking_level),
+          thinkingLevelMap: parseThinkingLevelMap(taskRecord.thinkingLevelMap ?? taskRecord.thinking_level_map),
           duration: parseOptionalDurationMs(taskRecord.duration ?? taskRecord.durationMs ?? taskRecord.duration_ms),
           status: parseSubagentExecutionStatus(taskRecord.status),
           sessionId: typeof taskRecord.sessionId === "string" ? taskRecord.sessionId : undefined,
@@ -810,6 +1079,7 @@ export function parseSubagentExecutionDetails(value: unknown): SubagentExecution
           usage: parseSubagentUsage(taskRecord.usage),
           toolCalls: parsedToolCalls,
           latestToolCall: typeof taskRecord.latestToolCall === "string" ? taskRecord.latestToolCall : undefined,
+          toolInvocations: compactToolInvocations(parseToolInvocations(taskRecord.toolInvocations)),
           output: typeof taskRecord.output === "string" ? taskRecord.output : undefined,
           error: typeof taskRecord.error === "string" ? taskRecord.error : undefined,
           resultSummary: typeof taskRecord.resultSummary === "string" ? taskRecord.resultSummary : undefined,
@@ -848,6 +1118,7 @@ export function parseSubagentExecutionDetails(value: unknown): SubagentExecution
     agentColor,
     model,
     thinkingLevel,
+    thinkingLevelMap,
     duration,
     status,
     attached,

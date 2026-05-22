@@ -1,4 +1,4 @@
-import { Container, Spacer, Text } from "@mariozechner/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 import { INLINE_OPEN_BOX_TARGET_WIDTH } from "../constants";
 import { getBrailleSpinnerFrame } from "../progress-spinner";

@@ -74,8 +74,10 @@ declare module "node:url" {
   export function fileURLToPath(url: string | URL): string;
 }
 
-declare module "@mariozechner/pi-ai" {
+declare module "@earendil-works/pi-ai" {
   export type Api = string;
+  export type ModelThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  export type ThinkingLevelMap = Partial<Record<ModelThinkingLevel, string | null>>;
   export type Message = any;
   export type Context = any;
   export type AssistantMessageEventStream = any;
@@ -95,7 +97,7 @@ declare module "@mariozechner/pi-ai" {
   } | undefined;
 }
 
-declare module "@mariozechner/pi-coding-agent" {
+declare module "@earendil-works/pi-coding-agent" {
   export type AgentToolUpdateCallback<T = any> = (details: T) => void;
 
   export interface Theme {
@@ -147,7 +149,7 @@ declare module "@mariozechner/pi-coding-agent" {
   export function getSettingsListTheme(theme?: Theme): any;
 }
 
-declare module "@mariozechner/pi-tui" {
+declare module "@earendil-works/pi-tui" {
   export type SettingItem = any;
 
   export class Box {

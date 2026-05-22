@@ -2,6 +2,8 @@
  * Model footer formatting utilities.
  */
 
+import type { ModelThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
+
 import { normalizeInputText } from "./input-normalization";
 
 const PROVIDER_ALIASES: Record<string, string> = {
@@ -166,23 +168,131 @@ export function formatModelReferenceForFooter(modelReference: string | undefined
   return `${modelLabel} (${providerLabel})`;
 }
 
-export function formatThinkingLevelForDisplay(
-  level: string | undefined,
-  modelReference: string | undefined,
-): string | undefined {
+const THINKING_LEVEL_HIERARCHY: ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function normalizeThinkingLevelForDisplay(level: string | undefined): ModelThinkingLevel | undefined {
   const normalized = normalizeInputText(level).toLowerCase();
-  if (!normalized || normalized === "off" || normalized === "none") {
+  if (!normalized) {
     return undefined;
   }
 
-  if (normalized === "xhigh") {
-    const modelLower = (modelReference ?? "").toLowerCase();
-    const isOpus46 = modelLower.includes("opus-4.6") || modelLower.includes("opus-4-6");
-    const isAnthropicStyle = modelLower.includes("anthropic") || modelLower.includes("claude");
-    if (isOpus46 && isAnthropicStyle) {
-      return "max";
-    }
+  if (normalized === "none" || normalized === "disabled") {
+    return "off";
+  }
+
+  if (normalized === "min") {
+    return "minimal";
+  }
+
+  if (normalized === "med") {
+    return "medium";
+  }
+
+  if (normalized === "max") {
+    return "xhigh";
+  }
+
+  return THINKING_LEVEL_HIERARCHY.includes(normalized as ModelThinkingLevel)
+    ? normalized as ModelThinkingLevel
+    : undefined;
+}
+
+function formatThinkingDisplayLabel(value: string | undefined): string | undefined {
+  const normalized = normalizeInputText(value).toLowerCase();
+  if (!normalized || normalized === "off" || normalized === "none" || normalized === "disabled") {
+    return undefined;
   }
 
   return normalized;
+}
+
+function supportsMappedThinkingLevel(
+  level: ModelThinkingLevel,
+  thinkingLevelMap: ThinkingLevelMap | undefined,
+): boolean {
+  if (level === "off") {
+    return true;
+  }
+
+  if (!thinkingLevelMap) {
+    return true;
+  }
+
+  const mapped = thinkingLevelMap[level];
+  if (mapped === null) {
+    return false;
+  }
+
+  // Pi treats an explicit map as authoritative for xhigh: absent xhigh means
+  // the model does not expose a max/xhigh tier, while absent lower tiers fall
+  // back to the canonical Pi labels.
+  if (level === "xhigh") {
+    return mapped !== undefined;
+  }
+
+  return true;
+}
+
+function resolveDisplayThinkingLevel(
+  level: ModelThinkingLevel,
+  thinkingLevelMap: ThinkingLevelMap | undefined,
+): ModelThinkingLevel {
+  if (supportsMappedThinkingLevel(level, thinkingLevelMap)) {
+    return level;
+  }
+
+  const requestedIndex = THINKING_LEVEL_HIERARCHY.indexOf(level);
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    const candidate = THINKING_LEVEL_HIERARCHY[index]!;
+    if (supportsMappedThinkingLevel(candidate, thinkingLevelMap)) {
+      return candidate;
+    }
+  }
+
+  return "off";
+}
+
+function hasLegacyMaxThinkingReference(modelReference: string | undefined): boolean {
+  const modelLower = normalizeInputText(modelReference).toLowerCase();
+  if (!modelLower) {
+    return false;
+  }
+
+  const isAnthropicStyle = modelLower.includes("anthropic") || modelLower.includes("claude");
+  if (!isAnthropicStyle) {
+    return false;
+  }
+
+  // Compatibility for older task details that only persisted a model string.
+  // Metadata-driven thinkingLevelMap remains authoritative when available.
+  return /claude[-\s_/]*(?:opus[-\s_/]*)?4[.-]?[67]\b|claude[-\s_/]*opus[-\s_/]*4[.-]?[67]\b/.test(modelLower);
+}
+
+export function formatThinkingLevelForDisplay(
+  level: string | undefined,
+  modelReference: string | undefined,
+  thinkingLevelMap?: ThinkingLevelMap,
+): string | undefined {
+  const requestedLevel = normalizeThinkingLevelForDisplay(level);
+  if (!requestedLevel || requestedLevel === "off") {
+    return undefined;
+  }
+
+  const displayLevel = resolveDisplayThinkingLevel(requestedLevel, thinkingLevelMap);
+  if (displayLevel === "off") {
+    return undefined;
+  }
+
+  const mappedDisplay = displayLevel === "xhigh"
+    ? formatThinkingDisplayLabel(thinkingLevelMap?.[displayLevel] ?? undefined)
+    : undefined;
+  if (mappedDisplay) {
+    return mappedDisplay;
+  }
+
+  if (displayLevel === "xhigh" && hasLegacyMaxThinkingReference(modelReference)) {
+    return "max";
+  }
+
+  return displayLevel;
 }

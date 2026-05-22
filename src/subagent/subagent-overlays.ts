@@ -1,14 +1,14 @@
 import {
   getMarkdownTheme,
   type ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import {
   Markdown,
   matchesKey,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 import { ZellijModal, type ZellijModalContentRenderer } from "../../../zellij-modal";
 import { getCircularSpinnerFrame } from "../progress-spinner";

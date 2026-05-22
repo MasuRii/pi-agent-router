@@ -3,7 +3,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -203,30 +203,6 @@ export function resetProviderEnvKeyCacheState(): void {
   resetConfiguredKeyDistributionSlices();
 }
 
-/**
- * Provider env keys for subagent credential distribution.
- * Dynamically loaded from models.json with core provider fallbacks.
- * Use getProviderEnvKeys() for the actual mapping.
- * @deprecated Use getProviderEnvKeys() instead for dynamic resolution.
- */
-export const PROVIDER_ENV_KEYS: Record<string, string> = new Proxy({} as Record<string, string>, {
-  get(_, key: string) {
-    return getProviderEnvKeys()[key];
-  },
-  ownKeys() {
-    return Object.keys(getProviderEnvKeys());
-  },
-  getOwnPropertyDescriptor(_, key: string) {
-    const keys = getProviderEnvKeys();
-    if (key in keys) {
-      return { enumerable: true, configurable: true, value: keys[key] };
-    }
-    return undefined;
-  },
-  has(_, key: string) {
-    return key in getProviderEnvKeys();
-  },
-});
 
 const PROVIDER_ID_ALIASES: Record<string, string> = {
   codex: "openai-codex",
@@ -299,6 +275,7 @@ export type GlobalKeyDistributor = {
         api?: string;
         signal?: AbortSignal;
         parentSessionId?: string;
+        excludedIds?: readonly string[];
       },
     ): Promise<KeyLease | string | null | undefined>;
   };
@@ -404,6 +381,25 @@ function parseModelIdFromReference(modelReference: string | undefined): string |
 function normalizeOptionalRoutingValue(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized ? normalized : undefined;
+}
+
+function normalizeExcludedCredentialIds(value: readonly string[] | undefined): string[] {
+  if (!value || value.length === 0) {
+    return [];
+  }
+
+  const credentialIds: string[] = [];
+  const seenCredentialIds = new Set<string>();
+  for (const credentialId of value) {
+    const normalizedCredentialId = credentialId.trim();
+    if (!normalizedCredentialId || seenCredentialIds.has(normalizedCredentialId)) {
+      continue;
+    }
+    seenCredentialIds.add(normalizedCredentialId);
+    credentialIds.push(normalizedCredentialId);
+  }
+
+  return credentialIds;
 }
 
 function resolveDelegatedCredentialRequest(options: {
@@ -704,6 +700,7 @@ export async function tryAcquireKeyForSubagent(
       api?: string;
     };
     parentSessionId?: string;
+    excludedCredentialIds?: readonly string[];
   } = {},
 ): Promise<SubagentKeyLease | null> {
   const normalizedProviderId = normalizeProviderId(providerId);
@@ -742,6 +739,9 @@ export async function tryAcquireKeyForSubagent(
     signal: abortController.signal,
   });
   const modelId = delegatedRequest.modelId;
+  const excludedCredentialIds = normalizeExcludedCredentialIds(
+    options.excludedCredentialIds,
+  );
   const startedAt = Date.now();
 
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -764,10 +764,10 @@ export async function tryAcquireKeyForSubagent(
       distributor,
       sessionId,
     );
-    if (existingLease) {
+    if (existingLease && !excludedCredentialIds.includes(existingLease.credentialId)) {
       void piAgentRouterDebugLogger.info("subagent.key_reused", {
         message:
-          `[pi-agent-router] Reused distributed ${normalizedProviderId} key ${existingLease.credentialId} for subagent ${sessionId.slice(0, 8)}.`,
+          `[pi-agent-router] Reused distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
         providerId: normalizedProviderId,
         credentialId: existingLease.credentialId,
         sessionId,
@@ -813,10 +813,26 @@ export async function tryAcquireKeyForSubagent(
       });
     }
 
+    const acquireLeasePromise = excludedCredentialIds.length > 0
+      ? distributor.acquireForSubagent(
+          sessionId,
+          normalizedProviderId,
+          {
+            timeoutMs: delegatedRequest.timeoutMs,
+            modelId: delegatedRequest.modelId,
+            modelRef: delegatedRequest.modelRef,
+            api: delegatedRequest.api,
+            signal: abortController.signal,
+            parentSessionId: delegatedRequest.parentSessionId,
+            excludedIds: excludedCredentialIds,
+          },
+        )
+      : distributor.acquireForSubagent(delegatedRequest);
+
     const acquiredLease = await Promise.race<
       KeyLease | string | null | undefined | typeof timeoutSentinel
     >([
-      distributor.acquireForSubagent(delegatedRequest),
+      acquireLeasePromise,
       new Promise<typeof timeoutSentinel>((resolve) => {
         timeoutHandle = setTimeout(() => {
           resolve(timeoutSentinel);
@@ -858,7 +874,7 @@ export async function tryAcquireKeyForSubagent(
 
     void piAgentRouterDebugLogger.info("subagent.key_acquired", {
       message:
-        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key ${lease.credentialId} for subagent ${sessionId.slice(0, 8)}.`,
+        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
       providerId: normalizedProviderId,
       credentialId: lease.credentialId,
       sessionId,
@@ -965,6 +981,7 @@ const QUOTA_RATE_LIMIT_PATTERNS: RegExp[] = [
   // Weekly quota patterns (Ollama)
   /weekly\s+(?:usage|limit)/i,
   /usage limit/i,
+  /you\s+have\s+reached\s+(?:(?:your|the)\s+)?(?:usage\s+)?limit/i,
   /upgrade for higher limits/i,
 ];
 
@@ -974,6 +991,13 @@ const QUOTA_RATE_LIMIT_PATTERNS: RegExp[] = [
  * the account has no credits and requires manual action to add funds.
  */
 const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
+  /\bHTTP\s+402\b/i,
+  /\b402\b[^\n]*(?:payment|required|verification|top\s*up)/i,
+  /payment[_\s-]?required/i,
+  /requires?[^\n.]*verification/i,
+  /account[^\n.]*requires?[^\n.]*verification/i,
+  /verify[^\n.]*(?:phone|phone\s+number)/i,
+  /top\s*up/i,
   /outstanding[_\s-]?balance/i,
   /balance[_\s-]?too[_\s-]?low/i,
   /insufficient[_\s-]?balance/i,
@@ -983,6 +1007,19 @@ const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
   /balance[_\s-]?depleted/i,
   /please[_\s-]?add[_\s-]?credits/i,
   /please[_\s-]?add[_\s-]?funds/i,
+];
+
+const ORGANIZATION_DISABLED_PATTERNS: RegExp[] = [
+  /this organization has been disabled/i,
+  /organization has been disabled/i,
+  /organization[^\n.]*disabled/i,
+  /invalid_request_error[^\n.]*organization/i,
+  // Workspace/account-level deactivation surfaced by providers such as OpenAI Codex
+  // (`{"detail":{"code":"deactivated_workspace"}}`). Same recovery semantics as an
+  // administratively disabled organization: requires manual reactivation.
+  /\bdeactivated[_\s-]?workspace\b/i,
+  /\bworkspace[_\s-]?deactivated\b/i,
+  /\bworkspace[^\n.]*disabled\b/i,
 ];
 
 /**
@@ -1006,31 +1043,61 @@ const CREDENTIAL_AUTH_PATTERNS: RegExp[] = [
   /please\s+(?:try\s+)?sign(?:ing)?\s+in\s+again/i,
 ];
 
+const TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS: RegExp[] = [
+  /400\s+(?:<|&lt;)html(?:>|&gt;)[\s\S]*(?:<|&lt;)title(?:>|&gt;)400\s+Bad Request(?:<\/|&lt;\/)title(?:>|&gt;)[\s\S]*(?:<|&lt;)center(?:>|&gt;)\s*alb\s*(?:<\/|&lt;\/)center(?:>|&gt;)/i,
+];
+
 const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
+  ...TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS,
   /\b5\d\d\b/i,
+  /\b408\b/i,
   /internal[_\s-]?server[_\s-]?error/i,
   /internal_server_error/i,
-  /service unavailable/i,
+  /the selected provider failed this request\s*\(HTTP\s*400\)/i,
+  /provider.?returned.?error/i,
+  /provider.?error/i,
+  /service.?unavailable/i,
   /bad gateway/i,
   /gateway timeout/i,
-  /upstream[^\n]*(?:timeout|error|failed|unavailable)/i,
+  /upstream[^\n]*(?:timeout|error|failed|unavailable|disconnect)/i,
   /temporar(?:y|ily) unavailable/i,
-  /please try again later/i,
+  /high traffic/i,
+  /Multi-auth rotation failed[\s\S]*Provider:\s*kiro\b[\s\S]*Reason:\s*I am experiencing high traffic,\s*please try again shortly\.?/i,
+  /please try again(?: (?:later|shortly))?/i,
+  /retry delay/i,
+  /Kiro request timed out after \d+ms\.?/i,
   /timeout/i,
   /timed out/i,
   /ECONNRESET/i,
   /ECONNREFUSED/i,
+  /ECONNABORTED/i,
   /ETIMEDOUT/i,
+  /EPIPE/i,
+  /ENOTFOUND/i,
+  /EAI_AGAIN/i,
   /socket hang up/i,
+  /connection (?:reset|closed|lost|terminated|aborted)/i,
+  /server disconnected/i,
   /network error/i,
   /fetch failed/i,
   /request was aborted/i,
   /operation was aborted/i,
   /\bAbortError\b/i,
+  /\bZlibError\b/i,
+  /incorrect header check/i,
   /without any assistant output/i,
   /without a final assistant output/i,
   /without completion event/i,
   /stream ended unexpectedly/i,
+  /stream returned an error/i,
+];
+
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+  /context[_\s-]?length[_\s-]?exceeded/i,
+  /context\s+(?:window|length|limit)[^\n]*(?:exceed|overflow|too long|maximum)/i,
+  /(?:maximum|max)\s+(?:context|token)[^\n]*(?:exceed|overflow|too long|limit)/i,
+  /tokens?[^\n]*(?:exceed|overflow|too many)[^\n]*(?:context|limit|maximum|max)/i,
+  /input[^\n]*(?:too long|exceed)[^\n]*(?:context|token)/i,
 ];
 
 const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
@@ -1049,14 +1116,19 @@ export const KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES = 1_024;
  * Checks whether an error message indicates a quota or rate-limit condition
  * that may be resolved by rotating to a different API credential.
  */
+function isContextOverflowError(errorText: string): boolean {
+  return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(errorText));
+}
+
 export function isQuotaOrRateLimitError(errorText: string): boolean {
-  if (!errorText) {
+  if (!errorText || isContextOverflowError(errorText)) {
     return false;
   }
 
   return (
     QUOTA_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorText)) ||
     BALANCE_EXHAUSTED_PATTERNS.some((pattern) => pattern.test(errorText)) ||
+    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(errorText)) ||
     WEEKLY_QUOTA_PATTERNS.some((pattern) => pattern.test(errorText))
   );
 }
@@ -1065,7 +1137,7 @@ export function isQuotaOrRateLimitError(errorText: string): boolean {
  * Checks whether an error message indicates a retryable transient transport/provider failure.
  */
 export function isRetryableCredentialAuthError(errorText: string): boolean {
-  if (!errorText) {
+  if (!errorText || isContextOverflowError(errorText)) {
     return false;
   }
 
@@ -1073,7 +1145,7 @@ export function isRetryableCredentialAuthError(errorText: string): boolean {
 }
 
 export function isTransientCredentialError(errorText: string): boolean {
-  if (!errorText) {
+  if (!errorText || isContextOverflowError(errorText)) {
     return false;
   }
 
@@ -1110,6 +1182,13 @@ export function isBalanceExhaustedError(errorText: string): boolean {
     return false;
   }
   return BALANCE_EXHAUSTED_PATTERNS.some((pattern) => pattern.test(errorText));
+}
+
+export function isOrganizationDisabledError(errorText: string): boolean {
+  if (!errorText) {
+    return false;
+  }
+  return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(errorText));
 }
 
 /**
@@ -1158,7 +1237,7 @@ export async function reportSubagentCredentialAuthError(
       void piAgentRouterDebugLogger.info("subagent.credential_auth_disabled", {
         credentialId,
         message:
-          `[pi-agent-router] Disabled credential ${credentialId} for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
+          `[pi-agent-router] Disabled credential for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
         sessionId,
       });
       return;
@@ -1167,7 +1246,7 @@ export async function reportSubagentCredentialAuthError(
       void piAgentRouterDebugLogger.warn("subagent.credential_auth_disable_failed", {
         credentialId,
         error: message,
-        message: `[pi-agent-router] Failed to disable credential ${credentialId}: ${message}.`,
+        message: `[pi-agent-router] Failed to disable credential for subagent ${sessionId.slice(0, 8)}: ${message}.`,
         sessionId,
       });
     }
@@ -1191,7 +1270,7 @@ export async function reportSubagentCredentialAuthError(
       cooldownMs: fallbackCooldownMs,
       credentialId,
       message:
-        `[pi-agent-router] Applied 72h cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
+        `[pi-agent-router] Applied 72h cooldown on credential for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
       sessionId,
     });
   } catch (error) {
@@ -1199,7 +1278,7 @@ export async function reportSubagentCredentialAuthError(
     void piAgentRouterDebugLogger.warn("subagent.credential_auth_cooldown_failed", {
       credentialId,
       error: message,
-      message: `[pi-agent-router] Failed to apply credential authentication cooldown for ${credentialId}: ${message}.`,
+      message: `[pi-agent-router] Failed to apply credential authentication cooldown for subagent ${sessionId.slice(0, 8)}: ${message}.`,
       sessionId,
     });
   }
@@ -1210,7 +1289,7 @@ export async function reportSubagentCredentialAuthError(
  * so the failed credential receives a cooldown period and subsequent acquisitions
  * rotate to a healthy credential.
  *
- * For balance exhaustion errors: Permanently disables the credential until manually re-enabled.
+ * For permanent access failures (balance, verification, organization disabled): Permanently disables the credential until manually re-enabled.
  * For weekly quota errors: Applies exponential backoff:
  * - 1st error: 12 hours
  * - 2nd consecutive: 24 hours
@@ -1233,12 +1312,15 @@ export async function reportSubagentKeyError(
 
   const retryAfterCooldownMs = parseRetryAfterCooldownMs(errorMessage);
   const isBalanceExhausted = isBalanceExhaustedError(errorMessage);
+  const isOrganizationDisabled = isOrganizationDisabledError(errorMessage);
+  const isPermanentCredentialAccessFailure = isBalanceExhausted || isOrganizationDisabled;
   const isWeekly = isWeeklyQuotaError(errorMessage) || isLongRetryAfterQuotaCooldown(retryAfterCooldownMs);
 
-  // Balance exhaustion: disable credential permanently (requires manual re-enable)
-  if (isBalanceExhausted) {
+  // Permanent credential access failures require manual intervention, so disable until manually re-enabled.
+  if (isPermanentCredentialAccessFailure) {
     weeklyQuotaAttempts.delete(credentialId);
-    const reason = `Subagent ${sessionId.slice(0, 8)} balance exhausted: ${errorMessage.slice(0, 200)}`;
+    const permanentReason = isOrganizationDisabled ? "organization disabled" : "balance or verification required";
+    const reason = `Subagent ${sessionId.slice(0, 8)} ${permanentReason}: ${errorMessage.slice(0, 200)}`;
 
     if (distributor.disableCredential) {
       try {
@@ -1246,7 +1328,7 @@ export async function reportSubagentKeyError(
         void piAgentRouterDebugLogger.info("subagent.credential_disabled", {
           credentialId,
           message:
-            `[pi-agent-router] Disabled credential ${credentialId} for subagent ${sessionId.slice(0, 8)} due to balance exhaustion.`,
+            `[pi-agent-router] Disabled credential for subagent ${sessionId.slice(0, 8)} due to ${permanentReason}.`,
           sessionId,
         });
       } catch (error) {
@@ -1254,7 +1336,7 @@ export async function reportSubagentKeyError(
         void piAgentRouterDebugLogger.warn("subagent.credential_disable_failed", {
           credentialId,
           error: message,
-          message: `[pi-agent-router] Failed to disable credential ${credentialId}: ${message}.`,
+          message: `[pi-agent-router] Failed to disable credential for subagent ${sessionId.slice(0, 8)}: ${message}.`,
           sessionId,
         });
       }
@@ -1274,7 +1356,7 @@ export async function reportSubagentKeyError(
           cooldownMs: fallbackCooldownMs,
           credentialId,
           message:
-            `[pi-agent-router] Applied 72h cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} (balance exhausted).`,
+            `[pi-agent-router] Applied 72h cooldown on credential for subagent ${sessionId.slice(0, 8)} (${permanentReason}).`,
           sessionId,
         });
       } catch (error) {
@@ -1282,7 +1364,7 @@ export async function reportSubagentKeyError(
         void piAgentRouterDebugLogger.warn("subagent.credential_cooldown_failed", {
           credentialId,
           error: message,
-          message: `[pi-agent-router] Failed to apply cooldown for credential ${credentialId}: ${message}.`,
+          message: `[pi-agent-router] Failed to apply cooldown for credential on subagent ${sessionId.slice(0, 8)}: ${message}.`,
           sessionId,
         });
       }
@@ -1336,7 +1418,7 @@ export async function reportSubagentKeyError(
       isWeekly,
       retryAfterCooldownMs,
       message:
-        `[pi-agent-router] Reported ${isWeekly ? "weekly " : ""}cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} (${cooldownMs / (60 * 60 * 1000)}h).`,
+        `[pi-agent-router] Reported ${isWeekly ? "weekly " : ""}cooldown on credential for subagent ${sessionId.slice(0, 8)} (${cooldownMs / (60 * 60 * 1000)}h).`,
       sessionId,
     });
   } catch (error) {
@@ -1393,7 +1475,7 @@ export async function reportSubagentTransientKeyError(
       cooldownMs,
       credentialId,
       message:
-        `[pi-agent-router] Applied transient cooldown on credential ${credentialId} for subagent ${sessionId.slice(0, 8)} (${cooldownMs}ms, attempt ${attempts}).`,
+        `[pi-agent-router] Applied transient cooldown on credential for subagent ${sessionId.slice(0, 8)} (${cooldownMs}ms, attempt ${attempts}).`,
       sessionId,
     });
   } catch (error) {

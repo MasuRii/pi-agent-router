@@ -1,8 +1,8 @@
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 
 import {
   containsToolTranscriptLine,
-  extractHumanReadableSubagentOutput,
+  extractHumanReadableSubagentOutputForHandoff,
   sanitizeStructuredSubagentResultForHandoff,
   sanitizeSubagentFinalResponseForHandoff,
   sanitizeSubagentResultForDisplay,
@@ -120,7 +120,7 @@ function findLatestSubmitResult(messages: readonly Message[]): unknown {
 }
 
 function formatOutputValue(value: unknown): string {
-  const extracted = extractHumanReadableSubagentOutput(value);
+  const extracted = extractHumanReadableSubagentOutputForHandoff(value);
   if (extracted !== undefined) {
     return sanitizeSubagentFinalResponseForHandoff(extracted);
   }

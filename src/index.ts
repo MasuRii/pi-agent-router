@@ -8,7 +8,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -17,14 +17,15 @@ import {
   type Api,
   type Model,
   type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
+  type ThinkingLevelMap,
+} from "@earendil-works/pi-ai";
 import {
   defineTool,
   type AgentToolUpdateCallback,
   type ExtensionAPI,
   type ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // Existing internal imports
@@ -50,6 +51,7 @@ import {
   type TaskExecutionMode,
 } from "./task/task-chain-mode";
 import { validateCurrentBatchContextFromReferences } from "./task/task-context-references";
+import { resolveTabCycleDebounceMs, shouldConsumeTabCycleInput } from "./tab-cycle-debounce";
 
 // Modularized internal imports
 import type {
@@ -73,7 +75,6 @@ import {
   AGENT_DIR,
   DEFAULT_AGENT,
   FINISHED_SUBAGENT_TTL_MS,
-  LINUX_TAB_CYCLE_DEBOUNCE_MS,
   SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
   SUBAGENT_HARD_KILL_DELAY_MS,
   SUBAGENT_STDOUT_CAPTURE_MAX_CHARS,
@@ -96,7 +97,6 @@ import {
   buildAgentSelectionMenu,
 } from "./agent/agent-command-ui";
 import {
-  isDirectory,
   isDirectoryAsync,
   isFileAsync,
   prepareIsolatedAgentDirectoryAsync,
@@ -104,7 +104,7 @@ import {
   resolveSubagentSessionDirectoryAsync,
   resolveSubagentWorkingDirectoryAsync,
 } from "./subagent/session-paths";
-import { resolveAgentModel, toModelReference } from "./model-resolution";
+import { resolveAgentModel, resolveAgentModelAfterReadiness, toModelReference } from "./model-resolution";
 import {
   cloneSubagentUsage,
   createSubagentJsonEventState,
@@ -120,6 +120,17 @@ import {
   summarizeSubagentToolInvocations,
 } from "./subagent/subagent-output";
 import { createOutputSink } from "./subagent/subagent-output-sink";
+import {
+  createDelegatedSubagentBaseArgs,
+  resolveDelegatedCliSpawnCommand,
+} from "./subagent/subagent-launch-command";
+import {
+  createDelegationSlotCoordinator,
+  ROUTER_DELEGATION_RESET_MESSAGE,
+  ROUTER_SHUTDOWN_ABORT_MESSAGE,
+  ROUTER_SHUTDOWN_TERMINATION_REASON,
+} from "./subagent/delegation-slot-coordinator";
+import { createLiveSubagentWidgetBatchTracker } from "./subagent/live-subagent-widget-batches";
 import {
   clearStaleSubagentSessionsForNewSession,
   clearSubagentSessionsForParentShutdown,
@@ -143,8 +154,10 @@ import {
 } from "./agent/extension-sources";
 import {
   aggregateUsageFromResults,
+  calculateTransientRetryDelayMs,
   createSubagentExecutionDetails,
   createSubagentProcessLifecycle,
+  DEFAULT_TRANSIENT_RETRY_SETTINGS,
   formatDuration,
   generateUniqueTaskId,
   getSubagentStatusDisplay,
@@ -154,7 +167,9 @@ import {
   resolveSessionByReference,
   resolveSubagentTimeoutMs,
   summarizeParallelResults,
+  type SubagentAutoRetrySettings,
 } from "./subagent/subagent-execution";
+import { hasExtensiveDelegatedProgressForCredentialRetry } from "./subagent/subagent-run-progress";
 import { renderParallelDelegationResult } from "./task/parallel-delegation-renderer";
 import { mapWithAbortAwareConcurrency } from "./task/parallel-control";
 import {
@@ -164,10 +179,16 @@ import {
   resolveDelegatedExtensionDirectoryAsync,
   shouldSkipDelegatedExtension,
 } from "./subagent/delegated-extensions";
+import {
+  isDelegatedRuntimeArtifactLoadFailure,
+  restoreMissingDelegatedRuntimeArtifactsAsync,
+  writeDelegatedRuntimeArtifactsAsync,
+  type DelegatedRuntimeArtifact,
+} from "./subagent/delegated-runtime-artifacts";
 import { SPINNER_RENDER_INTERVAL_MS } from "./progress-spinner";
 import { createAnimatedRenderSurface } from "./ui/animated-render-surface";
 import { createUiRenderScheduler } from "./ui/render-scheduler";
-import { resolveTaskControlsAsync } from "./task/task-controls";
+import { resolveRetryControlsAsync, resolveTaskControlsAsync } from "./task/task-controls";
 import {
   buildTaskToolPartialUpdateFingerprint,
   createTaskToolPartialUpdateGate,
@@ -177,6 +198,12 @@ import { normalizeDelegatedOutput } from "./output-contract";
 import { loadPiAgentRouterConfig } from "./config";
 import { piAgentRouterDebugLogger } from "./debug-logger";
 import { getErrorMessage } from "./error-utils";
+import { resolveDelegatedThinkingLevel, shouldForceDelegatedThinkingOff } from "./agent/thinking-policy";
+import {
+  buildDelegatedAgentColorFallbackMap,
+  resolveDelegatedAgentColor,
+} from "./agent/delegated-agent-presentation";
+import { logTaskPartialUpdateRenderFailure } from "./task/task-partial-update-logging";
 import {
   clearSubagentTransientKeyError,
   detectSubagentProviderIdAsync,
@@ -195,13 +222,23 @@ import {
   reportSubagentTransientKeyError,
   tryAcquireKeyForSubagent,
 } from "./subagent/subagent-key-distribution";
-import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env.js";
+import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env";
+import { inspectSessionToolCallIntegrity } from "./subagent/session-integrity";
+import { parseProviderRetryDelayHint, type ProviderRetryDelayHint } from "./subagent/credential-backoff";
 import { buildSystemPromptForActiveAgent } from "./agent/active-agent-prompt";
-import { invalidateRouterReloadCaches } from "./router-reload";
+import { registerRouterReloadHandler } from "./router-reload-handler";
+import {
+  findInvalidTaskDelegationIndex,
+  findUnknownTaskAgents,
+  formatUnknownTaskAgentsLabel,
+  getQueuedDelegationLabel,
+  normalizeTaskDelegations,
+} from "./task/task-execution-validation";
 import {
   getRuntimeTemperatureUnsupportedReason,
   supportsRuntimeTemperatureOption,
 } from "./agent/temperature-support";
+import { createTaskReferenceResolver } from "./task/task-reference-resolution";
 
 // Re-export shared types for external consumers
 export type {
@@ -231,6 +268,8 @@ export type {
   TaskControlsCacheSnapshot,
   TaskStyleDelegationItem,
 } from "./types";
+
+export { resolveDelegatedThinkingLevel, shouldForceDelegatedThinkingOff };
 
 const TASK_TOOL_BASE_DESCRIPTION =
   'Delegate compact task batches to local agents. Required task fields: id, description, assignment, agent. mode defaults to "parallel"; same-batch contextFrom is valid only in mode="chain" and only from earlier task ids. Parallel and top-level contextFrom must reference retained delegated sessions only. Handoffs inject bounded final responses or validated structured results, never transcripts.';
@@ -283,32 +322,32 @@ function createTaskBatchItemSchema() {
 
 const PI_FAST_MODE_EXTENSION_NAME = "pi-fast-mode";
 const PI_FAST_MODE_FLAG = "fast";
+const MODEL_DISCOVERY_READY_EVENT = "model-discovery:ready";
+const DELEGATED_MODEL_READINESS_MAX_ATTEMPTS = 21;
+const DELEGATED_MODEL_READINESS_DELAY_MS = 250;
 
-const resolveExtensionDirectory = (
-  extensionCandidates: readonly string[],
-): string | undefined => {
-  for (const extensionName of extensionCandidates) {
-    const extensionDir = join(AGENT_DIR, "extensions", extensionName);
-    if (isDirectory(extensionDir)) {
-      return extensionDir;
-    }
-  }
-
-  return undefined;
+type ModelDiscoveryEventBus = {
+  once?: (event: string, handler: () => void) => void;
 };
 
-const resolveExtensionDirectoryAsync = async (
-  extensionCandidates: readonly string[],
-): Promise<string | undefined> => {
-  for (const extensionName of extensionCandidates) {
-    const extensionDir = join(AGENT_DIR, "extensions", extensionName);
-    if (await isDirectoryAsync(extensionDir)) {
-      return extensionDir;
-    }
-  }
+function waitForModelDiscoveryReadyOrDelay(pi: ExtensionAPI, delayMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, Math.max(0, delayMs)) as ReturnType<typeof setTimeout> & { unref?: () => void };
+    timer.unref?.();
+    const eventBus = (pi as { events?: ModelDiscoveryEventBus }).events;
+    eventBus?.once?.(MODEL_DISCOVERY_READY_EVENT, finish);
+  });
+}
 
-  return undefined;
-};
 
 const formatExtensionCandidatePaths = (
   extensionCandidates: readonly string[],
@@ -368,11 +407,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     | undefined;
   const manualThinkingOverrideByAgent = new Map<string, AgentThinkingLevel>();
   let suppressManualModelOverrideCapture = false;
-  let activeSubagentDelegations = 0;
-  const queuedSubagentDelegations: Array<{
-    resume: () => void;
-    reject: (error: Error) => void;
-  }> = [];
+  const delegationSlotCoordinator = createDelegationSlotCoordinator();
   const pendingDelegationJobs = new Set<Promise<void>>();
   let dispatchReminderQueued = false;
   let autoCompletionWaitJob: Promise<void> | null = null;
@@ -380,411 +415,69 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   let tabCycleInputContext: ExtensionContext | undefined;
   let lastTabCycleAtMs = 0;
   let activeParentSessionId = "";
-  let gracefulShutdownInProgress = false;
-  const liveSubagentWidgetBatches = new Map<
-    string,
-    {
-      parentSessionId: string;
-      total: number;
-      sessionIds: Set<string>;
-    }
-  >();
 
-  const routerShutdownAbortMessage =
-    "Delegation was aborted because pi-agent-router is shutting down.";
-  const routerDelegationResetMessage =
-    "Delegation was aborted because pi-agent-router reset its delegation state.";
-  const routerShutdownTerminationReason =
-    "Terminated because pi-agent-router is shutting down.";
-
-  const tabCycleDebounceMs = process.platform === "linux" ? LINUX_TAB_CYCLE_DEBOUNCE_MS : 0;
+  const tabCycleDebounceMs = resolveTabCycleDebounceMs();
 
   const listSubagentSessions = (): SubagentSession[] =>
     listVisibleSubagentSessions(subagentSessions.values(), activeParentSessionId);
 
-  const registerLiveSubagentWidgetBatch = (
-    batchId: string,
-    parentSessionId: string,
-    total: number,
-  ): void => {
-    liveSubagentWidgetBatches.set(batchId, {
-      parentSessionId,
-      total: Math.max(0, Math.trunc(total)),
-      sessionIds: new Set<string>(),
-    });
-    requestSubagentUiRender();
-  };
-
-  const trackLiveSubagentWidgetSession = (
-    batchId: string,
-    sessionId: string,
-  ): void => {
-    const batch = liveSubagentWidgetBatches.get(batchId);
-    if (!batch) {
-      return;
-    }
-
-    batch.sessionIds.add(sessionId);
-    requestSubagentUiRender(false);
-  };
-
-  const clearLiveSubagentWidgetBatch = (batchId: string): void => {
-    if (liveSubagentWidgetBatches.delete(batchId)) {
-      requestSubagentUiRender();
-    }
-  };
-
-  const resolveSubagentWidgetTotalCount = (
-    sessions: readonly SubagentSession[],
-  ): number | undefined => {
-    const visibleSessionIds = new Set(sessions.map((session) => session.id));
-    let queuedWithoutSessions = 0;
-
-    for (const batch of liveSubagentWidgetBatches.values()) {
-      if (activeParentSessionId && batch.parentSessionId !== activeParentSessionId) {
-        continue;
-      }
-
-      let visibleStartedSessions = 0;
-      for (const sessionId of batch.sessionIds) {
-        if (visibleSessionIds.has(sessionId)) {
-          visibleStartedSessions += 1;
-        }
-      }
-
-      queuedWithoutSessions += Math.max(0, batch.total - visibleStartedSessions);
-    }
-
-    if (queuedWithoutSessions <= 0) {
-      return undefined;
-    }
-
-    return sessions.length + queuedWithoutSessions;
-  };
-
-  type ResolvedTaskReference = {
-    source: "registry" | "session";
-    reference: string;
-    taskId: string;
-    logicalTaskId?: string;
-    sessionId?: string;
-    sessionPath?: string;
-    status: SubagentExecutionStatus;
-    outputText?: string;
-    structuredResult?: unknown;
-    lastDismissedAt?: number;
-  };
-
-  const isActiveReferenceStatus = (status: SubagentExecutionStatus): boolean =>
-    status === "running" || status === "queued";
-
-  const describeResolvedTaskReference = (
-    candidate: ResolvedTaskReference,
-  ): string => {
-    const identifiers = [
-      candidate.logicalTaskId ? `logical=${candidate.logicalTaskId}` : undefined,
-      `task=${candidate.taskId}`,
-      candidate.sessionId ? `session=${candidate.sessionId}` : undefined,
-    ].filter((entry): entry is string => Boolean(entry));
-    return identifiers.join("/");
-  };
-
-  const isRetainedOutputSafeForHandoff = (
-    source: SubagentTaskRegistryEntry["lastOutputSource"],
-  ): boolean => source === "assistant_output" || source === "streamed_output";
+  const taskReferenceResolver = createTaskReferenceResolver({
+    subagentSessions,
+    subagentTaskRegistry,
+  });
 
   const isLatestTaskRegistrySession = (
     entry: SubagentTaskRegistryEntry,
     sessionId: string,
   ): boolean => entry.childSessionIds[entry.childSessionIds.length - 1] === sessionId;
 
-  const buildResolvedTaskReferenceCandidates = (
+  const hydrateRecoveredTaskReferencesFromSessionHistory = (
+    ctx: ExtensionContext,
     parentSessionId: string,
-  ): ResolvedTaskReference[] => {
-    const candidates = new Map<string, ResolvedTaskReference>();
-
-    const upsertCandidate = (candidate: ResolvedTaskReference): void => {
-      const key = `${candidate.taskId}:${candidate.sessionId || ""}`;
-      const existing = candidates.get(key);
-      candidates.set(key, {
-        ...existing,
-        ...candidate,
-        outputText: candidate.outputText || existing?.outputText,
-        structuredResult:
-          candidate.structuredResult !== undefined
-            ? candidate.structuredResult
-            : existing?.structuredResult,
-        sessionPath: candidate.sessionPath || existing?.sessionPath,
-        sessionId: candidate.sessionId || existing?.sessionId,
-        lastDismissedAt: candidate.lastDismissedAt ?? existing?.lastDismissedAt,
-      });
-    };
-
-    for (const entry of subagentTaskRegistry.values()) {
-      if (parentSessionId && entry.parentSessionId !== parentSessionId) {
-        continue;
-      }
-
-      const latestSessionId = [...entry.childSessionIds]
-        .reverse()
-        .find((sessionId) => subagentSessions.has(sessionId));
-      const latestSession = latestSessionId
-        ? subagentSessions.get(latestSessionId)
-        : undefined;
-      upsertCandidate({
-        source: "registry",
-        reference: entry.logicalTaskId || entry.taskId,
-        taskId: entry.taskId,
-        logicalTaskId: entry.logicalTaskId,
-        sessionId: latestSession?.id || latestSessionId,
-        sessionPath: entry.sessionPath || latestSession?.sessionPath,
-        status: entry.status,
-        lastDismissedAt: entry.lastDismissedAt,
-        outputText:
-          entry.lastFinalResponseText ||
-          latestSession?.lastFinalResponseText ||
-          (isRetainedOutputSafeForHandoff(entry.lastOutputSource)
-            ? entry.lastOutput
-            : undefined),
-        structuredResult: entry.lastStructuredResult,
-      });
-    }
-
-    for (const session of subagentSessions.values()) {
-      if (parentSessionId && session.parentSessionId !== parentSessionId) {
-        continue;
-      }
-
-      upsertCandidate({
-        source: "session",
-        reference: session.logicalTaskId || session.taskId,
-        taskId: session.taskId,
-        logicalTaskId: session.logicalTaskId,
-        sessionId: session.id,
-        sessionPath: session.sessionPath,
-        status: session.status,
-        outputText: session.lastFinalResponseText,
-        lastDismissedAt: session.dismissed ? session.finishedAt ?? session.startedAt : undefined,
-      });
-    }
-
-    return [...candidates.values()];
-  };
-
-  const resolveTaskReference = (
-    reference: string,
-    parentSessionId: string,
-    fieldName: string,
-  ): { candidate?: ResolvedTaskReference; error?: string } => {
-    const normalizedReference = normalizeInputText(reference);
-    const normalized = normalizedReference.toLowerCase();
-    if (!normalized) {
-      return {
-        error: `Task delegation failed: '${fieldName}' requires a non-empty task or session reference.`,
-      };
-    }
-
-    const candidates = buildResolvedTaskReferenceCandidates(parentSessionId);
-    const matchesReference = (
-      candidate: ResolvedTaskReference,
-      exact: boolean,
-    ): boolean => {
-      const values = [
-        candidate.taskId,
-        candidate.logicalTaskId,
-        candidate.sessionId,
-        candidate.sessionPath,
-      ]
-        .map((value) => normalizeInputText(value).toLowerCase())
-        .filter(Boolean);
-
-      return values.some((value) => exact ? value === normalized : value.startsWith(normalized));
-    };
-
-    const exactSessionIdMatches = candidates.filter(
-      (candidate) => normalizeInputText(candidate.sessionId).toLowerCase() === normalized,
+  ): void => {
+    taskReferenceResolver.hydrateRecoveredTaskReferencesFromSessionHistory(
+      ctx,
+      parentSessionId,
     );
-    const exactMatches = exactSessionIdMatches.length > 0
-      ? exactSessionIdMatches
-      : candidates.filter((candidate) => matchesReference(candidate, true));
-    const registryExactMatches = exactMatches.filter(
-      (candidate) => candidate.source === "registry",
-    );
-    const matches = registryExactMatches.length > 0
-      ? registryExactMatches
-      : exactMatches.length > 0
-        ? exactMatches
-        : candidates.filter((candidate) => matchesReference(candidate, false));
-
-    if (matches.length === 0) {
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${normalizedReference}' was not found in retained delegated sessions.`,
-      };
-    }
-
-    const uniqueMatches = new Map(
-      matches.map((candidate) => [
-        `${candidate.taskId}:${candidate.sessionId || ""}`,
-        candidate,
-      ]),
-    );
-    if (uniqueMatches.size > 1) {
-      const labels = [...uniqueMatches.values()]
-        .slice(0, 6)
-        .map((candidate) => describeResolvedTaskReference(candidate))
-        .join(", ");
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${normalizedReference}' is ambiguous; matched ${labels}. Use a full taskId or sessionId.`,
-      };
-    }
-
-    return { candidate: [...uniqueMatches.values()][0] };
   };
 
   const resolveRetainedContextFromSource = (
     reference: string,
     parentSessionId: string,
     fieldName: string,
-  ): { source?: TaskContextFromSource; error?: string } => {
-    const resolved = resolveTaskReference(reference, parentSessionId, fieldName);
-    if (resolved.error || !resolved.candidate) {
-      return { error: resolved.error };
-    }
-
-    const candidate = resolved.candidate;
-    if (isActiveReferenceStatus(candidate.status)) {
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${reference}' is not available because the delegated session is ${candidate.status}.`,
-      };
-    }
-
-    if (candidate.structuredResult === undefined && !normalizeInputText(candidate.outputText)) {
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${reference}' has no retained final response/result.`,
-      };
-    }
-
-    return {
-      source: {
-        reference,
-        taskId: candidate.taskId,
-        sessionId: candidate.sessionId,
-        status: candidate.status,
-        outputText: candidate.outputText,
-        structuredResult: candidate.structuredResult,
-      },
-    };
-  };
-
-  const resolveContextFromSources = (
-    references: readonly string[],
-    parentSessionId: string,
-    fieldName: string,
-  ): { sources?: TaskContextFromSource[]; error?: string } => {
-    const sources: TaskContextFromSource[] = [];
-
-    for (const reference of references) {
-      const resolved = resolveRetainedContextFromSource(
-        reference,
-        parentSessionId,
-        fieldName,
-      );
-      if (resolved.error || !resolved.source) {
-        return { error: resolved.error };
-      }
-      sources.push(resolved.source);
-    }
-
-    return { sources };
-  };
+  ) => taskReferenceResolver.resolveRetainedContextFromSource(
+    reference,
+    parentSessionId,
+    fieldName,
+  );
 
   const resolveContextFromText = (
     references: readonly string[],
     parentSessionId: string,
     fieldName: string,
-  ): { text?: string; error?: string } => {
-    const resolved = resolveContextFromSources(
-      references,
-      parentSessionId,
-      fieldName,
-    );
-    if (resolved.error || !resolved.sources) {
-      return { error: resolved.error };
-    }
-
-    return { text: renderTaskContextFromText(resolved.sources) };
-  };
+  ) => taskReferenceResolver.resolveContextFromText(
+    references,
+    parentSessionId,
+    fieldName,
+  );
 
   const resolveRetryReference = (
     reference: string,
     parentSessionId: string,
     fieldName: string,
-  ): { taskId?: string; sessionPath?: string; error?: string; autoResumed?: boolean } => {
-    const resolved = resolveTaskReference(reference, parentSessionId, fieldName);
-    if (resolved.error || !resolved.candidate) {
-      return { error: resolved.error };
-    }
-
-    const candidate = resolved.candidate;
-    if (isActiveReferenceStatus(candidate.status)) {
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${reference}' cannot be retried while it is ${candidate.status}.`,
-      };
-    }
-
-    if (!candidate.sessionPath) {
-      return {
-        error: `Task delegation failed: ${fieldName} reference '${reference}' cannot be retried because no retained session path is available.`,
-      };
-    }
-
-    return { taskId: candidate.taskId, sessionPath: candidate.sessionPath };
-  };
+  ) => taskReferenceResolver.resolveRetryReference(
+    reference,
+    parentSessionId,
+    fieldName,
+  );
 
   const resolveImplicitDismissedRetryReference = (
     logicalTaskId: string | undefined,
     parentSessionId: string,
-  ): { taskId?: string; sessionPath?: string; error?: string; autoResumed?: boolean } => {
-    const normalizedLogicalTaskId = normalizeInputText(logicalTaskId).toLowerCase();
-    if (!normalizedLogicalTaskId) {
-      return {};
-    }
-
-    const candidates = buildResolvedTaskReferenceCandidates(parentSessionId)
-      .filter((candidate) => {
-        if (!candidate.lastDismissedAt || !candidate.sessionPath) {
-          return false;
-        }
-
-        if (isActiveReferenceStatus(candidate.status)) {
-          return false;
-        }
-
-        const candidateLogicalTaskId = normalizeInputText(
-          candidate.logicalTaskId || candidate.taskId,
-        ).toLowerCase();
-        return candidateLogicalTaskId === normalizedLogicalTaskId;
-      })
-      .sort((left, right) => {
-        const dismissedAtDelta = (right.lastDismissedAt ?? 0) - (left.lastDismissedAt ?? 0);
-        if (dismissedAtDelta !== 0) {
-          return dismissedAtDelta;
-        }
-
-        return (right.sessionId || "").localeCompare(left.sessionId || "");
-      });
-
-    const candidate = candidates[0];
-    if (!candidate) {
-      return {};
-    }
-
-    return {
-      taskId: candidate.taskId,
-      sessionPath: candidate.sessionPath,
-      autoResumed: true,
-    };
-  };
+  ) => taskReferenceResolver.resolveImplicitDismissedRetryReference(
+    logicalTaskId,
+    parentSessionId,
+  );
 
   const hasRunningVisibleSubagentSession = (): boolean => {
     for (const session of subagentSessions.values()) {
@@ -817,6 +510,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   const requestSubagentUiRender = (immediate = true): void => {
     subagentUiRenderScheduler.request({ immediate });
   };
+
+  const liveSubagentWidgetBatches = createLiveSubagentWidgetBatchTracker({
+    requestRender: requestSubagentUiRender,
+    getActiveParentSessionId: () => activeParentSessionId,
+  });
 
   const syncActiveParentSessionId = (ctx: ExtensionContext): string => {
     activeParentSessionId = normalizeInputText(ctx.sessionManager.getSessionId());
@@ -853,7 +551,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
   const shutdownParentScopedSubagentSessions = (
     parentSessionId: string,
-    terminationReason = routerShutdownTerminationReason,
+    terminationReason = ROUTER_SHUTDOWN_TERMINATION_REASON,
   ): boolean => {
     const { removedCount, terminatedSessionIds } =
       clearSubagentSessionsForParentShutdown(
@@ -871,22 +569,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     return removedCount > 0 || terminatedSessionIds.length > 0;
   };
 
-  const cancelQueuedSubagentDelegations = (reason: string): number => {
-    if (queuedSubagentDelegations.length === 0) {
-      return 0;
-    }
-
-    const queuedRequests = queuedSubagentDelegations.splice(
-      0,
-      queuedSubagentDelegations.length,
-    );
-
-    for (const queuedRequest of queuedRequests) {
-      queuedRequest.reject(new Error(reason));
-    }
-
-    return queuedRequests.length;
-  };
+  const cancelQueuedSubagentDelegations = (reason: string): number =>
+    delegationSlotCoordinator.cancelQueuedDelegations(reason);
 
   const shutdownTrackedSubagentSessions = (ctx: ExtensionContext): boolean => {
     const parentSessionIds = new Set<string>();
@@ -923,7 +607,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
       if (session.status === "running") {
         shutdownChangedState =
-          killSubagentSession(sessionId, routerShutdownTerminationReason) ||
+          killSubagentSession(sessionId, ROUTER_SHUTDOWN_TERMINATION_REASON) ||
           shutdownChangedState;
         continue;
       }
@@ -1018,101 +702,14 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     });
   };
 
-  const acquireDelegationSlot = async (
+  const acquireDelegationSlot = (
     signal: AbortSignal | undefined,
     maxConcurrency: number,
-  ): Promise<{ queued: boolean }> => {
-    if (gracefulShutdownInProgress) {
-      throw new Error(routerShutdownAbortMessage);
-    }
-
-    if (activeSubagentDelegations < maxConcurrency) {
-      activeSubagentDelegations += 1;
-      return { queued: false };
-    }
-
-    return new Promise<{ queued: boolean }>((resolve, reject) => {
-      let settled = false;
-
-      const rejectRequest = (error: Error): void => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
-        signal?.removeEventListener("abort", onAbort);
-        reject(error);
-      };
-
-      const removeQueuedRequest = (): void => {
-        const queueIndex = queuedSubagentDelegations.indexOf(queuedRequest);
-        if (queueIndex >= 0) {
-          queuedSubagentDelegations.splice(queueIndex, 1);
-        }
-      };
-
-      const onAbort = (): void => {
-        removeQueuedRequest();
-        rejectRequest(
-          new Error(
-            "Delegation request was aborted while waiting for an available slot.",
-          ),
-        );
-      };
-
-      const queuedRequest = {
-        resume: (): void => {
-          if (settled) {
-            return;
-          }
-
-          signal?.removeEventListener("abort", onAbort);
-          if (gracefulShutdownInProgress) {
-            rejectRequest(new Error(routerShutdownAbortMessage));
-            return;
-          }
-
-          settled = true;
-          activeSubagentDelegations += 1;
-          resolve({ queued: true });
-        },
-        reject: (error: Error): void => {
-          removeQueuedRequest();
-          rejectRequest(error);
-        },
-      };
-
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-
-      if (gracefulShutdownInProgress) {
-        queuedRequest.reject(new Error(routerShutdownAbortMessage));
-        return;
-      }
-
-      if (signal) {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-
-      queuedSubagentDelegations.push(queuedRequest);
-    });
-  };
+  ): Promise<{ queued: boolean }> =>
+    delegationSlotCoordinator.acquireSlot(signal, maxConcurrency);
 
   const releaseDelegationSlot = (): void => {
-    if (activeSubagentDelegations > 0) {
-      activeSubagentDelegations -= 1;
-    }
-
-    if (gracefulShutdownInProgress) {
-      return;
-    }
-
-    const next = queuedSubagentDelegations.shift();
-    if (next) {
-      next.resume();
-    }
+    delegationSlotCoordinator.releaseSlot();
   };
 
   const appendSessionOutputNotice = (
@@ -1749,6 +1346,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           timedOut: session.status === "timed_out",
           usage: run.usage,
           agentColor: session.agentColor,
+          model: session.model,
+          thinkingLevel: session.thinkingLevel,
+          thinkingLevelMap: session.thinkingLevelMap,
         },
       );
 
@@ -1791,8 +1391,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     if (session.proc && !session.proc.killed) {
       try {
         session.proc.kill("SIGTERM");
-      } catch {
-        // ignore kill errors
+      } catch (error) {
+        void piAgentRouterDebugLogger.warn("subagent.kill_signal_failed", {
+          message: getErrorMessage(error, "Failed to send SIGTERM to delegated process"),
+          sessionId: session.id,
+          taskId: session.taskId,
+          signal: "SIGTERM",
+        });
       }
 
       setTimeout(() => {
@@ -1802,8 +1407,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
         try {
           session.proc.kill("SIGKILL");
-        } catch {
-          // ignore kill errors
+        } catch (error) {
+          void piAgentRouterDebugLogger.warn("subagent.kill_signal_failed", {
+            message: getErrorMessage(error, "Failed to send SIGKILL to delegated process"),
+            sessionId: session.id,
+            taskId: session.taskId,
+            signal: "SIGKILL",
+          });
         }
       }, SUBAGENT_HARD_KILL_DELAY_MS);
     }
@@ -1868,6 +1478,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       parentSessionId?: string;
       displayTask?: string;
       sessionPath?: string;
+      retrySettings?: SubagentAutoRetrySettings;
       onStreamUpdate?: (update: {
         outputText: string;
         usage: SubagentUsage;
@@ -1950,6 +1561,30 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       resolveCompletion,
     };
 
+    const failStartup = (message: string): SubagentSession => {
+      session.status = "failed";
+      session.finishedAt = Date.now();
+      session.stderr = message;
+      taskRegistryEntry.updatedAt = session.finishedAt;
+      taskRegistryEntry.status = "failed";
+      taskRegistryEntry.lastError = message;
+      taskRegistryEntry.lastExitCode = 1;
+      taskRegistryEntry.lastTimedOut = false;
+      session.resolveCompletion?.({
+        code: 1,
+        stdout: "",
+        stderr: message,
+        timedOut: false,
+        sessionPath: session.sessionPath,
+      });
+      session.resolveCompletion = undefined;
+      session.completionPromise = undefined;
+      subagentSessions.set(session.id, session);
+      enforceSubagentSessionRetentionLimit();
+      requestSubagentUiRender();
+      return session;
+    };
+
     if (!(await isDirectoryAsync(cwd))) {
       session.status = "failed";
       session.finishedAt = Date.now();
@@ -2007,8 +1642,26 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     enforceSubagentSessionRetentionLimit();
     requestSubagentUiRender();
 
-    const delegatedModelResolution = resolveAgentModel<{ provider: string; id: string; api: Api }>(ctx, agent);
+    const delegatedModelResolution = await resolveAgentModelAfterReadiness<{
+      provider: string;
+      id: string;
+      api: Api;
+      thinkingLevelMap?: ThinkingLevelMap;
+    }>(
+      ctx,
+      agent,
+      {
+        maxAttempts: DELEGATED_MODEL_READINESS_MAX_ATTEMPTS,
+        waitForReadiness: () => waitForModelDiscoveryReadyOrDelay(pi, DELEGATED_MODEL_READINESS_DELAY_MS),
+      },
+    );
     const delegatedModel = delegatedModelResolution.model;
+    if (delegatedModelResolution.requested && !delegatedModel) {
+      return failStartup(
+        `Model "${delegatedModelResolution.requested}" was not registered after waiting for model discovery readiness. ` +
+        "Use --list-models to verify availability or retry after model-discovery finishes registering providers.",
+      );
+    }
     const delegatedModelRef = delegatedModel
       ? toModelReference(delegatedModel)
       : agent.model?.trim() || undefined;
@@ -2021,23 +1674,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         }
       : undefined;
 
-    const args: string[] = [
-      "--mode",
-      "json",
-      "-p",
-      "--no-extensions",
-      "--session-dir",
-      subagentSessionDir,
-    ];
-    if (options.sessionPath) {
-      args.push("--session", options.sessionPath);
-    }
-    if (delegatedModelRef) {
-      args.push("--model", delegatedModelRef);
-    }
-    if (agent.thinkingLevel) {
-      args.push("--thinking", agent.thinkingLevel);
-    }
+    const delegatedThinkingLevel = resolveDelegatedThinkingLevel(agent, delegatedModel);
+    session.model = delegatedModelRef;
+    session.thinkingLevel = delegatedThinkingLevel;
+    session.thinkingLevelMap = delegatedModel?.thinkingLevelMap;
+    const args = createDelegatedSubagentBaseArgs({
+      sessionDir: subagentSessionDir,
+      sessionPath: options.sessionPath,
+      modelRef: delegatedModelRef,
+      thinkingLevel: delegatedThinkingLevel,
+    });
 
     const subagentProviderId = await detectSubagentProviderIdAsync({
       requestedModel: delegatedModelRef,
@@ -2045,6 +1691,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       parentEnv: process.env,
     });
     const subagentProviderEnvKey = await resolveProviderEnvKeyAsync(subagentProviderId);
+    let delegatedRuntimeArtifacts: DelegatedRuntimeArtifact[] = [];
 
     try {
       const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-router-"));
@@ -2177,18 +1824,22 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const delegatedIdentityExtensionSource =
         buildDelegatedActiveAgentIdentityExtensionSource(agent);
 
-      const runtimeFileWrites: Array<Promise<void>> = [
-        writeFile(tempPrompt, delegatedSystemPrompt, "utf-8"),
-        writeFile(
-          delegatedCopilotInitiatorExtension,
-          copilotInitiatorExtensionSource,
-          "utf-8",
-        ),
-        writeFile(
-          delegatedIdentityExtension,
-          delegatedIdentityExtensionSource,
-          "utf-8",
-        ),
+      const runtimeArtifacts: DelegatedRuntimeArtifact[] = [
+        {
+          path: tempPrompt,
+          source: delegatedSystemPrompt,
+          requiredForLaunch: true,
+        },
+        {
+          path: delegatedCopilotInitiatorExtension,
+          source: copilotInitiatorExtensionSource,
+          requiredForLaunch: true,
+        },
+        {
+          path: delegatedIdentityExtension,
+          source: delegatedIdentityExtensionSource,
+          requiredForLaunch: true,
+        },
       ];
 
       let delegatedRuntimeExtension: string | undefined;
@@ -2200,10 +1851,15 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const extensionSource = buildDelegatedTemperatureExtensionSource(
           agent.temperature,
         );
-        runtimeFileWrites.push(writeFile(delegatedRuntimeExtension, extensionSource, "utf-8"));
+        runtimeArtifacts.push({
+          path: delegatedRuntimeExtension,
+          source: extensionSource,
+          requiredForLaunch: true,
+        });
       }
 
-      await Promise.all(runtimeFileWrites);
+      await writeDelegatedRuntimeArtifactsAsync(runtimeArtifacts);
+      delegatedRuntimeArtifacts = runtimeArtifacts;
 
       args.push("-e", delegatedCopilotInitiatorExtension);
       if (delegatedRuntimeExtension) {
@@ -2228,6 +1884,54 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       requestSubagentUiRender();
       return session;
     }
+
+    const restoreDelegatedRuntimeArtifactsForSpawn = async (
+      reason: string,
+    ): Promise<string | undefined> => {
+      if (!session.tmpDir) {
+        return "Failed to restore delegated runtime files: temporary runtime directory is not available.";
+      }
+
+      if (!session.isolatedAgentDir || !(await isDirectoryAsync(session.isolatedAgentDir))) {
+        const previousIsolatedAgentDir = session.isolatedAgentDir;
+        const isolatedAgentDirResult = await prepareIsolatedAgentDirectoryAsync(session.tmpDir);
+        if ("error" in isolatedAgentDirResult) {
+          return isolatedAgentDirResult.error;
+        }
+
+        if (previousIsolatedAgentDir) {
+          isolatedAgentDirs.delete(previousIsolatedAgentDir);
+        }
+        session.isolatedAgentDir = isolatedAgentDirResult.agentDir;
+        isolatedAgentDirs.add(isolatedAgentDirResult.agentDir);
+        void piAgentRouterDebugLogger.warn("subagent.delegated_runtime_isolated_agent_dir_restored", {
+          sessionId: session.id,
+          taskId: session.taskId,
+          reason,
+          previousIsolatedAgentDir,
+          isolatedAgentDir: isolatedAgentDirResult.agentDir,
+        });
+      }
+
+      const restoreResult = await restoreMissingDelegatedRuntimeArtifactsAsync(
+        delegatedRuntimeArtifacts,
+        isFileAsync,
+      );
+      if ("error" in restoreResult) {
+        return restoreResult.error;
+      }
+
+      if (restoreResult.restoredPaths.length > 0) {
+        void piAgentRouterDebugLogger.warn("subagent.delegated_runtime_artifacts_restored", {
+          sessionId: session.id,
+          taskId: session.taskId,
+          reason,
+          restoredPaths: restoreResult.restoredPaths,
+        });
+      }
+
+      return undefined;
+    };
 
     const LOCK_ERROR_PATTERN = /(Lock file is already being held|ELOCKED)/i;
 
@@ -2469,6 +2173,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       isToolUseStopReason(getLatestAssistantStopReason(run)) &&
       Boolean(run.sessionPath || session.sessionPath);
 
+    const isErrorStopReason = (stopReason: string | undefined): boolean =>
+      normalizeInputText(stopReason).toLowerCase() === "error";
+
+    const shouldContinueAfterOverflowCompaction = (run: SubagentRunResult): boolean =>
+      run.code === 0 &&
+      !run.timedOut &&
+      (run.overflowCompactionRecoveryCount ?? 0) > 0 &&
+      Boolean(run.sessionPath || session.sessionPath) &&
+      (isErrorStopReason(getLatestAssistantStopReason(run)) || !hasAssistantResponse(run));
+
     const mergeContinuationUsage = (
       base: SubagentUsage | undefined,
       next: SubagentUsage | undefined,
@@ -2510,6 +2224,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         messages,
         usage: mergeContinuationUsage(base.usage, next.usage),
         malformedEventCount: (base.malformedEventCount ?? 0) + (next.malformedEventCount ?? 0),
+        overflowCompactionRecoveryCount:
+          (base.overflowCompactionRecoveryCount ?? 0) +
+          (next.overflowCompactionRecoveryCount ?? 0),
         outputText: next.outputText || base.outputText,
         finalResponseText: next.finalResponseText || base.finalResponseText,
         toolInvocations: messages.length > 0
@@ -2523,18 +2240,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       };
     };
 
-    const hasExtensiveDelegatedProgress = (run: SubagentRunResult): boolean => {
-      const usage = run.usage;
-      const outputText = getNormalizedRunOutputText(run);
-      const toolInvocationCount = getRunToolInvocationCount(run);
-
-      return (
-        toolInvocationCount >= 12 ||
-        (usage?.turns ?? 0) >= 6 ||
-        (usage?.input ?? 0) >= 50_000 ||
-        outputText.length >= 24_000
-      );
-    };
+    const hasExtensiveDelegatedProgress = (run: SubagentRunResult): boolean =>
+      hasExtensiveDelegatedProgressForCredentialRetry(run, {
+        outputText: getNormalizedRunOutputText(run),
+        structuredError: getStructuredAssistantErrorMessage(run),
+        toolInvocationCount: getRunToolInvocationCount(run),
+      });
 
     const getRunQualityScore = (run: SubagentRunResult): number => {
       const usage = run.usage;
@@ -2588,6 +2299,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           base.malformedEventCount ?? 0,
           candidate.malformedEventCount ?? 0,
         ),
+        overflowCompactionRecoveryCount: Math.max(
+          base.overflowCompactionRecoveryCount ?? 0,
+          candidate.overflowCompactionRecoveryCount ?? 0,
+        ),
         outputText:
           (candidate.outputText?.trim().length ?? 0) >=
           (base.outputText?.trim().length ?? 0)
@@ -2620,9 +2335,16 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return !hasMeaningfulOutput(run);
     };
 
+    type RetryableCredentialFailure = {
+      kind: "quota" | "credential_auth" | "transient";
+      message: string;
+      retryAfter?: ProviderRetryDelayHint;
+    };
+
     const getRetryableCredentialFailure = (
       run: SubagentRunResult,
-    ): { kind: "quota" | "credential_auth" | "transient"; message: string } | undefined => {
+      options: { allowExtensiveProgress?: boolean } = {},
+    ): RetryableCredentialFailure | undefined => {
       if (run.timedOut) {
         return undefined;
       }
@@ -2633,18 +2355,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const candidates = [structuredError, stderrText, silentSuccessMessage].filter(
         (value): value is string => Boolean(value),
       );
-      const allowFullTaskRetry = !hasExtensiveDelegatedProgress(run);
+      const allowCredentialRetry =
+        options.allowExtensiveProgress === true || !hasExtensiveDelegatedProgress(run);
 
       for (const candidate of candidates) {
+        const retryAfter = parseProviderRetryDelayHint(candidate);
         if (isRetryableCredentialAuthError(candidate)) {
-          return allowFullTaskRetry
-            ? { kind: "credential_auth", message: candidate }
+          return allowCredentialRetry
+            ? { kind: "credential_auth", message: candidate, retryAfter }
             : undefined;
         }
 
         if (isQuotaOrRateLimitError(candidate)) {
-          return allowFullTaskRetry
-            ? { kind: "quota", message: candidate }
+          return allowCredentialRetry
+            ? { kind: "quota", message: candidate, retryAfter }
             : undefined;
         }
 
@@ -2652,13 +2376,38 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           isTransientCredentialError(candidate) ||
           isRetryableModelAvailabilityError(subagentProviderId, candidate)
         ) {
-          return allowFullTaskRetry
-            ? { kind: "transient", message: candidate }
+          return allowCredentialRetry
+            ? { kind: "transient", message: candidate, retryAfter }
             : undefined;
         }
       }
 
       return undefined;
+    };
+
+    const reportRetryableCredentialFailure = async (
+      failure: RetryableCredentialFailure,
+      credentialId: string,
+    ): Promise<void> => {
+      if (failure.kind === "quota") {
+        await reportSubagentKeyError(session.id, credentialId, failure.message.slice(0, 500));
+        return;
+      }
+
+      if (failure.kind === "credential_auth") {
+        await reportSubagentCredentialAuthError(
+          session.id,
+          credentialId,
+          failure.message.slice(0, 500),
+        );
+        return;
+      }
+
+      await reportSubagentTransientKeyError(
+        session.id,
+        credentialId,
+        failure.message.slice(0, 500),
+      );
     };
 
     const subagentProcessLifecycle = createSubagentProcessLifecycle({
@@ -2673,30 +2422,22 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       },
     });
 
-    const cliEntrypoint = normalizeInputText(process.argv[1]);
-    const canSpawnCurrentCli = Boolean(cliEntrypoint && (await isFileAsync(cliEntrypoint)));
-    const command = canSpawnCurrentCli
-      ? process.execPath
-      : process.platform === "win32"
-        ? process.env.ComSpec || "cmd.exe"
-        : "pi";
-    const buildCommandArgs = (continuationSessionPath?: string): string[] => {
-      const invocationArgs = [...args];
-      const normalizedContinuationSessionPath = normalizeInputText(continuationSessionPath);
-      if (normalizedContinuationSessionPath && !options.sessionPath) {
-        invocationArgs.push("--session", normalizedContinuationSessionPath);
-      }
-
-      return canSpawnCurrentCli
-        ? [cliEntrypoint, ...invocationArgs]
-        : process.platform === "win32"
-          ? ["/d", "/s", "/c", "pi", ...invocationArgs]
-          : invocationArgs;
-    };
+    const delegatedCliSpawnCommand = await resolveDelegatedCliSpawnCommand({
+      cliEntrypoint: process.argv[1],
+      nodeExecPath: process.execPath,
+      invocationArgs: args,
+      hasExplicitSessionPath: Boolean(options.sessionPath),
+      isFile: isFileAsync,
+    });
     const delegatedTaskPrompt = `Task: ${task}`;
 
+    const CONTINUATION_CREDENTIAL_RETRY_BASE_DELAY_MS = 1_500;
+    const CONTINUATION_CREDENTIAL_RETRY_JITTER_MAX_MS = 500;
     let lastAcquiredCredentialId: string | undefined;
+    const credentialIdsExcludedFromRetry: string[] = [];
     let quotaCredentialRetryLimitPromise: Promise<number> | undefined;
+    let nextTransientRetrySessionPath: string | undefined;
+    const effectiveRetrySettings: SubagentAutoRetrySettings = options.retrySettings ?? DEFAULT_TRANSIENT_RETRY_SETTINGS;
 
     const getQuotaCredentialRetryLimit = (): Promise<number> => {
       quotaCredentialRetryLimitPromise ??= resolveSubagentQuotaCredentialRetryLimit(
@@ -2709,6 +2450,22 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         },
       );
       return quotaCredentialRetryLimitPromise;
+    };
+
+    const prepareCredentialLeaseRefreshForRetry = (
+      failedCredentialId: string | undefined = lastAcquiredCredentialId,
+    ): void => {
+      if (!failedCredentialId) {
+        return;
+      }
+
+      if (!credentialIdsExcludedFromRetry.includes(failedCredentialId)) {
+        credentialIdsExcludedFromRetry.push(failedCredentialId);
+      }
+      releaseKeyForSubagent(session.id);
+      if (lastAcquiredCredentialId === failedCredentialId) {
+        lastAcquiredCredentialId = undefined;
+      }
     };
 
     const runSubagentProcess = async (
@@ -2750,6 +2507,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               requestedModel: delegatedModelRef,
               modelContext: delegatedModelContext,
               parentSessionId: session.parentSessionId,
+              excludedCredentialIds: [...credentialIdsExcludedFromRetry],
             },
           )
         : null;
@@ -2840,8 +2598,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               taskId: session.taskId,
               parentSessionId: session.parentSessionId,
             });
-          } catch {
-            // ignore attach stream callback failures
+          } catch (error) {
+            void piAgentRouterDebugLogger.warn("subagent.stream_update_callback_failed", {
+              message: getErrorMessage(error, "Failed to deliver delegated stream update"),
+              sessionId: session.id,
+              taskId: session.taskId,
+              parentSessionId: session.parentSessionId,
+            });
           }
         }
 
@@ -3017,6 +2780,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 messages: [...eventState.messages],
                 usage: cloneSubagentUsage(eventState.usage),
                 malformedEventCount: eventState.malformedEventCount,
+                overflowCompactionRecoveryCount: eventState.overflowCompactionRecoveryCount,
                 outputText: eventState.outputText,
                 finalResponseText: eventState.finalResponseText,
                 toolInvocations: getSubagentToolInvocationsFromState(eventState),
@@ -3045,6 +2809,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 messages: [...eventState.messages],
                 usage: cloneSubagentUsage(eventState.usage),
                 malformedEventCount: eventState.malformedEventCount,
+                overflowCompactionRecoveryCount: eventState.overflowCompactionRecoveryCount,
                 outputText: eventState.outputText,
                 finalResponseText: eventState.finalResponseText,
                 toolInvocations: getSubagentToolInvocationsFromState(eventState),
@@ -3062,7 +2827,20 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         };
 
         const startSubagentProcess = async (): Promise<void> => {
+          if ("error" in delegatedCliSpawnCommand) {
+            appendStderrMessage(delegatedCliSpawnCommand.error);
+            completeAttempt(1);
+            return;
+          }
+
           try {
+            const runtimeArtifactRestoreError = await restoreDelegatedRuntimeArtifactsForSpawn("pre_spawn");
+            if (runtimeArtifactRestoreError) {
+              appendStderrMessage(runtimeArtifactRestoreError);
+              completeAttempt(1);
+              return;
+            }
+
             const parentSessionId = activeParentSessionId || syncActiveParentSessionId(ctx);
             const inheritedEnvKeys =
               subagentProviderEnvKey && shouldInheritParentCredentialEnvForProvider(subagentProviderId)
@@ -3073,6 +2851,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               parentSessionId,
               isolatedAgentDir: session.isolatedAgentDir,
               multiAuthRuntimeDir: AGENT_DIR,
+              permissionPolicyAgentDir: AGENT_DIR,
+              modelDiscoveryCacheOnly: Boolean(delegatedModelRef),
               inheritedEnvKeys,
               delegatedCredential: acquiredKeyLease
                 ? {
@@ -3084,7 +2864,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 : undefined,
             });
 
-            const proc = spawn(command, buildCommandArgs(continuationSessionPath), {
+            const proc = spawn(delegatedCliSpawnCommand.command, delegatedCliSpawnCommand.buildArgs(continuationSessionPath), {
               cwd,
               shell: false,
               stdio: ["pipe", "pipe", "pipe"],
@@ -3130,10 +2910,97 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       });
     };
 
+    const runSubagentProcessWithRuntimeArtifactRetry = async (
+      stdinText: string,
+      continuationSessionPath?: string,
+    ): Promise<SubagentRunResult> => {
+      const run = await runSubagentProcess(stdinText, continuationSessionPath);
+      if (
+        run.code === 0 ||
+        run.timedOut ||
+        session.status !== "running" ||
+        hasMeaningfulOutput(run) ||
+        !isDelegatedRuntimeArtifactLoadFailure(run.stderr, delegatedRuntimeArtifacts)
+      ) {
+        return run;
+      }
+
+      const retryNotice =
+        `[pi-agent-router] Delegated runtime artifact load failed for task ${session.id.slice(0, 8)}. ` +
+        "Restoring runtime files and retrying delegated process once.";
+      appendSessionOutputNotice(
+        session,
+        "Delegated runtime files disappeared before extension load and were restored; the delegated process was retried once.",
+      );
+      void piAgentRouterDebugLogger.warn("subagent.delegated_runtime_artifact_load_retry", {
+        sessionId: session.id,
+        taskId: session.taskId,
+        sessionPath: continuationSessionPath || session.sessionPath,
+        stderr: run.stderr.slice(0, 2_000),
+      });
+
+      const restoreError = await restoreDelegatedRuntimeArtifactsForSpawn("post_load_failure");
+      if (restoreError) {
+        return {
+          ...run,
+          stderr: mergeCapturedText(run.stderr, mergeCapturedText(retryNotice, restoreError)),
+        };
+      }
+
+      const retryRun = await runSubagentProcess(stdinText, continuationSessionPath);
+      if (retryRun.code === 0 && !retryRun.timedOut) {
+        return retryRun;
+      }
+
+      return {
+        ...retryRun,
+        stderr: mergeCapturedText(run.stderr, mergeCapturedText(retryNotice, retryRun.stderr)),
+      };
+    };
+
     const runSubagentAttempt = async (): Promise<SubagentRunResult> => {
       const maxToolUseContinuations = 12;
+      const maxOverflowCompactionContinuations = 2;
       let continuationCount = 0;
-      let run = await runSubagentProcess(delegatedTaskPrompt);
+      let overflowCompactionContinuationCount = 0;
+      let continuationCredentialRetryCount = 0;
+      let continuationTransientRetryCount = 0;
+      const retrySessionPath = nextTransientRetrySessionPath;
+      nextTransientRetrySessionPath = undefined;
+      let run = await runSubagentProcessWithRuntimeArtifactRetry(
+        retrySessionPath ? "" : delegatedTaskPrompt,
+        retrySessionPath,
+      );
+
+      const continueAfterOverflowCompaction = async (): Promise<void> => {
+        while (
+          shouldContinueAfterOverflowCompaction(run) &&
+          overflowCompactionContinuationCount < maxOverflowCompactionContinuations &&
+          session.status === "running" &&
+          !session.timedOut
+        ) {
+          const continuationSessionPath = run.sessionPath || session.sessionPath;
+          if (!continuationSessionPath) {
+            break;
+          }
+
+          overflowCompactionContinuationCount += 1;
+          void piAgentRouterDebugLogger.info("subagent.overflow_compaction_continuation", {
+            message:
+              `[pi-agent-router] Continuing delegated task ${session.id.slice(0, 8)} after overflow compaction ` +
+              `(${overflowCompactionContinuationCount}/${maxOverflowCompactionContinuations}).`,
+            sessionId: session.id,
+            taskId: session.taskId,
+            sessionPath: continuationSessionPath,
+            continuationCount: overflowCompactionContinuationCount,
+          });
+
+          const continuationRun = await runSubagentProcessWithRuntimeArtifactRetry("Continue.", continuationSessionPath);
+          run = mergeContinuationRunResult(run, continuationRun);
+        }
+      };
+
+      await continueAfterOverflowCompaction();
 
       while (
         shouldContinueDelegatedToolUse(run) &&
@@ -3157,8 +3024,90 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           continuationCount,
         });
 
-        const continuationRun = await runSubagentProcess("", continuationSessionPath);
+        let continuationRun = await runSubagentProcessWithRuntimeArtifactRetry("", continuationSessionPath);
+        while (session.status === "running" && !session.timedOut) {
+          const retryableFailure = getRetryableCredentialFailure(continuationRun, {
+            allowExtensiveProgress: true,
+          });
+          const failedCredentialId = lastAcquiredCredentialId;
+          if (!retryableFailure || (!failedCredentialId && retryableFailure.kind !== "transient")) {
+            break;
+          }
+
+          let retryAttempt: number;
+          let retryLimit: number;
+          let delayMs: number;
+          let retryMode: "auto retry" | "credential retry" = "credential retry";
+          if (retryableFailure.kind === "transient") {
+            retryLimit = effectiveRetrySettings.enabled ? effectiveRetrySettings.maxRetries : 0;
+            if (continuationTransientRetryCount >= retryLimit) {
+              break;
+            }
+            continuationTransientRetryCount += 1;
+            retryAttempt = continuationTransientRetryCount;
+            delayMs = calculateTransientRetryDelayMs(effectiveRetrySettings, retryAttempt);
+            retryMode = "auto retry";
+          } else {
+            retryLimit = await getQuotaCredentialRetryLimit();
+            if (continuationCredentialRetryCount >= retryLimit) {
+              break;
+            }
+            continuationCredentialRetryCount += 1;
+            retryAttempt = continuationCredentialRetryCount;
+            delayMs =
+              CONTINUATION_CREDENTIAL_RETRY_BASE_DELAY_MS * retryAttempt +
+              Math.floor(Math.random() * CONTINUATION_CREDENTIAL_RETRY_JITTER_MAX_MS);
+          }
+
+          if (failedCredentialId) {
+            await reportRetryableCredentialFailure(retryableFailure, failedCredentialId);
+          }
+          if (retryableFailure.kind !== "transient") {
+            prepareCredentialLeaseRefreshForRetry(failedCredentialId);
+          }
+          const failureLabel = retryableFailure.kind === "credential_auth"
+            ? "Credential authentication error"
+            : retryableFailure.kind === "quota"
+              ? "Quota/rate-limit error"
+              : "Transient provider error";
+          const retryMessage =
+            `[pi-agent-router] ${failureLabel} during delegated task ${session.id.slice(0, 8)} tool-use continuation ` +
+            `(${retryMode} ${retryAttempt}/${retryLimit}). Retrying continuation in ${delayMs}ms.`;
+          session.stderr = mergeCapturedText(session.stderr, retryMessage);
+          void piAgentRouterDebugLogger.warn("subagent.continuation_credential_retry", {
+            attempt: retryAttempt,
+            credentialId: failedCredentialId,
+            delayMs,
+            failureKind: retryableFailure.kind,
+            maxAttempts: retryLimit,
+            message: retryMessage,
+            sessionId: session.id,
+            taskId: session.taskId,
+            continuationCount,
+            sessionPath: continuationSessionPath,
+          });
+          requestSubagentUiRender(false);
+
+          await sleep(delayMs);
+          if (session.status !== "running" || session.timedOut) {
+            break;
+          }
+          continuationRun = await runSubagentProcessWithRuntimeArtifactRetry("", continuationSessionPath);
+        }
+
         run = mergeContinuationRunResult(run, continuationRun);
+        await continueAfterOverflowCompaction();
+      }
+
+      if (shouldContinueAfterOverflowCompaction(run)) {
+        return {
+          ...run,
+          code: run.code === 0 ? 1 : run.code,
+          stderr: mergeCapturedText(
+            run.stderr,
+            `[pi-agent-router] Delegated task ${session.id.slice(0, 8)} stopped after overflow compaction recovery without a successful continuation.`,
+          ),
+        };
       }
 
       if (shouldContinueDelegatedToolUse(run)) {
@@ -3178,13 +3127,37 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     void subagentProcessLifecycle.runWithRetry({
       runAttempt: runSubagentAttempt,
       getErrorMessage,
-      getRetryableCredentialFailure,
+      getRetryableCredentialFailure: (run) => {
+        const regularFailure = getRetryableCredentialFailure(run);
+        if (regularFailure) {
+          return regularFailure;
+        }
+
+        const continuationSessionPath = run.sessionPath || session.sessionPath;
+        if (!continuationSessionPath) {
+          return undefined;
+        }
+
+        const progressSafeFailure = getRetryableCredentialFailure(run, {
+          allowExtensiveProgress: true,
+        });
+        return progressSafeFailure?.kind === "transient" ? progressSafeFailure : undefined;
+      },
       getRunFailureText,
       preferRicherRunResult,
       isLockRetryableFailure,
       sleep,
       getLastAcquiredCredentialId: () => lastAcquiredCredentialId,
       getQuotaCredentialRetryLimit,
+      transientRetrySettings: effectiveRetrySettings,
+      prepareRetryAttempt: ({ run, failure }) => {
+        if (failure.kind === "transient") {
+          nextTransientRetrySessionPath = run.sessionPath || session.sessionPath;
+          return;
+        }
+
+        prepareCredentialLeaseRefreshForRetry();
+      },
       clearTransientCredentialError: clearSubagentTransientKeyError,
       reportQuotaCredentialError: (message, credentialId) =>
         reportSubagentKeyError(session.id, credentialId, message.slice(0, 500)),
@@ -3203,9 +3176,32 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 : "subagent.transient_retry";
         void piAgentRouterDebugLogger.warn(eventName, {
           attempt: event.attempt,
+          defaultDelayMs: event.defaultDelayMs,
           delayMs: event.delayMs,
           maxAttempts: event.maxAttempts,
           message: event.message,
+          providerRetryDelayCapped: event.providerRetryDelayCapped,
+          providerRetryDelayMs: event.providerRetryDelayMs,
+          providerRetryDelaySource: event.providerRetryDelaySource,
+          reason: event.reason,
+          sessionId: event.sessionId,
+          usedProviderRetryDelay: event.usedProviderRetryDelay,
+        });
+      },
+      onRetryExhausted: (event) => {
+        const eventName =
+          event.kind === "quota"
+            ? "subagent.quota_retry_exhausted"
+            : event.kind === "credential_auth"
+              ? "subagent.credential_auth_retry_exhausted"
+              : "subagent.transient_retry_exhausted";
+        void piAgentRouterDebugLogger.warn(eventName, {
+          attempts: event.attempts,
+          maxAttempts: event.maxAttempts,
+          message: event.message,
+          providerRetryDelayMs: event.providerRetryDelayMs,
+          providerRetryDelaySource: event.providerRetryDelaySource,
+          reason: event.reason,
           sessionId: event.sessionId,
         });
       },
@@ -3243,7 +3239,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             const sessions = listSubagentSessions();
             return renderSubagentWidgetLines({
               sessions,
-              totalCount: resolveSubagentWidgetTotalCount(sessions),
+              totalCount: liveSubagentWidgetBatches.resolveTotalCount(sessions),
               width,
               theme,
               formatDuration,
@@ -3508,7 +3504,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       }
 
       const now = Date.now();
-      if (tabCycleDebounceMs > 0 && now - lastTabCycleAtMs < tabCycleDebounceMs) {
+      if (shouldConsumeTabCycleInput(now, lastTabCycleAtMs, tabCycleDebounceMs)) {
         return { consume: true, data: "" };
       }
 
@@ -3554,14 +3550,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     setActiveAgent(ctx, persistedAgent.name, { persist: false, notify: false });
   };
 
-  pi.on("resources_discover", async (event) => {
-    if (event.reason === "reload") {
-      invalidateRouterReloadCaches();
-    }
-  });
+  registerRouterReloadHandler(pi);
 
   pi.on("session_start", async (event, ctx) => {
-    gracefulShutdownInProgress = false;
+    delegationSlotCoordinator.setShutdownInProgress(false);
     subagentUiRenderScheduler.cancel();
     manualModelOverrideForActiveAgent = undefined;
     manualThinkingOverrideByAgent.clear();
@@ -3576,8 +3568,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         persistActiveAgent(ctx, activeAgent);
       }
     } else {
-      activeSubagentDelegations = 0;
-      cancelQueuedSubagentDelegations(routerDelegationResetMessage);
+      delegationSlotCoordinator.reset(ROUTER_DELEGATION_RESET_MESSAGE);
       pendingDelegationJobs.clear();
       dispatchReminderQueued = false;
       autoCompletionWaitJob = null;
@@ -3629,9 +3620,9 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    gracefulShutdownInProgress = true;
+    delegationSlotCoordinator.setShutdownInProgress(true);
     subagentUiRenderScheduler.cancel();
-    cancelQueuedSubagentDelegations(routerShutdownAbortMessage);
+    cancelQueuedSubagentDelegations(ROUTER_SHUTDOWN_ABORT_MESSAGE);
     shutdownTrackedSubagentSessions(ctx);
 
     activeParentSessionId = "";
@@ -3639,10 +3630,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     clearAgentStatus(ctx);
     manualModelOverrideForActiveAgent = undefined;
     manualThinkingOverrideByAgent.clear();
-    activeSubagentDelegations = 0;
+    delegationSlotCoordinator.resetActiveDelegations();
     pendingDelegationJobs.clear();
     dispatchReminderQueued = false;
     autoCompletionWaitJob = null;
+    await piAgentRouterDebugLogger.dispose();
 
     if (!ctx.hasUI) {
       subagentOverlayRenderRequest = null;
@@ -4057,8 +4049,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const defaultExecutionCwd = await resolveExistingWorkingDirectoryAsync(
         ctx.cwd,
       );
-      const { controls: taskControls, warnings: controlWarnings } =
+      const { controls: taskControls, warnings: taskControlWarnings } =
         await resolveTaskControlsAsync(defaultExecutionCwd);
+      const { controls: retryControls, warnings: retryControlWarnings } =
+        await resolveRetryControlsAsync(defaultExecutionCwd);
+      const controlWarnings = [...taskControlWarnings, ...retryControlWarnings];
       const modeAgentLabel =
         distinctTaskAgents.length === 1
           ? distinctTaskAgents[0]
@@ -4152,6 +4147,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       }
 
       const parentSessionId = ctx.sessionManager.getSessionId();
+      hydrateRecoveredTaskReferencesFromSessionHistory(ctx, parentSessionId);
       const sharedContextFromReferences = normalizeTaskReferenceList(
         params.contextFrom,
         "contextFrom",
@@ -4380,33 +4376,17 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
       if (hasExecutableTasks) {
         const delegationStartedAt = Date.now();
-        const normalizedTasks = providedTasks.map((task, index) => ({
-          agent: normalizeInputText(task.agent),
-          task: normalizeInputText(task.task),
-          cwd: normalizeInputText(task.cwd) || undefined,
-          taskLabel: hasTaskStyleMode
-            ? taskStyleMetadata[index]?.id
-            : undefined,
-          taskDescription: hasTaskStyleMode
-            ? taskStyleMetadata[index]?.description ||
-              taskStyleMetadata[index]?.id
-            : undefined,
-          assignment: taskStyleMetadata[index]?.assignment || "",
-          skills: taskStyleMetadata[index]?.skills,
-          contextFromReferences: itemContextFromReferencesByIndex[index] || [],
-          retry: taskStyleMetadata[index]?.retry === true,
-          retryFrom: taskStyleMetadata[index]?.retryFrom,
-        }));
+        const normalizedTasks = normalizeTaskDelegations({
+          providedTasks,
+          taskStyleMetadata,
+          contextFromReferencesByIndex: itemContextFromReferencesByIndex,
+        });
 
-        const invalidTaskIndex = normalizedTasks.findIndex(
-          (task) => !task.agent || !task.task,
+        const invalidTaskIndex = findInvalidTaskDelegationIndex(normalizedTasks);
+        const queuedDelegationLabel = getQueuedDelegationLabel(
+          requestedMode,
+          normalizedTasks.length,
         );
-        const queuedDelegationLabel =
-          requestedMode === "chain"
-            ? "Chain delegation"
-            : normalizedTasks.length === 1
-              ? "Task delegation"
-              : "Parallel delegation";
         if (invalidTaskIndex >= 0) {
           const details = createSubagentExecutionDetails(
             delegatedBy,
@@ -4432,13 +4412,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         const agentsByName = new Map(
           availableAgents.map((item) => [item.name, item] as const),
         );
-        const unknownTaskAgents = [
-          ...new Set(
-            normalizedTasks
-              .map((task) => task.agent)
-              .filter((agentName) => !agentsByName.has(agentName)),
-          ),
-        ];
+        const unknownTaskAgents = findUnknownTaskAgents(
+          normalizedTasks,
+          availableAgents,
+        );
         if (unknownTaskAgents.length > 0) {
           const details = createSubagentExecutionDetails(
             delegatedBy,
@@ -4450,9 +4427,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
               parentSessionId: ctx.sessionManager.getSessionId(),
             },
           );
-          const unknownAgentLabel = unknownTaskAgents.length === 1
-            ? `Unknown agent: ${unknownTaskAgents[0]}`
-            : `Unknown agents: ${unknownTaskAgents.join(", ")}`;
+          const unknownAgentLabel = formatUnknownTaskAgentsLabel(unknownTaskAgents);
           return {
             isError: true,
             content: [
@@ -4465,66 +4440,37 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           };
         }
 
-        const builtInAgentColorFallback = new Map<string, string>([
-          ["architect", "#50E3C2"],
-          ["ask", "#9013FE"],
-          ["code", "#4A90E2"],
-          ["debug", "#F5A623"],
-          ["devops", "#6C5CE7"],
-          ["docs", "#417505"],
-          ["git", "#D0021B"],
-          ["orchestrator", "#7ED321"],
-          ["product", "#8B572A"],
-          ["refactor", "#4A4A4A"],
-          ["researcher", "#F8E71C"],
-          ["security", "#B00020"],
-          ["test", "#2D9CDB"],
-          ["ui", "#FF6F61"],
-        ]);
-        const fallbackUserAgentColors = new Map(
-          (await loadAgentsAsync())
-            .filter(
-              (agent) => typeof agent.color === "string" && agent.color.trim().length > 0,
-            )
-            .map(
-              (agent) => [normalizeInputText(agent.name).toLowerCase(), agent.color!] as const,
-            ),
+        const fallbackUserAgentColors = buildDelegatedAgentColorFallbackMap(
+          await loadAgentsAsync(),
         );
-        const resolveDelegatedAgentColor = (
-          agentName: string,
-          agent: Agent | undefined,
-        ): string | undefined => {
-          const normalizedAgentName = normalizeInputText(agentName).toLowerCase();
-          const configuredColor = normalizeInputText(agent?.color);
-          if (configuredColor) {
-            return configuredColor;
-          }
-
-          const fallbackColor = fallbackUserAgentColors.get(normalizedAgentName);
-          if (normalizeInputText(fallbackColor)) {
-            return normalizeInputText(fallbackColor);
-          }
-
-          return builtInAgentColorFallback.get(normalizedAgentName);
+        type DelegatedDisplayModel = {
+          provider: string;
+          id: string;
+          api?: Api;
+          thinkingLevelMap?: ThinkingLevelMap;
         };
-        const resolveDelegatedModelLabel = (
+
+        const resolveDelegatedModelDisplay = (
           agent: Agent | undefined,
-        ): string | undefined => {
+        ): { model?: string; thinkingLevelMap?: ThinkingLevelMap } => {
           if (!agent) {
-            return undefined;
+            return {};
           }
 
           const configuredModel = normalizeInputText(agent.model);
           if (!configuredModel) {
-            return undefined;
+            return {};
           }
 
-          const resolution = resolveAgentModel(ctx, agent);
+          const resolution = resolveAgentModel<DelegatedDisplayModel>(ctx, agent);
           if (resolution.model) {
-            return toModelReference(resolution.model);
+            return {
+              model: toModelReference(resolution.model),
+              thinkingLevelMap: resolution.model.thinkingLevelMap,
+            };
           }
 
-          return configuredModel;
+          return { model: configuredModel };
         };
 
         const taskResults: NonNullable<SubagentExecutionDetails["results"]> =
@@ -4533,21 +4479,27 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             const thinkingLevel = normalizeInputText(
               configuredAgent?.thinkingLevel,
             );
+            const modelDisplay = resolveDelegatedModelDisplay(configuredAgent);
 
             return {
               index: index + 1,
               delegatedAgent: task.agent,
               delegatedTask: task.task,
-              agentColor: resolveDelegatedAgentColor(task.agent, configuredAgent),
+              agentColor: resolveDelegatedAgentColor({
+                agentName: task.agent,
+                agent: configuredAgent,
+                fallbackUserAgentColors,
+              }),
               taskLabel: task.taskLabel,
               taskDescription: task.taskDescription,
-              model: resolveDelegatedModelLabel(configuredAgent),
+              model: modelDisplay.model,
+              thinkingLevelMap: modelDisplay.thinkingLevelMap,
               thinkingLevel: thinkingLevel || undefined,
               status: "queued",
             };
           });
         const liveSubagentWidgetBatchId = randomUUID();
-        registerLiveSubagentWidgetBatch(
+        liveSubagentWidgetBatches.registerBatch(
           liveSubagentWidgetBatchId,
           parentSessionId,
           normalizedTasks.length,
@@ -4614,6 +4566,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 snapshot.summary.total === 1 ? taskResults[0]?.model : undefined,
               thinkingLevel:
                 snapshot.summary.total === 1 ? taskResults[0]?.thinkingLevel : undefined,
+              thinkingLevelMap:
+                snapshot.summary.total === 1 ? taskResults[0]?.thinkingLevelMap : undefined,
               duration:
                 snapshot.summary.total === 1 ? taskResults[0]?.duration : undefined,
               usage: aggregateUsageFromResults(taskResults),
@@ -4648,7 +4602,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             return undefined;
           }
 
-          return truncatePreview(normalized, 220);
+          return truncatePreview(normalized, 1_000);
         };
 
         const buildCompactPartialResults = (
@@ -4712,8 +4666,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             (onUpdate as unknown as (partial: unknown) => void)(
               compatibilityUpdate,
             );
-          } catch {
-            // ignore partial update rendering errors
+          } catch (error) {
+            logTaskPartialUpdateRenderFailure(piAgentRouterDebugLogger, error);
           }
         };
 
@@ -4887,11 +4841,18 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   throw new Error(taskResult.error);
                 }
 
+                const modelDisplay = resolveDelegatedModelDisplay(agent);
                 taskResult.model =
-                  taskResult.model || resolveDelegatedModelLabel(agent);
+                  taskResult.model || modelDisplay.model;
+                taskResult.thinkingLevelMap =
+                  taskResult.thinkingLevelMap || modelDisplay.thinkingLevelMap;
                 taskResult.agentColor =
                   taskResult.agentColor ||
-                  resolveDelegatedAgentColor(task.agent, agent);
+                  resolveDelegatedAgentColor({
+                    agentName: task.agent,
+                    agent,
+                    fallbackUserAgentColors,
+                  });
                 taskResult.thinkingLevel =
                   taskResult.thinkingLevel ||
                   normalizeInputText(agent.thinkingLevel) ||
@@ -4960,6 +4921,31 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   ];
                 }
 
+                let retrySessionPath = retryResume.sessionPath;
+                if (retrySessionPath) {
+                  const sessionIntegrity = await inspectSessionToolCallIntegrity(retrySessionPath);
+                  if (sessionIntegrity.hasPendingToolCalls || sessionIntegrity.error) {
+                    const pendingIds = sessionIntegrity.pendingToolCallIds.slice(0, 4).join(", ");
+                    const reason = sessionIntegrity.error
+                      ? sessionIntegrity.error
+                      : `retained session has pending tool calls${pendingIds ? ` (${pendingIds})` : ""}`;
+                    retrySessionPath = undefined;
+                    taskResult.contractWarnings = [
+                      ...(taskResult.contractWarnings || []),
+                      `Task ${taskResult.index}: started a clean retry instead of resuming '${retryReference || task.taskLabel}' because ${reason}.`,
+                    ];
+                    void piAgentRouterDebugLogger.warn("task.retry_session_clean_start", {
+                      message:
+                        `[pi-agent-router] Starting clean retry for task ${taskResult.index} because retained session cannot be safely resumed: ${reason}.`,
+                      taskId: retryResume.taskId,
+                      logicalTaskId: task.taskLabel,
+                      sessionPath: retryResume.sessionPath,
+                      pendingToolCallIds: sessionIntegrity.pendingToolCallIds,
+                      inspectionError: sessionIntegrity.error,
+                    });
+                  }
+                }
+
                 const session = await startBackgroundSubagent(
                   ctx,
                   delegatedBy,
@@ -4971,13 +4957,15 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                     notifyCompletion: false,
                     taskId: retryResume.taskId,
                     logicalTaskId: task.taskLabel,
-                    sessionPath: retryResume.sessionPath,
+                    sessionPath: retrySessionPath,
+                    retrySettings: retryControls,
                     onStreamUpdate: (update) => {
                       if (attachToParent || !taskResult.output) {
                         taskResult.output = update.outputText;
                       }
                       taskResult.usage = update.usage;
                       taskResult.toolCalls = update.toolInvocationCount;
+                      taskResult.toolInvocations = update.toolInvocations;
                       taskResult.latestToolCall = update.latestToolCall;
                       const streamLabel = taskResult.taskLabel
                         ? `${taskResult.taskLabel} (${task.agent})`
@@ -4989,7 +4977,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   },
                 );
                 taskResult.sessionId = session.id;
-                trackLiveSubagentWidgetSession(liveSubagentWidgetBatchId, session.id);
+                liveSubagentWidgetBatches.trackSession(liveSubagentWidgetBatchId, session.id);
 
                 if (session.status !== "running" || !session.completionPromise) {
                   taskResult.status = "failed";
@@ -5147,6 +5135,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                 taskResult.toolCalls =
                   run.toolInvocationCount ??
                   countSubagentToolInvocations(finalToolInvocations);
+                taskResult.toolInvocations = finalToolInvocations;
                 taskResult.latestToolCall =
                   run.latestToolCall ||
                   ((run.messages && run.messages.length > 0
@@ -5182,12 +5171,13 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   throw error;
                 }
 
-                if (workerSignal.aborted || gracefulShutdownInProgress) {
+                const routerShutdownInProgress = delegationSlotCoordinator.isShutdownInProgress();
+                if (workerSignal.aborted || routerShutdownInProgress) {
                   taskResult.status = "aborted";
                   taskResult.abortReason =
                     taskResult.abortReason ||
-                    (gracefulShutdownInProgress
-                      ? routerShutdownAbortMessage
+                    (routerShutdownInProgress
+                      ? ROUTER_SHUTDOWN_ABORT_MESSAGE
                       : "Delegation aborted by parent signal.");
                   taskResult.error = taskResult.abortReason;
                 } else {
@@ -5261,7 +5251,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           }
         } finally {
           stopParallelProgressTicker();
-          clearLiveSubagentWidgetBatch(liveSubagentWidgetBatchId);
+          liveSubagentWidgetBatches.clearBatch(liveSubagentWidgetBatchId);
           resolvePendingDelegationJob?.();
           pendingDelegationJobs.delete(trackedDelegationJob);
         }
@@ -5305,6 +5295,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   : taskResult.status === "timed_out"
                     ? "timed_out"
                     : taskResult.status,
+              sessionId: taskResult.sessionId,
+              exitCode: taskResult.exitCode,
+              timedOut: taskResult.timedOut,
+              toolCalls: taskResult.toolCalls,
+              latestToolCall: taskResult.latestToolCall,
+              toolInvocations: taskResult.toolInvocations,
               output: taskResult.output,
               error: taskResult.error,
             })),

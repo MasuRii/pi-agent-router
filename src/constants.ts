@@ -2,7 +2,7 @@
  * Constants and configuration values for pi-agent-router extension.
  */
 
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 
 import type { AgentMode, AgentThinkingLevel } from "./types";
@@ -28,12 +28,12 @@ export const AGENT_EMOJIS: Record<string, string> = {
 
 export const AGENT_DISCOVERY_CACHE_MAX_ENTRIES = 64;
 export const TASK_CONTROLS_CACHE_MAX_ENTRIES = 64;
-export const SUBAGENT_SESSION_RETENTION_MAX_COMPLETED = 64;
+export const SUBAGENT_SESSION_RETENTION_MAX_COMPLETED = 256;
 
 export const SUBAGENT_WIDGET_KEY = "subagent-background-sessions";
 export const SUBAGENT_WIDGET_ACTIVE_RENDER_INTERVAL_MS = 1_000;
 export const FINISHED_SUBAGENT_TTL_MS = 30 * 60 * 1000;
-export const SUBAGENT_TASK_REGISTRY_TTL_MS = 6 * 60 * 60 * 1000;
+export const SUBAGENT_TASK_REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
 export const SUBAGENT_HARD_KILL_DELAY_MS = 5_000;
 export const SUBAGENT_DEFAULT_MAX_CONCURRENCY = 4;
 export const SUBAGENT_MIN_CONCURRENCY = 1;
@@ -51,7 +51,7 @@ export const SUBAGENT_DERIVED_OUTPUT_MAX_CHARS = 256 * 1024;
 export const SUBAGENT_STDERR_CAPTURE_MAX_CHARS = 512 * 1024;
 export const SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS = 4 * 1024 * 1024;
 export const TASK_HISTORY_EXCERPT_MAX_CHARS = 1024 * 1024;
-export const TASK_HISTORY_SUMMARY_MAX_CHARS = 320;
+export const TASK_HISTORY_SUMMARY_MAX_CHARS = 1_200;
 export const LINUX_TAB_CYCLE_DEBOUNCE_MS = 180;
 
 export const INLINE_OPEN_BOX_TARGET_WIDTH = 118;

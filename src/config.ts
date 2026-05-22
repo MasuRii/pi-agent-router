@@ -19,6 +19,7 @@ export type SubagentWidgetIconConfigMode = "auto" | "nerd" | "fallback";
 export interface AgentDiscoveryConfig {
   projectSourceDirs: string[];
   userSourceDirs: string[];
+  maxMarkdownBytes: number;
 }
 
 export type DelegatedExtensionSkipCondition = "directEnvAuthAvailable";
@@ -53,17 +54,37 @@ export interface PiAgentRouterConfigLoadResult {
   warning?: string;
 }
 
+export const DEFAULT_AGENT_MARKDOWN_MAX_BYTES = 256 * 1024;
 const DEFAULT_AGENT_DISCOVERY_CONFIG: AgentDiscoveryConfig = {
   projectSourceDirs: [".omp/agents", ".pi/agents", ".claude/agents"],
   userSourceDirs: ["{home}/.omp/agents", "{agentDir}/agents", "{home}/.claude/agents"],
+  maxMarkdownBytes: DEFAULT_AGENT_MARKDOWN_MAX_BYTES,
 };
 
 const DEFAULT_DELEGATED_EXTENSION_NAME_ALIASES: Readonly<Record<string, readonly string[]>> = {};
 
-const VALID_DELEGATED_EXTENSION_SKIP_CONDITIONS: ReadonlySet<DelegatedExtensionSkipCondition> =
+export const VALID_DELEGATED_EXTENSION_SKIP_CONDITIONS: ReadonlySet<DelegatedExtensionSkipCondition> =
   new Set(["directEnvAuthAvailable"]);
 
-const DEFAULT_DELEGATED_EXTENSIONS_CONFIG: DelegatedExtensionsConfig = [];
+const SAFE_DELEGATED_EXTENSION_NAME_PATTERN = /^[A-Za-z0-9@][A-Za-z0-9._@-]*$/;
+
+export function isSafeDelegatedExtensionCandidateName(value: string): boolean {
+  const normalized = normalizeTrimmedString(value);
+  if (!normalized || normalized === "." || normalized === "..") {
+    return false;
+  }
+
+  if (normalized.includes("\0") || normalized.includes(":") || /[/\\]/.test(normalized)) {
+    return false;
+  }
+
+  return SAFE_DELEGATED_EXTENSION_NAME_PATTERN.test(normalized);
+}
+
+const DEFAULT_DELEGATED_EXTENSIONS_CONFIG: DelegatedExtensionsConfig = [
+  { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
+  { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
+];
 
 const DEFAULT_PROVIDER_ENV_KEYS: Record<string, string> = {
   anthropic: "ANTHROPIC_API_KEY",
@@ -94,10 +115,29 @@ const DEFAULT_DIRECT_ENV_DELEGATION_PROVIDER_IDS = [
 ];
 
 const DEFAULT_PROVIDER_CREDENTIAL_FALLBACK_POLICIES: Record<string, CredentialFallbackPolicy> = {
+  "amazon-bedrock": "parent-env",
+  anthropic: "parent-env",
+  "azure-openai-responses": "parent-env",
+  cerebras: "parent-env",
+  "github-copilot": "parent-env",
+  google: "parent-env",
+  "google-vertex": "parent-env",
+  groq: "parent-env",
+  huggingface: "parent-env",
+  "kimi-coding": "parent-env",
+  minimax: "parent-env",
+  "minimax-cn": "parent-env",
+  mistral: "parent-env",
+  openai: "parent-env",
   "openai-codex": "distributed-only",
+  opencode: "parent-env",
+  "opencode-go": "parent-env",
+  openrouter: "parent-env",
+  xai: "parent-env",
+  zai: "parent-env",
 };
 
-const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
+export const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
   "openai-completions",
   "openai-responses",
   "anthropic-messages",
@@ -160,6 +200,7 @@ function cloneDefaultConfig(): PiAgentRouterConfig {
       userSourceDirs: cloneStringArray(
         DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.userSourceDirs,
       ),
+      maxMarkdownBytes: DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.maxMarkdownBytes,
     },
     delegatedExtensions: cloneDelegatedExtensionEntries(
       DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions,
@@ -394,6 +435,45 @@ function normalizeProviderCredentialFallbackPolicies(
   return { ...fallback, ...normalized };
 }
 
+function ensureExplicitProviderCredentialFallbackPolicies(
+  directEnvDelegationProviderIds: readonly string[],
+  policies: Readonly<Record<string, CredentialFallbackPolicy>>,
+  warnings: string[],
+): Record<string, CredentialFallbackPolicy> {
+  const normalized: Record<string, CredentialFallbackPolicy> = { ...policies };
+
+  for (const providerId of directEnvDelegationProviderIds) {
+    if (normalized[providerId]) {
+      continue;
+    }
+
+    normalized[providerId] = "parent-env";
+    warnings.push(
+      `Missing pi-agent-router config setting 'providerCredentialFallbackPolicies.${providerId}'; defaulting to 'parent-env'.`,
+    );
+  }
+
+  return normalized;
+}
+
+function normalizePositiveInteger(
+  value: unknown,
+  fallback: number,
+  field: string,
+  warnings: string[],
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    warnInvalidConfigValue(warnings, field, "a positive integer", value);
+    return fallback;
+  }
+
+  return value;
+}
+
 function normalizeAgentDiscoveryConfig(
   value: unknown,
   warnings: string[],
@@ -418,6 +498,12 @@ function normalizeAgentDiscoveryConfig(
       "agentDiscovery.userSourceDirs",
       warnings,
     ),
+    maxMarkdownBytes: normalizePositiveInteger(
+      record.maxMarkdownBytes,
+      defaults.maxMarkdownBytes,
+      "agentDiscovery.maxMarkdownBytes",
+      warnings,
+    ),
   };
 }
 
@@ -427,11 +513,12 @@ function normalizeDelegatedExtensionCandidates(
   warnings: string[],
 ): string[] {
   const singleCandidate = normalizeTrimmedString(value);
+  let rawCandidates: string[];
   if (singleCandidate) {
-    return [singleCandidate];
-  }
-
-  if (!Array.isArray(value)) {
+    rawCandidates = [singleCandidate];
+  } else if (Array.isArray(value)) {
+    rawCandidates = normalizeStringList(value, [], field, warnings);
+  } else {
     warnInvalidConfigValue(
       warnings,
       field,
@@ -441,17 +528,42 @@ function normalizeDelegatedExtensionCandidates(
     return [];
   }
 
-  const candidates = normalizeStringList(value, [], field, warnings);
-  if (candidates.length === 0) {
+  if (rawCandidates.length === 0) {
     warnInvalidConfigValue(
       warnings,
       field,
       "at least one non-empty delegated extension candidate",
       value,
     );
+    return [];
   }
 
-  return expandDelegatedExtensionCandidateAliases(candidates);
+  const candidates = expandDelegatedExtensionCandidateAliases(rawCandidates);
+  const safeCandidates: string[] = [];
+  for (const candidate of candidates) {
+    if (!isSafeDelegatedExtensionCandidateName(candidate)) {
+      warnInvalidConfigValue(
+        warnings,
+        field,
+        "safe delegated extension names only (basename, no path separators, absolute paths, traversal, drive prefixes, or null bytes)",
+        candidate,
+      );
+      continue;
+    }
+
+    safeCandidates.push(candidate);
+  }
+
+  if (safeCandidates.length === 0) {
+    warnInvalidConfigValue(
+      warnings,
+      field,
+      "at least one safe delegated extension candidate",
+      value,
+    );
+  }
+
+  return safeCandidates;
 }
 
 function normalizeDelegatedExtensionSkipWhen(
@@ -698,6 +810,22 @@ function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings:
 
   const normalizedRecord = record ?? {};
 
+  const directEnvDelegationProviderIds = normalizeProviderIdList(
+    normalizedRecord.directEnvDelegationProviderIds,
+    DEFAULT_PI_AGENT_ROUTER_CONFIG.directEnvDelegationProviderIds,
+    "directEnvDelegationProviderIds",
+    warnings,
+  );
+  const providerCredentialFallbackPolicies = ensureExplicitProviderCredentialFallbackPolicies(
+    directEnvDelegationProviderIds,
+    normalizeProviderCredentialFallbackPolicies(
+      normalizedRecord.providerCredentialFallbackPolicies,
+      DEFAULT_PI_AGENT_ROUTER_CONFIG.providerCredentialFallbackPolicies,
+      warnings,
+    ),
+    warnings,
+  );
+
   return {
     config: {
       debug: normalizedRecord.debug === true,
@@ -716,17 +844,8 @@ function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings:
         "providerEnvKeys",
         warnings,
       ),
-      directEnvDelegationProviderIds: normalizeProviderIdList(
-        normalizedRecord.directEnvDelegationProviderIds,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.directEnvDelegationProviderIds,
-        "directEnvDelegationProviderIds",
-        warnings,
-      ),
-      providerCredentialFallbackPolicies: normalizeProviderCredentialFallbackPolicies(
-        normalizedRecord.providerCredentialFallbackPolicies,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.providerCredentialFallbackPolicies,
-        warnings,
-      ),
+      directEnvDelegationProviderIds,
+      providerCredentialFallbackPolicies,
       copilotInitiatorTargetApis: normalizeStringList(
         normalizedRecord.copilotInitiatorTargetApis,
         DEFAULT_PI_AGENT_ROUTER_CONFIG.copilotInitiatorTargetApis,

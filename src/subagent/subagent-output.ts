@@ -2,7 +2,7 @@
  * Subagent output extraction and processing utilities.
  */
 
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 
 import type { SubagentJsonEventState, SubagentToolInvocation } from "../types";
 import { normalizeInputText } from "../input-normalization";
@@ -12,7 +12,7 @@ import {
   SUBAGENT_TOOL_NAME_MAX_CHARS,
 } from "../constants";
 import { stripSubagentThinkingContent } from "../output-sanitizer";
-import { buildSessionPathFromHeader } from "./session-paths";
+import { tryBuildSessionPathFromHeader } from "./session-paths";
 import { mergeUsageTotals } from "./subagent-usage";
 import { truncatePreview } from "../text-formatting";
 import {
@@ -445,7 +445,18 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     const sessionDirOverride = normalizeInputText(state.sessionDir);
 
     if (sessionId && timestamp && (cwd || sessionDirOverride)) {
-      state.sessionPath = buildSessionPathFromHeader(sessionId, timestamp, cwd, sessionDirOverride || undefined);
+      const sessionPathResult = tryBuildSessionPathFromHeader(
+        sessionId,
+        timestamp,
+        cwd,
+        sessionDirOverride || undefined,
+        { requireSubagentSessionRoot: Boolean(sessionDirOverride) },
+      );
+      if ("sessionPath" in sessionPathResult) {
+        state.sessionPath = sessionPathResult.sessionPath;
+      } else {
+        state.malformedEventCount += 1;
+      }
     }
     return;
   }
@@ -491,6 +502,17 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     if (eventType === "message_end" && message.role === "assistant") {
       state.usage.turns += 1;
       mergeUsageTotals(state.usage, rawMessage.usage);
+    }
+    return;
+  }
+
+  if (eventType === "compaction_end") {
+    const reason = normalizeInputText(eventRecord.reason).toLowerCase();
+    const willRetry = eventRecord.willRetry === true;
+    const aborted = eventRecord.aborted === true;
+    const hasResult = Boolean(eventRecord.result);
+    if (reason === "overflow" && willRetry && !aborted && hasResult) {
+      state.overflowCompactionRecoveryCount += 1;
     }
     return;
   }

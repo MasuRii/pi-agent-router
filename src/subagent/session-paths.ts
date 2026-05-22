@@ -2,15 +2,80 @@
  * Session directory and path management utilities.
  */
 
-import { copyFileSync, mkdirSync, mkdtempSync, statSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, statSync } from "node:fs";
+import { chmod, copyFile, mkdir, mkdtemp, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { AGENT_DIR, SESSIONS_DIR, SUBAGENT_SESSIONS_DIR } from "../constants";
 import { getErrorMessage } from "../error-utils";
 import { normalizeInputText } from "../input-normalization";
 
-const ISOLATED_AGENT_RUNTIME_FILES = ["auth.json", "settings.json", "models.json", "multi-auth.json"] as const;
+const ISOLATED_AGENT_RUNTIME_FILES = ["auth.json", "settings.json", "models.json"] as const;
+const ISOLATED_AGENT_DIR_MODE = 0o700;
+const ISOLATED_AGENT_RUNTIME_FILE_MODE = 0o600;
+const SAFE_SESSION_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SAFE_SESSION_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}\.jsonl$/;
+
+function isPathInsideDirectory(parentDir: string, candidatePath: string): boolean {
+  const relativePath = relative(parentDir, candidatePath);
+  return Boolean(relativePath) && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
+
+export function normalizeSafeSessionIdentifier(value: unknown): string | undefined {
+  const normalized = normalizeInputText(value);
+  if (!normalized || !SAFE_SESSION_IDENTIFIER_PATTERN.test(normalized)) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function normalizeSafeSessionTimestamp(value: unknown): string | undefined {
+  const normalized = normalizeInputText(value).replace(/[:.]/g, "-");
+  if (!normalized || !SAFE_SESSION_IDENTIFIER_PATTERN.test(normalized)) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function validateRetainedSessionPath(resolvedSessionPath: string): string | undefined {
+  const resolvedSubagentSessionsDir = resolve(SUBAGENT_SESSIONS_DIR);
+  if (!isPathInsideDirectory(resolvedSubagentSessionsDir, resolvedSessionPath)) {
+    return `Invalid retained session path '${resolvedSessionPath}': path must stay within '${resolvedSubagentSessionsDir}'.`;
+  }
+
+  const filename = basename(resolvedSessionPath);
+  if (!SAFE_SESSION_FILENAME_PATTERN.test(filename)) {
+    return `Invalid retained session path '${resolvedSessionPath}': filename must be a safe .jsonl session filename.`;
+  }
+
+  return undefined;
+}
+
+function hardenIsolatedAgentDirectory(path: string): void {
+  if (process.platform !== "win32") {
+    chmodSync(path, ISOLATED_AGENT_DIR_MODE);
+  }
+}
+
+async function hardenIsolatedAgentDirectoryAsync(path: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await chmod(path, ISOLATED_AGENT_DIR_MODE);
+  }
+}
+
+function hardenIsolatedRuntimeFile(path: string): void {
+  if (process.platform !== "win32") {
+    chmodSync(path, ISOLATED_AGENT_RUNTIME_FILE_MODE);
+  }
+}
+
+async function hardenIsolatedRuntimeFileAsync(path: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await chmod(path, ISOLATED_AGENT_RUNTIME_FILE_MODE);
+  }
+}
 
 export function prepareIsolatedAgentDirectory(parentTempDir: string): { agentDir: string } | { error: string } {
   const normalizedParentDir = normalizeInputText(parentTempDir);
@@ -30,6 +95,7 @@ export function prepareIsolatedAgentDirectory(parentTempDir: string): { agentDir
   let isolatedDir: string;
   try {
     isolatedDir = mkdtempSync(join(resolvedParentDir, "agent-home-"));
+    hardenIsolatedAgentDirectory(isolatedDir);
   } catch (error) {
     const message = getErrorMessage(error);
     return { error: `Failed to create isolated agent directory in '${resolvedParentDir}': ${message}` };
@@ -42,7 +108,9 @@ export function prepareIsolatedAgentDirectory(parentTempDir: string): { agentDir
         continue;
       }
 
-      copyFileSync(sourcePath, join(isolatedDir, runtimeFile));
+      const destinationPath = join(isolatedDir, runtimeFile);
+      copyFileSync(sourcePath, destinationPath);
+      hardenIsolatedRuntimeFile(destinationPath);
     }
   } catch (error) {
     const message = getErrorMessage(error);
@@ -72,6 +140,7 @@ export async function prepareIsolatedAgentDirectoryAsync(
   let isolatedDir: string;
   try {
     isolatedDir = await mkdtemp(join(resolvedParentDir, "agent-home-"));
+    await hardenIsolatedAgentDirectoryAsync(isolatedDir);
   } catch (error) {
     const message = getErrorMessage(error);
     return { error: `Failed to create isolated agent directory in '${resolvedParentDir}': ${message}` };
@@ -85,7 +154,9 @@ export async function prepareIsolatedAgentDirectoryAsync(
           return;
         }
 
-        await copyFile(sourcePath, join(isolatedDir, runtimeFile));
+        const destinationPath = join(isolatedDir, runtimeFile);
+        await copyFile(sourcePath, destinationPath);
+        await hardenIsolatedRuntimeFileAsync(destinationPath);
       }),
     );
   } catch (error) {
@@ -132,10 +203,46 @@ export function encodeSessionDirectoryForCwd(cwd: string): string {
   return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
-export function buildSessionPathFromHeader(id: string, timestamp: string, cwd: string, sessionDir?: string): string {
+export function tryBuildSessionPathFromHeader(
+  id: string,
+  timestamp: string,
+  cwd: string,
+  sessionDir?: string,
+  options: { requireSubagentSessionRoot?: boolean } = {},
+): { sessionPath: string } | { error: string } {
+  const safeSessionId = normalizeSafeSessionIdentifier(id);
+  if (!safeSessionId) {
+    return { error: "Invalid session event id: expected a safe filename identifier." };
+  }
+
+  const fileTimestamp = normalizeSafeSessionTimestamp(timestamp);
+  if (!fileTimestamp) {
+    return { error: "Invalid session event timestamp: expected a safe filename timestamp." };
+  }
+
   const baseSessionDir = sessionDir ? resolve(sessionDir) : join(SESSIONS_DIR, encodeSessionDirectoryForCwd(cwd));
-  const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-  return join(baseSessionDir, `${fileTimestamp}_${id}.jsonl`);
+  const sessionPath = resolve(baseSessionDir, `${fileTimestamp}_${safeSessionId}.jsonl`);
+  if (!isPathInsideDirectory(baseSessionDir, sessionPath)) {
+    return { error: `Invalid session event path '${sessionPath}': path must stay within '${baseSessionDir}'.` };
+  }
+
+  if (options.requireSubagentSessionRoot) {
+    const retainedPathError = validateRetainedSessionPath(sessionPath);
+    if (retainedPathError) {
+      return { error: retainedPathError };
+    }
+  }
+
+  return { sessionPath };
+}
+
+export function buildSessionPathFromHeader(id: string, timestamp: string, cwd: string, sessionDir?: string): string {
+  const result = tryBuildSessionPathFromHeader(id, timestamp, cwd, sessionDir);
+  if ("error" in result) {
+    throw new Error(result.error);
+  }
+
+  return result.sessionPath;
 }
 
 export function resolveExistingWorkingDirectory(preferredCwd: string): string {
@@ -164,9 +271,22 @@ export async function resolveExistingWorkingDirectoryAsync(preferredCwd: string)
 
 export function resolveSubagentSessionDirectory(cwd: string, existingSessionPath?: string): { sessionDir: string } | { error: string } {
   const normalizedSessionPath = normalizeInputText(existingSessionPath);
-  const sessionDir = normalizedSessionPath
-    ? dirname(resolve(normalizedSessionPath))
-    : join(SUBAGENT_SESSIONS_DIR, encodeSessionDirectoryForCwd(resolve(cwd)));
+  let sessionDir: string;
+  if (normalizedSessionPath) {
+    if (normalizedSessionPath.includes("\0")) {
+      return { error: "Invalid retained session path: value contains a null byte." };
+    }
+
+    const resolvedSessionPath = resolve(normalizedSessionPath);
+    const retainedPathError = validateRetainedSessionPath(resolvedSessionPath);
+    if (retainedPathError) {
+      return { error: retainedPathError };
+    }
+
+    sessionDir = dirname(resolvedSessionPath);
+  } else {
+    sessionDir = join(SUBAGENT_SESSIONS_DIR, encodeSessionDirectoryForCwd(resolve(cwd)));
+  }
 
   try {
     mkdirSync(sessionDir, { recursive: true });
@@ -191,9 +311,22 @@ export async function resolveSubagentSessionDirectoryAsync(
   existingSessionPath?: string,
 ): Promise<{ sessionDir: string } | { error: string }> {
   const normalizedSessionPath = normalizeInputText(existingSessionPath);
-  const sessionDir = normalizedSessionPath
-    ? dirname(resolve(normalizedSessionPath))
-    : join(SUBAGENT_SESSIONS_DIR, encodeSessionDirectoryForCwd(resolve(cwd)));
+  let sessionDir: string;
+  if (normalizedSessionPath) {
+    if (normalizedSessionPath.includes("\0")) {
+      return { error: "Invalid retained session path: value contains a null byte." };
+    }
+
+    const resolvedSessionPath = resolve(normalizedSessionPath);
+    const retainedPathError = validateRetainedSessionPath(resolvedSessionPath);
+    if (retainedPathError) {
+      return { error: retainedPathError };
+    }
+
+    sessionDir = dirname(resolvedSessionPath);
+  } else {
+    sessionDir = join(SUBAGENT_SESSIONS_DIR, encodeSessionDirectoryForCwd(resolve(cwd)));
+  }
 
   try {
     await mkdir(sessionDir, { recursive: true });

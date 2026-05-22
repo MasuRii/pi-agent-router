@@ -16,6 +16,7 @@ import { CONFIG_PATH, loadPiAgentRouterConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { normalizeInputText } from "../input-normalization";
 import type { OutputContractStrictness } from "../output-contract";
+import { DEFAULT_TRANSIENT_RETRY_SETTINGS, type SubagentAutoRetrySettings } from "../subagent/subagent-execution";
 import { asRecord } from "../record-utils";
 import type { CacheDebugCounters, TaskControlsCacheSnapshot } from "../types";
 
@@ -27,11 +28,20 @@ export type AgentRouterTaskControls = {
   outputStrictness: OutputContractStrictness;
 };
 
+export type AgentRouterRetryControls = SubagentAutoRetrySettings;
+
 export interface TaskControlsResolutionOptions {
   configPath?: string;
   globalSettingsPath?: string;
   projectSettingsPath?: string;
 }
+
+type TaskControlsEnvSnapshot = {
+  signature: string;
+  maxConcurrency?: string;
+  defaultTimeoutMs?: string;
+  outputStrictness?: string;
+};
 
 const DEFAULT_TASK_CONTROLS: AgentRouterTaskControls = {
   maxConcurrency: SUBAGENT_MAX_CONCURRENCY,
@@ -40,6 +50,8 @@ const DEFAULT_TASK_CONTROLS: AgentRouterTaskControls = {
   defaultTimeoutMs: SUBAGENT_DEFAULT_TIMEOUT_MS,
   outputStrictness: "compat",
 };
+
+export const DEFAULT_RETRY_CONTROLS: AgentRouterRetryControls = DEFAULT_TRANSIENT_RETRY_SETTINGS;
 
 const taskControlsCache = createBoundedCache<string, { controls: AgentRouterTaskControls; warnings: string[] }>(
   TASK_CONTROLS_CACHE_MAX_ENTRIES,
@@ -88,12 +100,16 @@ function logTaskControlsCacheEvent(event: string, payload: Record<string, unknow
   });
 }
 
-function getTaskControlsEnvSignature(): string {
-  return [
-    process.env.PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY ?? "",
-    process.env.PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS ?? "",
-    process.env.PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS ?? "",
-  ].join("\u0000");
+function getTaskControlsEnvSnapshot(): TaskControlsEnvSnapshot {
+  const maxConcurrency = process.env.PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY;
+  const defaultTimeoutMs = process.env.PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS;
+  const outputStrictness = process.env.PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS;
+  return {
+    signature: [maxConcurrency ?? "", defaultTimeoutMs ?? "", outputStrictness ?? ""].join("\u0000"),
+    maxConcurrency,
+    defaultTimeoutMs,
+    outputStrictness,
+  };
 }
 
 function getTaskControlsConfigSignature(options: TaskControlsResolutionOptions = {}): string {
@@ -106,9 +122,10 @@ function getTaskControlsConfigSignature(options: TaskControlsResolutionOptions =
 
 function createTaskControlsCacheKey(
   cwd: string,
+  envSnapshot: TaskControlsEnvSnapshot,
   options: TaskControlsResolutionOptions = {},
 ): string {
-  return `${resolve(cwd)}\u0000${getTaskControlsEnvSignature()}\u0000${getTaskControlsConfigSignature(options)}`;
+  return `${resolve(cwd)}\u0000${envSnapshot.signature}\u0000${getTaskControlsConfigSignature(options)}`;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -289,8 +306,55 @@ function parseStrictnessSetting(
   return fallback;
 }
 
+function pickRetrySettings(settings: Record<string, unknown> | undefined): Record<string, unknown> {
+  return asRecord(settings?.retry) ?? {};
+}
+
+function parseRetryNumberSetting(
+  value: unknown,
+  fallback: number,
+  options: { min: number; max: number; field: string },
+  warnings: string[],
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    warnings.push(`Invalid retry setting '${options.field}': expected a finite number, got ${JSON.stringify(value)}.`);
+    return fallback;
+  }
+
+  const normalized = Math.trunc(value);
+  if (normalized < options.min || normalized > options.max) {
+    warnings.push(
+      `Invalid retry setting '${options.field}': expected value between ${options.min} and ${options.max}, got ${normalized}.`,
+    );
+    return fallback;
+  }
+
+  return normalized;
+}
+
+function parseRetryControls(merged: Record<string, unknown>, warnings: string[]): AgentRouterRetryControls {
+  return {
+    enabled: parseBooleanSetting(merged.enabled, DEFAULT_RETRY_CONTROLS.enabled, "retry.enabled", warnings),
+    maxRetries: parseRetryNumberSetting(merged.maxRetries, DEFAULT_RETRY_CONTROLS.maxRetries, {
+      min: 0,
+      max: 32,
+      field: "retry.maxRetries",
+    }, warnings),
+    baseDelayMs: parseRetryNumberSetting(merged.baseDelayMs, DEFAULT_RETRY_CONTROLS.baseDelayMs, {
+      min: 0,
+      max: 60 * 60 * 1000,
+      field: "retry.baseDelayMs",
+    }, warnings),
+  };
+}
+
 function buildTaskControlsResult(
   cwd: string,
+  envSnapshot: TaskControlsEnvSnapshot,
   options: TaskControlsResolutionOptions = {},
 ): {
   controls: AgentRouterTaskControls;
@@ -315,19 +379,16 @@ function buildTaskControlsResult(
     ...projectTaskSettings,
   };
 
-  const envMaxConcurrency = process.env.PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY;
-  if (envMaxConcurrency !== undefined) {
-    merged.maxConcurrency = Number.parseInt(envMaxConcurrency, 10);
+  if (envSnapshot.maxConcurrency !== undefined) {
+    merged.maxConcurrency = Number.parseInt(envSnapshot.maxConcurrency, 10);
   }
 
-  const envTimeout = process.env.PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS;
-  if (envTimeout !== undefined) {
-    merged.defaultTimeoutMs = Number.parseInt(envTimeout, 10);
+  if (envSnapshot.defaultTimeoutMs !== undefined) {
+    merged.defaultTimeoutMs = Number.parseInt(envSnapshot.defaultTimeoutMs, 10);
   }
 
-  const envStrictness = process.env.PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS;
-  if (envStrictness !== undefined) {
-    merged.outputStrictness = envStrictness;
+  if (envSnapshot.outputStrictness !== undefined) {
+    merged.outputStrictness = envSnapshot.outputStrictness;
   }
 
   return {
@@ -356,6 +417,7 @@ function buildTaskControlsResult(
 
 async function buildTaskControlsResultAsync(
   cwd: string,
+  envSnapshot: TaskControlsEnvSnapshot,
   options: TaskControlsResolutionOptions = {},
 ): Promise<{
   controls: AgentRouterTaskControls;
@@ -385,19 +447,16 @@ async function buildTaskControlsResultAsync(
     ...projectTaskSettings,
   };
 
-  const envMaxConcurrency = process.env.PI_AGENT_ROUTER_TASK_MAX_CONCURRENCY;
-  if (envMaxConcurrency !== undefined) {
-    merged.maxConcurrency = Number.parseInt(envMaxConcurrency, 10);
+  if (envSnapshot.maxConcurrency !== undefined) {
+    merged.maxConcurrency = Number.parseInt(envSnapshot.maxConcurrency, 10);
   }
 
-  const envTimeout = process.env.PI_AGENT_ROUTER_TASK_DEFAULT_TIMEOUT_MS;
-  if (envTimeout !== undefined) {
-    merged.defaultTimeoutMs = Number.parseInt(envTimeout, 10);
+  if (envSnapshot.defaultTimeoutMs !== undefined) {
+    merged.defaultTimeoutMs = Number.parseInt(envSnapshot.defaultTimeoutMs, 10);
   }
 
-  const envStrictness = process.env.PI_AGENT_ROUTER_TASK_OUTPUT_STRICTNESS;
-  if (envStrictness !== undefined) {
-    merged.outputStrictness = envStrictness;
+  if (envSnapshot.outputStrictness !== undefined) {
+    merged.outputStrictness = envSnapshot.outputStrictness;
   }
 
   return {
@@ -424,6 +483,33 @@ async function buildTaskControlsResultAsync(
   };
 }
 
+export async function resolveRetryControlsAsync(
+  cwd: string,
+  options: TaskControlsResolutionOptions = {},
+): Promise<{
+  controls: AgentRouterRetryControls;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const globalSettingsPath = options.globalSettingsPath ?? join(AGENT_DIR, "settings.json");
+  const projectSettingsPath = options.projectSettingsPath ?? (await findNearestProjectSettingsPathAsync(cwd));
+
+  const [globalSettings, projectSettings] = await Promise.all([
+    readJsonFileAsync(globalSettingsPath),
+    projectSettingsPath ? readJsonFileAsync(projectSettingsPath) : Promise.resolve(undefined),
+  ]);
+
+  const merged = {
+    ...pickRetrySettings(globalSettings),
+    ...pickRetrySettings(projectSettings),
+  };
+
+  return {
+    controls: parseRetryControls(merged, warnings),
+    warnings,
+  };
+}
+
 export function resolveTaskControls(
   cwd: string,
   options: TaskControlsResolutionOptions = {},
@@ -431,7 +517,8 @@ export function resolveTaskControls(
   controls: AgentRouterTaskControls;
   warnings: string[];
 } {
-  const cacheKey = createTaskControlsCacheKey(cwd, options);
+  const envSnapshot = getTaskControlsEnvSnapshot();
+  const cacheKey = createTaskControlsCacheKey(cwd, envSnapshot, options);
   const cachedResult = taskControlsCache.get(cacheKey);
   if (cachedResult) {
     taskControlsCounters.hits += 1;
@@ -439,7 +526,7 @@ export function resolveTaskControls(
   }
 
   taskControlsCounters.misses += 1;
-  const result = buildTaskControlsResult(cwd, options);
+  const result = buildTaskControlsResult(cwd, envSnapshot, options);
 
   const setResult = taskControlsCache.set(cacheKey, {
     controls: cloneTaskControls(result.controls),
@@ -462,7 +549,8 @@ export async function resolveTaskControlsAsync(
   controls: AgentRouterTaskControls;
   warnings: string[];
 }> {
-  const cacheKey = createTaskControlsCacheKey(cwd, options);
+  const envSnapshot = getTaskControlsEnvSnapshot();
+  const cacheKey = createTaskControlsCacheKey(cwd, envSnapshot, options);
   const cachedResult = taskControlsCache.get(cacheKey);
   if (cachedResult) {
     taskControlsCounters.hits += 1;
@@ -478,7 +566,7 @@ export async function resolveTaskControlsAsync(
   const cacheRevision = taskControlsCacheRevision;
 
   const loadPromise = (async (): Promise<{ controls: AgentRouterTaskControls; warnings: string[] }> => {
-    const result = await buildTaskControlsResultAsync(cwd, options);
+    const result = await buildTaskControlsResultAsync(cwd, envSnapshot, options);
 
     if (cacheRevision === taskControlsCacheRevision) {
       const setResult = taskControlsCache.set(cacheKey, {

@@ -2,17 +2,14 @@
  * Dynamic extension source generation for delegated subagents.
  */
 
-import type { Api, AssistantMessageEventStream, Context as LlmContext, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessageEventStream, Context as LlmContext, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+
+import { DEFAULT_COPILOT_INITIATOR_TARGET_APIS } from "../config";
 
 import type { Agent, ApiStreamSimpleDelegate, GlobalWithAgentRouterBaseApiStreams } from "../types";
 
 const ACTIVE_AGENT_PROMPT_MODULE_URL = new URL("./active-agent-prompt.ts", import.meta.url).href;
 const TEMPERATURE_SUPPORT_MODULE_URL = new URL("./temperature-support.ts", import.meta.url).href;
-const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
-  "openai-completions",
-  "openai-responses",
-  "anthropic-messages",
-] as const;
 
 export function getAgentRouterBaseApiStreams(): Map<string, ApiStreamSimpleDelegate> {
   const globalScope = globalThis as GlobalWithAgentRouterBaseApiStreams;
@@ -32,7 +29,7 @@ export function buildDelegatedActiveAgentIdentityExtensionSource(
   };
 
   return [
-    "import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";",
+    "import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";",
     `import { buildSystemPromptForActiveAgent } from ${JSON.stringify(ACTIVE_AGENT_PROMPT_MODULE_URL)};`,
     "",
     `const delegatedAgent = ${JSON.stringify(delegatedAgent, null, 2)};`,
@@ -52,8 +49,8 @@ export function buildDelegatedTemperatureExtensionSource(temperature: number): s
   const runtimeTemperature = Number.isFinite(temperature) ? temperature : 1;
 
   return [
-    "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@mariozechner/pi-ai\";",
-    "import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";",
+    "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@earendil-works/pi-ai\";",
+    "import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";",
     `import { supportsRuntimeTemperatureOption } from ${JSON.stringify(TEMPERATURE_SUPPORT_MODULE_URL)};`,
     "",
     `const runtimeTemperature = ${JSON.stringify(runtimeTemperature)};`,
@@ -117,8 +114,8 @@ export function buildDelegatedCopilotInitiatorExtensionSource(
   targetApis: readonly string[] = DEFAULT_COPILOT_INITIATOR_TARGET_APIS,
 ): string {
   return [
-    "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@mariozechner/pi-ai\";",
-    "import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";",
+    "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@earendil-works/pi-ai\";",
+    "import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";",
     "",
     "type ApiStreamSimpleDelegate = (",
     "  model: Model<Api>,",

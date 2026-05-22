@@ -4,12 +4,12 @@
  * Handles finding and parsing agent definitions from .md files.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { createBoundedCache } from "../cache/bounded-cache";
 import { mapWithAbortAwareConcurrency } from "../task/parallel-control";
@@ -20,7 +20,7 @@ import {
   PRIMARY_MODE_VALUES,
   VALID_THINKING_LEVELS,
 } from "../constants";
-import { loadPiAgentRouterConfig } from "../config";
+import { DEFAULT_AGENT_MARKDOWN_MAX_BYTES, loadPiAgentRouterConfig } from "../config";
 import type { AgentDiscoveryConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { normalizeInputText } from "../input-normalization";
@@ -36,6 +36,10 @@ import type {
 
 
 export const AGENT_MARKDOWN_PARSE_CONCURRENCY = 8;
+
+type AgentMarkdownReadOptions = {
+  maxBytes?: number;
+};
 
 type AgentDiscoveryConfigSlices = {
   agentDiscovery: AgentDiscoveryConfig;
@@ -56,6 +60,7 @@ function getConfiguredAgentDiscoverySlices(): AgentDiscoveryConfigSlices {
     agentDiscovery: {
       projectSourceDirs: [...config.agentDiscovery.projectSourceDirs],
       userSourceDirs: [...config.agentDiscovery.userSourceDirs],
+      maxMarkdownBytes: config.agentDiscovery.maxMarkdownBytes,
     },
     primaryAgents: [...config.primaryAgents],
     primaryAgentSet: new Set(config.primaryAgents),
@@ -350,11 +355,46 @@ function normalizeAgentColor(value: string | undefined): string | undefined {
   return expanded.toUpperCase();
 }
 
-export function parseAgent(mdPath: string): Agent | null {
+function normalizeAgentMarkdownMaxBytes(value: number | undefined): number {
+  return Number.isInteger(value) && value !== undefined && value > 0
+    ? value
+    : DEFAULT_AGENT_MARKDOWN_MAX_BYTES;
+}
+
+function isAgentMarkdownFileWithinSizeLimit(mdPath: string, maxBytes: number): boolean {
+  try {
+    return statSync(mdPath).size <= maxBytes;
+  } catch {
+    return false;
+  }
+}
+
+async function isAgentMarkdownFileWithinSizeLimitAsync(mdPath: string, maxBytes: number): Promise<boolean> {
+  try {
+    return (await stat(mdPath)).size <= maxBytes;
+  } catch {
+    return false;
+  }
+}
+
+export function parseAgent(mdPath: string, options: AgentMarkdownReadOptions = {}): Agent | null {
+  const maxBytes = normalizeAgentMarkdownMaxBytes(options.maxBytes);
+  if (!isAgentMarkdownFileWithinSizeLimit(mdPath, maxBytes)) {
+    return null;
+  }
+
   return parseAgentContent(readFileSync(mdPath, "utf-8"));
 }
 
-export async function parseAgentAsync(mdPath: string): Promise<Agent | null> {
+export async function parseAgentAsync(
+  mdPath: string,
+  options: AgentMarkdownReadOptions = {},
+): Promise<Agent | null> {
+  const maxBytes = normalizeAgentMarkdownMaxBytes(options.maxBytes);
+  if (!(await isAgentMarkdownFileWithinSizeLimitAsync(mdPath, maxBytes))) {
+    return null;
+  }
+
   const raw = await readFile(mdPath, "utf-8");
   return parseAgentContent(raw);
 }
@@ -391,12 +431,13 @@ export function loadAgentsFromDir(dirPath: string): Agent[] {
   }
 
   agentDirectoryCounters.misses += 1;
+  const maxMarkdownBytes = getConfiguredAgentDiscovery().maxMarkdownBytes;
 
   const agents = (() => {
     try {
       return readdirSync(cacheKey, { withFileTypes: true })
         .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-        .map((entry) => parseAgent(join(cacheKey, entry.name)))
+        .map((entry) => parseAgent(join(cacheKey, entry.name), { maxBytes: maxMarkdownBytes }))
         .filter((agent): agent is Agent => Boolean(agent))
         .sort((a, b) => a.name.localeCompare(b.name));
     } catch {
@@ -430,6 +471,7 @@ export async function loadAgentsFromDirAsync(dirPath: string): Promise<Agent[]> 
 
   agentDirectoryCounters.misses += 1;
   const cacheRevision = agentDiscoveryCacheRevision;
+  const maxMarkdownBytes = getConfiguredAgentDiscovery().maxMarkdownBytes;
 
   const loadPromise = (async (): Promise<Agent[]> => {
     try {
@@ -438,7 +480,7 @@ export async function loadAgentsFromDirAsync(dirPath: string): Promise<Agent[]> 
       const parseResult = await mapWithAbortAwareConcurrency({
         items: markdownEntries,
         concurrency: AGENT_MARKDOWN_PARSE_CONCURRENCY,
-        worker: (entry) => parseAgentAsync(join(cacheKey, entry.name)),
+        worker: (entry) => parseAgentAsync(join(cacheKey, entry.name), { maxBytes: maxMarkdownBytes }),
       });
       if (parseResult.control.firstError) {
         throw parseResult.control.firstError;

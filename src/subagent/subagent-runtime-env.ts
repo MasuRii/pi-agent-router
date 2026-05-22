@@ -1,10 +1,12 @@
 export const PI_AGENT_ROUTER_SUBAGENT_ENV = "PI_AGENT_ROUTER_SUBAGENT";
 export const PI_AGENT_ROUTER_PARENT_SESSION_ID_ENV = "PI_AGENT_ROUTER_PARENT_SESSION_ID";
 export const PI_MULTI_AUTH_RUNTIME_DIR_ENV = "PI_MULTI_AUTH_RUNTIME_DIR";
+export const PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR_ENV = "PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR";
 export const PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID";
 export const PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID";
 export const PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV = "PI_AGENT_ROUTER_DELEGATED_API_KEY";
 
+export const PI_MODEL_DISCOVERY_CACHE_ONLY_ENV = "PI_MODEL_DISCOVERY_CACHE_ONLY";
 const SUBAGENT_PARENT_ENV_ALLOWLIST = [
   "APPDATA",
   "CI",
@@ -19,7 +21,6 @@ const SUBAGENT_PARENT_ENV_ALLOWLIST = [
   "LC_CTYPE",
   "LOCALAPPDATA",
   "NODE_ENV",
-  "NODE_OPTIONS",
   "NO_COLOR",
   "PATH",
   "PATHEXT",
@@ -50,6 +51,17 @@ const SUBAGENT_PARENT_ENV_ALLOWLIST = [
   "XDG_RUNTIME_DIR",
 ] as const;
 
+const SUBAGENT_PARENT_ENV_DENYLIST: ReadonlySet<string> = new Set([
+  "bun_options",
+  "node_options",
+  "node_path",
+  "npm_config_node_options",
+]);
+
+function isDeniedSubagentEnvKey(key: string): boolean {
+  return SUBAGENT_PARENT_ENV_DENYLIST.has(key.trim().toLowerCase());
+}
+
 function normalizeEnvValue(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -64,6 +76,10 @@ function setNormalizedEnvValue(
   key: string,
   value: string | undefined,
 ): void {
+  if (isDeniedSubagentEnvKey(key)) {
+    return;
+  }
+
   const normalizedValue = normalizeEnvValue(value);
   if (!normalizedValue) {
     return;
@@ -119,6 +135,8 @@ export function buildSubagentSpawnEnv(options: {
   parentSessionId?: string;
   isolatedAgentDir?: string;
   multiAuthRuntimeDir?: string;
+  permissionPolicyAgentDir?: string;
+  modelDiscoveryCacheOnly?: boolean;
   inheritedEnvKeys?: readonly string[];
   delegatedCredential?: {
     providerId: string;
@@ -133,6 +151,10 @@ export function buildSubagentSpawnEnv(options: {
 
   setNormalizedEnvValue(env, "PI_CODING_AGENT_DIR", options.isolatedAgentDir);
   setNormalizedEnvValue(env, PI_MULTI_AUTH_RUNTIME_DIR_ENV, options.multiAuthRuntimeDir);
+  setNormalizedEnvValue(env, PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR_ENV, options.permissionPolicyAgentDir);
+  if (options.modelDiscoveryCacheOnly) {
+    setNormalizedEnvValue(env, PI_MODEL_DISCOVERY_CACHE_ONLY_ENV, "1");
+  }
 
   if (options.delegatedCredential) {
     setNormalizedEnvValue(

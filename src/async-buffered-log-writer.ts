@@ -1,10 +1,14 @@
 import { appendFile } from "node:fs/promises";
 
+import { getErrorMessage } from "./error-utils";
+
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_FLUSH_ENTRY_LIMIT = 100;
 const DEFAULT_FLUSH_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_MAX_BUFFERED_ENTRIES = 1_000;
 const DEFAULT_MAX_BUFFERED_BYTES = 512 * 1024;
+const DEFAULT_MAX_WRITE_RETRIES = 3;
+const DEFAULT_WRITE_RETRY_DELAY_MS = 250;
 
 export interface AsyncBufferedLogWriterOptions {
   enabled: boolean;
@@ -16,6 +20,15 @@ export interface AsyncBufferedLogWriterOptions {
   maxBufferedEntries?: number;
   maxBufferedBytes?: number;
   createDroppedEntriesLine?: (droppedEntries: number) => string;
+  maxWriteRetries?: number;
+  writeRetryDelayMs?: number;
+  createDroppedWriteFailuresLine?: (metadata: {
+    droppedPayloads: number;
+    droppedEntries: number;
+    droppedBytes: number;
+    failedAttempts: number;
+    lastFailure: string;
+  }) => string;
 }
 
 export class AsyncBufferedLogWriter {
@@ -25,6 +38,9 @@ export class AsyncBufferedLogWriter {
   private readonly maxBufferedEntries: number;
   private readonly maxBufferedBytes: number;
   private readonly createDroppedEntriesLine?: (droppedEntries: number) => string;
+  private readonly maxWriteRetries: number;
+  private readonly writeRetryDelayMs: number;
+  private readonly createDroppedWriteFailuresLine?: AsyncBufferedLogWriterOptions["createDroppedWriteFailuresLine"];
   private readonly lines: string[] = [];
   private enabled: boolean;
   private bufferedBytes = 0;
@@ -35,6 +51,13 @@ export class AsyncBufferedLogWriter {
   private flushPromise: Promise<void> | null = null;
   private flushRequestedWhileBusy = false;
   private shutdownHooksRegistered = false;
+  private shutdownFlushHandler: (() => void) | null = null;
+  private writeRetryCount = 0;
+  private droppedWritePayloads = 0;
+  private droppedWriteEntries = 0;
+  private droppedWriteBytes = 0;
+  private droppedWriteFailedAttempts = 0;
+  private lastWriteFailure: string | undefined;
 
   constructor(private readonly options: AsyncBufferedLogWriterOptions) {
     this.enabled = options.enabled;
@@ -59,6 +82,15 @@ export class AsyncBufferedLogWriter {
       normalizePositiveInteger(options.maxBufferedBytes, DEFAULT_MAX_BUFFERED_BYTES),
     );
     this.createDroppedEntriesLine = options.createDroppedEntriesLine;
+    this.maxWriteRetries = Math.max(
+      0,
+      normalizePositiveInteger(options.maxWriteRetries, DEFAULT_MAX_WRITE_RETRIES),
+    );
+    this.writeRetryDelayMs = normalizePositiveInteger(
+      options.writeRetryDelayMs,
+      DEFAULT_WRITE_RETRY_DELAY_MS,
+    );
+    this.createDroppedWriteFailuresLine = options.createDroppedWriteFailuresLine;
   }
 
   setEnabled(enabled: boolean): void {
@@ -68,6 +100,7 @@ export class AsyncBufferedLogWriter {
 
     this.enabled = enabled;
     if (!enabled) {
+      this.unregisterShutdownHooks();
       this.clearBuffer();
     }
   }
@@ -112,12 +145,19 @@ export class AsyncBufferedLogWriter {
       return;
     }
 
+    let deferNextFlush = false;
     const flushPromise = appendFile(this.options.logPath, payload, "utf-8")
-      .catch(() => {
-        this.requeuePayload(payload);
+      .then(() => {
+        this.writeRetryCount = 0;
+      })
+      .catch((error) => {
+        deferNextFlush = this.handleWriteFailure(payload, error);
       })
       .finally(async () => {
         this.flushPromise = null;
+        if (deferNextFlush) {
+          return;
+        }
         if (this.flushRequestedWhileBusy || this.lines.length > 0) {
           this.flushRequestedWhileBusy = false;
           await this.flush();
@@ -154,9 +194,24 @@ export class AsyncBufferedLogWriter {
     const flushSafely = (): void => {
       void this.flush();
     };
+    this.shutdownFlushHandler = flushSafely;
     process.once("beforeExit", flushSafely);
-    process.once("SIGINT", flushSafely);
-    process.once("SIGTERM", flushSafely);
+  }
+
+  private unregisterShutdownHooks(): void {
+    if (!this.shutdownHooksRegistered || !this.shutdownFlushHandler) {
+      return;
+    }
+
+    process.off("beforeExit", this.shutdownFlushHandler);
+    this.shutdownHooksRegistered = false;
+    this.shutdownFlushHandler = null;
+  }
+
+  async dispose(): Promise<void> {
+    this.unregisterShutdownHooks();
+    await this.flush();
+    this.clearBuffer();
   }
 
   private pushLine(line: string): void {
@@ -183,7 +238,7 @@ export class AsyncBufferedLogWriter {
     }
   }
 
-  private scheduleFlush(): void {
+  private scheduleFlush(delayMs = this.flushIntervalMs): void {
     if (this.flushTimer) {
       return;
     }
@@ -191,7 +246,7 @@ export class AsyncBufferedLogWriter {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       void this.flush();
-    }, this.flushIntervalMs);
+    }, delayMs);
     const flushTimer = this.flushTimer as ReturnType<typeof setTimeout> & {
       unref?: () => void;
     };
@@ -212,13 +267,27 @@ export class AsyncBufferedLogWriter {
       pendingLines.push(this.createDroppedEntriesLine(this.droppedEntries));
       this.droppedEntries = 0;
     }
+    if (this.droppedWritePayloads > 0 && this.createDroppedWriteFailuresLine) {
+      pendingLines.push(this.createDroppedWriteFailuresLine({
+        droppedPayloads: this.droppedWritePayloads,
+        droppedEntries: this.droppedWriteEntries,
+        droppedBytes: this.droppedWriteBytes,
+        failedAttempts: this.droppedWriteFailedAttempts,
+        lastFailure: this.lastWriteFailure ?? "unknown write failure",
+      }));
+      this.droppedWritePayloads = 0;
+      this.droppedWriteEntries = 0;
+      this.droppedWriteBytes = 0;
+      this.droppedWriteFailedAttempts = 0;
+      this.lastWriteFailure = undefined;
+    }
     pendingLines.push(...this.lines);
     this.lines.length = 0;
     this.bufferedBytes = 0;
     return pendingLines.join("");
   }
 
-  private requeuePayload(payload: string): void {
+  private requeuePayload(payload: string, delayMs = this.flushIntervalMs): void {
     this.clearBuffer();
     for (const line of payload.split(/(?<=\n)/u)) {
       if (!line) {
@@ -226,7 +295,25 @@ export class AsyncBufferedLogWriter {
       }
       this.pushLine(line);
     }
-    this.scheduleFlush();
+    this.scheduleFlush(delayMs);
+  }
+
+  private handleWriteFailure(payload: string, error: unknown): boolean {
+    this.writeRetryCount += 1;
+    this.droppedWriteFailedAttempts += 1;
+    this.lastWriteFailure = getErrorMessage(error);
+
+    if (this.writeRetryCount <= this.maxWriteRetries) {
+      const retryDelayMs = this.writeRetryDelayMs * 2 ** Math.max(0, this.writeRetryCount - 1);
+      this.requeuePayload(payload, retryDelayMs);
+      return true;
+    }
+
+    this.droppedWritePayloads += 1;
+    this.droppedWriteEntries += countPayloadEntries(payload);
+    this.droppedWriteBytes += Buffer.byteLength(payload, "utf-8");
+    this.writeRetryCount = 0;
+    return false;
   }
 
   private clearBuffer(): void {
@@ -243,4 +330,8 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
     return fallback;
   }
   return Math.max(1, Math.trunc(value));
+}
+
+function countPayloadEntries(payload: string): number {
+  return payload.split(/(?<=\n)/u).filter(Boolean).length;
 }

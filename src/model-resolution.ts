@@ -17,6 +17,39 @@ type ModelRegistryContext<TModel extends ModelReference> = {
   };
 };
 
+export type ModelReadinessWaitOptions = {
+  maxAttempts?: number;
+  waitBetweenAttemptsMs?: number;
+  waitForReadiness?: (attempt: number, requested: string) => Promise<void>;
+};
+
+function normalizeModelReadinessAttempts(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.trunc(value));
+}
+
+function normalizeModelReadinessDelayMs(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.trunc(value));
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms) as ReturnType<typeof setTimeout> & { unref?: () => void };
+    timer.unref?.();
+  });
+}
+
 export function parseModelReference(modelReference: string | undefined): { provider: string; modelId: string } | undefined {
   if (!modelReference) {
     return undefined;
@@ -42,10 +75,16 @@ export function toModelReference(model: { provider: string; id: string }): strin
   return `${model.provider}/${model.id}`;
 }
 
+export type AgentModelResolution<TModel extends ModelReference> = {
+  model?: TModel;
+  requested?: string;
+  fallbackFrom?: string;
+};
+
 export function resolveAgentModel<TModel extends ModelReference>(
   ctx: ModelRegistryContext<TModel>,
   agent: Agent,
-): { model?: TModel; requested?: string; fallbackFrom?: string } {
+): AgentModelResolution<TModel> {
   const requested = agent.model?.trim();
   if (!requested) {
     return {};
@@ -101,4 +140,29 @@ export function resolveAgentModel<TModel extends ModelReference>(
   }
 
   return { requested };
+}
+
+export async function resolveAgentModelAfterReadiness<TModel extends ModelReference>(
+  ctx: ModelRegistryContext<TModel>,
+  agent: Agent,
+  options: ModelReadinessWaitOptions = {},
+): Promise<AgentModelResolution<TModel>> {
+  const maxAttempts = normalizeModelReadinessAttempts(options.maxAttempts);
+  const waitBetweenAttemptsMs = normalizeModelReadinessDelayMs(options.waitBetweenAttemptsMs);
+  const waitForReadiness = options.waitForReadiness ?? (async () => sleep(waitBetweenAttemptsMs));
+
+  let resolution = resolveAgentModel(ctx, agent);
+  if (!resolution.requested || resolution.model) {
+    return resolution;
+  }
+
+  for (let attempt = 1; attempt < maxAttempts; attempt += 1) {
+    await waitForReadiness(attempt, resolution.requested);
+    resolution = resolveAgentModel(ctx, agent);
+    if (resolution.model) {
+      return resolution;
+    }
+  }
+
+  return resolution;
 }
