@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-router",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Pi extension for active-agent routing, controlled subagent delegation, and task result rendering.",
   "type": "module",
   "main": "./index.ts",
@@ -18,10 +18,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
-    "lint": "npm run typecheck",
+    "build": "npm run typecheck",
+    "lint": "npm run --silent typecheck && node ./scripts/extension-standards-guard.mjs",
     "typecheck": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json",
-    "test": "bun ./src/test.ts && bun ./src/test/active-agent-prompt-test.ts && bun ./src/test/agent-discovery-test.ts && bun ./src/test/config-test.ts && bun ./src/test/delegated-extensions-test.ts && bun ./src/test/display-enhancements-test.ts && bun ./src/test/output-contract-test.ts && bun ./src/test/output-sanitizer-test.ts && bun ./src/test/parallel-control-test.ts && bun ./src/test/parallel-result-activity-test.ts && bun ./src/test/session-paths-test.ts && bun ./src/test/spinner-surface-test.ts && bun ./src/test/subagent-memory-regression-test.ts && bun ./src/test/subagent-output-sink-test.ts && bun ./src/test/subagent-output-test.ts && bun ./src/test/subagent-process-lifecycle-test.ts && bun ./src/test/subagent-runtime-env-test.ts && bun ./src/test/subagent-session-state-test.ts && bun ./src/test/subagent-key-distribution-entitlement-test.ts && bun ./src/test/task-controls-test.ts && bun ./src/test/task-display-formatting-test.ts && bun ./src/test/task-render-hints-test.ts && bun ./src/test/task-chain-mode-test.ts && bun ./src/test/task-tool-adapter-test.ts && bun ./src/test/task-update-dedupe-test.ts && bun ./src/test/tool-formatting-test.ts && bun ./src/test/ui-utils-test.ts",
+    "test:runtime": "node -e \"const { spawnSync } = require('node:child_process'); const result = spawnSync('bun', ['--version'], { stdio: 'inherit' }); if (result.error || result.status !== 0) { console.error('pi-agent-router tests require Bun on PATH. Install Bun from https://bun.sh/docs/installation.'); process.exit(result.status || 1); }\"",
+    "test": "npm run test:runtime && bun ./src/test/run-tests.ts",
     "check": "npm run build && npm run lint && npm run test"
   },
   "keywords": [
@@ -60,9 +61,13 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.72.0",
-    "@mariozechner/pi-coding-agent": "^0.72.0",
-    "@mariozechner/pi-tui": "^0.72.0",
-    "typebox": "^1.1.37"
+    "typebox": "^1.1.38",
+    "@earendil-works/pi-ai": "^0.75.4",
+    "@earendil-works/pi-coding-agent": "^0.75.4",
+    "@earendil-works/pi-tui": "^0.75.4"
+  },
+  "overrides": {
+    "fast-xml-builder": "1.1.7",
+    "ip-address": "10.1.1"
   }
 }
