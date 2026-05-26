@@ -21,6 +21,10 @@ import {
   formatToolInvocationLabel,
   getToolCallArguments,
 } from "../tool-formatting";
+import {
+  detectSubagentSemanticCompletion,
+  type SubagentSemanticCompletionSignal,
+} from "./semantic-completion-detector";
 
 export function extractMessageText(message: Message): string {
   if (typeof message.content === "string") {
@@ -417,10 +421,19 @@ export function getSubagentToolInvocationsFromState(state: SubagentJsonEventStat
   return [...state.toolInvocationMap.values()].map((item) => ({ ...item }));
 }
 
-export function processSubagentJsonEventLine(line: string, state: SubagentJsonEventState): void {
+export type SubagentJsonEventLineProcessResult = {
+  semanticCompletion?: SubagentSemanticCompletionSignal;
+};
+
+const EMPTY_JSON_EVENT_LINE_PROCESS_RESULT: SubagentJsonEventLineProcessResult = {};
+
+export function processSubagentJsonEventLine(
+  line: string,
+  state: SubagentJsonEventState,
+): SubagentJsonEventLineProcessResult {
   const trimmed = line.trim();
   if (!trimmed) {
-    return;
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   let event: unknown;
@@ -428,11 +441,11 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     event = JSON.parse(trimmed);
   } catch {
     state.malformedEventCount += 1;
-    return;
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   if (!event || typeof event !== "object" || Array.isArray(event)) {
-    return;
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   const eventRecord = event as Record<string, unknown>;
@@ -458,7 +471,7 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
         state.malformedEventCount += 1;
       }
     }
-    return;
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   if (
@@ -469,12 +482,12 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
   ) {
     const messageValue = eventRecord.message;
     if (!messageValue || typeof messageValue !== "object" || Array.isArray(messageValue)) {
-      return;
+      return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
     }
 
     const rawMessage = messageValue as { content?: unknown; usage?: unknown; role?: unknown };
     if (typeof rawMessage.content !== "string" && !Array.isArray(rawMessage.content)) {
-      return;
+      return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
     }
 
     const message = messageValue as Message;
@@ -483,14 +496,14 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
       if (message.role === "assistant") {
         setLiveMessageState(state, message);
       }
-      return;
+      return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
     }
 
     if (eventType === "message_update") {
       if (message.role === "assistant") {
         setLiveMessageState(state, message);
       }
-      return;
+      return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
     }
 
     if (eventType === "message_end" && message.role === "assistant") {
@@ -502,8 +515,11 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     if (eventType === "message_end" && message.role === "assistant") {
       state.usage.turns += 1;
       mergeUsageTotals(state.usage, rawMessage.usage);
+      const semanticCompletion = detectSubagentSemanticCompletion(message);
+      return semanticCompletion ? { semanticCompletion } : EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
     }
-    return;
+
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   if (eventType === "compaction_end") {
@@ -514,12 +530,14 @@ export function processSubagentJsonEventLine(line: string, state: SubagentJsonEv
     if (reason === "overflow" && willRetry && !aborted && hasResult) {
       state.overflowCompactionRecoveryCount += 1;
     }
-    return;
+    return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
   }
 
   if (eventType === "usage") {
     mergeUsageTotals(state.usage, eventRecord.usage ?? eventRecord);
   }
+
+  return EMPTY_JSON_EVENT_LINE_PROCESS_RESULT;
 }
 
 export function getLatestSubagentFinalResponseFromMessages(messages: readonly Message[]): string {

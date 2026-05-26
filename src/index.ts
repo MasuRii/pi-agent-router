@@ -77,6 +77,9 @@ import {
   FINISHED_SUBAGENT_TTL_MS,
   SUBAGENT_DERIVED_OUTPUT_MAX_CHARS,
   SUBAGENT_HARD_KILL_DELAY_MS,
+  SUBAGENT_SEMANTIC_COMPLETION_FORCED_FINALIZE_GRACE_MS,
+  SUBAGENT_SEMANTIC_COMPLETION_GRACE_MS,
+  SUBAGENT_SEMANTIC_COMPLETION_HARD_KILL_DELAY_MS,
   SUBAGENT_STDOUT_CAPTURE_MAX_CHARS,
   SUBAGENT_STDERR_CAPTURE_MAX_CHARS,
   SUBAGENT_STDOUT_PARTIAL_LINE_MAX_CHARS,
@@ -225,6 +228,19 @@ import {
 import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env";
 import { inspectSessionToolCallIntegrity } from "./subagent/session-integrity";
 import { parseProviderRetryDelayHint, type ProviderRetryDelayHint } from "./subagent/credential-backoff";
+import {
+  createSubagentCredentialStallMonitor,
+  type SubagentCredentialStallEvent,
+} from "./subagent/credential-stall-detector";
+import {
+  createSubagentSemanticCompletionFinalizer,
+  type SubagentSemanticCompletionFinalizeEvent,
+  type SubagentSemanticCompletionTerminationEvent,
+} from "./subagent/semantic-completion-finalizer";
+import {
+  getLatestAssistantStopReason,
+  shouldContinueDelegatedToolUse as shouldContinueDelegatedToolUseRun,
+} from "./subagent/tool-use-continuation";
 import { buildSystemPromptForActiveAgent } from "./agent/active-agent-prompt";
 import { registerRouterReloadHandler } from "./router-reload-handler";
 import {
@@ -1692,6 +1708,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     });
     const subagentProviderEnvKey = await resolveProviderEnvKeyAsync(subagentProviderId);
     let delegatedRuntimeArtifacts: DelegatedRuntimeArtifact[] = [];
+    const routerConfig = loadPiAgentRouterConfig().config;
 
     try {
       const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-router-"));
@@ -1705,7 +1722,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       session.isolatedAgentDir = isolatedAgentDirResult.agentDir;
       isolatedAgentDirs.add(isolatedAgentDirResult.agentDir);
 
-      const routerConfig = loadPiAgentRouterConfig().config;
       const directEnvAuthAvailable =
         await isDirectEnvDelegationAuthAvailableForProviderAsync(subagentProviderId);
       const delegatedExtensionResolutionResults = await Promise.all(
@@ -2146,32 +2162,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return 0;
     };
 
-    const getLatestAssistantStopReason = (
-      run: SubagentRunResult,
-    ): string | undefined => {
-      const messages = run.messages || [];
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const candidate = messages[index] as Record<string, unknown> | undefined;
-        if (!candidate || candidate.role !== "assistant") {
-          continue;
-        }
-
-        return normalizeInputText(candidate.stopReason);
-      }
-
-      return undefined;
-    };
-
-    const isToolUseStopReason = (stopReason: string | undefined): boolean => {
-      const normalized = normalizeInputText(stopReason).toLowerCase();
-      return normalized === "tooluse" || normalized === "tool_use" || normalized === "tool-use";
-    };
-
     const shouldContinueDelegatedToolUse = (run: SubagentRunResult): boolean =>
-      run.code === 0 &&
-      !run.timedOut &&
-      isToolUseStopReason(getLatestAssistantStopReason(run)) &&
-      Boolean(run.sessionPath || session.sessionPath);
+      shouldContinueDelegatedToolUseRun(run, session.sessionPath);
 
     const isErrorStopReason = (stopReason: string | undefined): boolean =>
       normalizeInputText(stopReason).toLowerCase() === "error";
@@ -2542,9 +2534,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       let lastStreamOutput = "";
       let lastStreamToolInvocationCount = 0;
       let lastStreamLatestToolCall: string | undefined;
+      let credentialStallMonitor: ReturnType<typeof createSubagentCredentialStallMonitor> | undefined;
+      let semanticCompletionFinalizer: ReturnType<typeof createSubagentSemanticCompletionFinalizer> | undefined;
 
       const emitStreamUpdate = (): void => {
         const eventSessionPath = eventState.sessionPath;
+        const sessionPathChanged = Boolean(eventSessionPath && session.sessionPath !== eventSessionPath);
         if (eventSessionPath && session.sessionPath !== eventSessionPath) {
           session.sessionPath = eventSessionPath;
           const trackedTask = subagentTaskRegistry.get(session.taskId);
@@ -2572,7 +2567,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
         const outputChanged =
           Boolean(outputText) && outputText !== lastStreamOutput;
-        if (!outputChanged && !trackedInvocationsChanged && !toolInvocationCountChanged && !latestToolCallChanged) {
+        if (!sessionPathChanged && !outputChanged && !trackedInvocationsChanged && !toolInvocationCountChanged && !latestToolCallChanged) {
           return;
         }
 
@@ -2583,6 +2578,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
         lastStreamToolInvocationCount = toolInvocationCount;
         lastStreamLatestToolCall = latestToolCall;
+        credentialStallMonitor?.recordMeaningfulProgress();
 
         if (typeof options.onStreamUpdate === "function") {
           try {
@@ -2619,6 +2615,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
         stdoutSink.push(piece);
         subagentProcessLifecycle.recordActivity();
+        semanticCompletionFinalizer?.recordProcessActivity();
         stdoutBuffer += piece;
 
         let processedJsonEvent = false;
@@ -2631,7 +2628,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
             continue;
           }
 
-          processSubagentJsonEventLine(line, eventState);
+          const processResult = processSubagentJsonEventLine(line, eventState);
+          if (processResult.semanticCompletion) {
+            semanticCompletionFinalizer?.recordSemanticCompletion(processResult.semanticCompletion);
+          }
           processedJsonEvent = true;
         }
 
@@ -2661,6 +2661,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
           stderrSink.summarize().tailText,
         );
         subagentProcessLifecycle.recordActivity();
+        semanticCompletionFinalizer?.recordProcessActivity();
+        credentialStallMonitor?.recordCredentialSignalText(piece);
         requestSubagentUiRender(false);
       };
 
@@ -2686,7 +2688,10 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
         if (stdoutPartialLineOverflowed) {
           eventState.malformedEventCount += 1;
         } else {
-          processSubagentJsonEventLine(stdoutBuffer, eventState);
+          const processResult = processSubagentJsonEventLine(stdoutBuffer, eventState);
+          if (processResult.semanticCompletion) {
+            semanticCompletionFinalizer?.recordSemanticCompletion(processResult.semanticCompletion);
+          }
           emitStreamUpdate();
         }
 
@@ -2761,13 +2766,145 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
       return new Promise<SubagentRunResult>((resolve) => {
         let settled = false;
+        let credentialStallHardKillTimer: ReturnType<typeof setTimeout> | undefined;
+        let credentialStallForcedFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
+        let completeAttempt: (code: number) => void;
 
-        const completeAttempt = (code: number): void => {
+        const clearCredentialStallTerminationTimers = (): void => {
+          if (credentialStallHardKillTimer) {
+            clearTimeout(credentialStallHardKillTimer);
+            credentialStallHardKillTimer = undefined;
+          }
+          if (credentialStallForcedFinalizeTimer) {
+            clearTimeout(credentialStallForcedFinalizeTimer);
+            credentialStallForcedFinalizeTimer = undefined;
+          }
+        };
+
+        const isProcessStillRunning = (proc: NonNullable<SubagentSession["proc"]>): boolean =>
+          proc.exitCode === null && proc.signalCode === null;
+
+        const formatCredentialStallMessage = (event: SubagentCredentialStallEvent): string =>
+          `[pi-agent-router] Credential retry/cooldown stall detected for delegated task ${session.id.slice(0, 8)} after ${formatDuration(event.stalledForMs)} without meaningful progress. ` +
+          `Observed ${event.signal.kind} signal: ${event.signal.matchedText}`;
+
+        const triggerCredentialStallTermination = (event: SubagentCredentialStallEvent): void => {
+          if (settled) {
+            return;
+          }
+
+          const message = formatCredentialStallMessage(event);
+          appendStderrMessage(message);
+          void piAgentRouterDebugLogger.warn("subagent.credential_stall_detected", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            parentSessionId: session.parentSessionId,
+            stallKind: event.signal.kind,
+            stalledForMs: event.stalledForMs,
+            signalCount: event.signalCount,
+            sessionPath: eventState.sessionPath || session.sessionPath,
+          });
+
+          const proc = session.proc;
+          if (!proc || !isProcessStillRunning(proc)) {
+            completeAttempt(1);
+            return;
+          }
+
+          try {
+            proc.kill("SIGTERM");
+          } catch (error) {
+            appendStderrMessage(getErrorMessage(error, "Failed to terminate credential-stalled delegated process"));
+          }
+
+          credentialStallHardKillTimer = setTimeout(() => {
+            const activeProc = session.proc;
+            if (!activeProc || !isProcessStillRunning(activeProc)) {
+              return;
+            }
+
+            try {
+              activeProc.kill("SIGKILL");
+            } catch (error) {
+              appendStderrMessage(getErrorMessage(error, "Failed to hard-kill credential-stalled delegated process"));
+            }
+          }, SUBAGENT_HARD_KILL_DELAY_MS);
+
+          credentialStallForcedFinalizeTimer = setTimeout(() => {
+            completeAttempt(1);
+          }, SUBAGENT_HARD_KILL_DELAY_MS + routerConfig.subagentCredentialStall.forcedFinalizeGraceMs);
+
+          requestSubagentUiRender(false);
+        };
+
+        credentialStallMonitor = createSubagentCredentialStallMonitor({
+          enabled: routerConfig.subagentCredentialStall.enabled && hasDelegatedMultiAuthRuntime,
+          thresholdMs: routerConfig.subagentCredentialStall.thresholdMs,
+          onStall: triggerCredentialStallTermination,
+        });
+
+        const recordSemanticCompletionTermination = (event: SubagentSemanticCompletionTerminationEvent): void => {
+          appendSessionOutputNotice(
+            session,
+            `Delegated process stayed open for ${formatDuration(SUBAGENT_SEMANTIC_COMPLETION_GRACE_MS)} after a terminal assistant completion event; finalizing from semantic completion.`,
+          );
+          void piAgentRouterDebugLogger.warn("subagent.semantic_completion_process_open", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            parentSessionId: session.parentSessionId,
+            stopReason: event.signal.stopReason,
+            finalResponseChars: event.signal.finalResponseText.length,
+            sessionPath: eventState.sessionPath || session.sessionPath,
+          });
+        };
+
+        const finalizeSemanticCompletion = (event: SubagentSemanticCompletionFinalizeEvent): void => {
+          void piAgentRouterDebugLogger.warn("subagent.semantic_completion_forced_finalize", {
+            sessionId: session.id,
+            taskId: session.taskId,
+            parentSessionId: session.parentSessionId,
+            stopReason: event.signal.stopReason,
+            finalResponseChars: event.signal.finalResponseText.length,
+            forcedAfterMs: event.forcedAfterMs,
+            sessionPath: eventState.sessionPath || session.sessionPath,
+          });
+          completeAttempt(0);
+        };
+
+        semanticCompletionFinalizer = createSubagentSemanticCompletionFinalizer({
+          completionGraceMs: SUBAGENT_SEMANTIC_COMPLETION_GRACE_MS,
+          hardKillDelayMs: SUBAGENT_SEMANTIC_COMPLETION_HARD_KILL_DELAY_MS,
+          forcedFinalizeGraceMs: SUBAGENT_SEMANTIC_COMPLETION_FORCED_FINALIZE_GRACE_MS,
+          isProcessStillRunning: () => {
+            const proc = session.proc;
+            return Boolean(proc && isProcessStillRunning(proc));
+          },
+          terminateProcess: (signal) => {
+            const proc = session.proc;
+            if (!proc || !isProcessStillRunning(proc)) {
+              return;
+            }
+            proc.kill(signal);
+          },
+          onTerminateError: (error, signal) => {
+            const action = signal === "SIGKILL" ? "hard-kill" : "terminate";
+            appendStderrMessage(
+              getErrorMessage(error, `Failed to ${action} semantically completed delegated process`),
+            );
+          },
+          onTerminationStarted: recordSemanticCompletionTermination,
+          onFinalize: finalizeSemanticCompletion,
+        });
+
+        completeAttempt = (code: number): void => {
           if (settled) {
             return;
           }
 
           settled = true;
+          credentialStallMonitor?.stop();
+          clearCredentialStallTerminationTimers();
+          semanticCompletionFinalizer?.stop();
           void (async () => {
             try {
               const captured = await finalizeCapturedOutput();

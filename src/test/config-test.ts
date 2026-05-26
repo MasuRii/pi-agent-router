@@ -260,4 +260,46 @@ await runTest("loadPiAgentRouterConfig makes custom direct-env credential fallba
   }
 });
 
+await runTest("loadPiAgentRouterConfig normalizes credential stall detection settings", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
+  const configPath = join(root, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        subagentCredentialStall: {
+          enabled: false,
+          thresholdMs: 75_000,
+          forcedFinalizeGraceMs: 250,
+        },
+      }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const result = loadPiAgentRouterConfig(configPath);
+    assert.equal(result.warning, undefined);
+    assert.deepEqual(result.config.subagentCredentialStall, {
+      enabled: false,
+      thresholdMs: 75_000,
+      forcedFinalizeGraceMs: 250,
+    });
+
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({ subagentCredentialStall: { thresholdMs: 0 } }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const invalidResult = loadPiAgentRouterConfig(configPath);
+    assert.equal(
+      invalidResult.config.subagentCredentialStall.thresholdMs,
+      DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall.thresholdMs,
+    );
+    assert.match(invalidResult.warning || "", /subagentCredentialStall\.thresholdMs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 console.log("All config tests passed.");

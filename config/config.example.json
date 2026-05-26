@@ -66,5 +66,10 @@
     "architect": "🏗️",
     "orchestrator": "🎯"
   },
-  "subagentWidgetIconMode": "auto"
+  "subagentWidgetIconMode": "auto",
+  "subagentCredentialStall": {
+    "enabled": true,
+    "thresholdMs": 120000,
+    "forcedFinalizeGraceMs": 1000
+  }
 }

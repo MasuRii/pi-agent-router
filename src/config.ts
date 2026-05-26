@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import {
   AGENT_EMOJIS,
   DEFAULT_PRIMARY_AGENTS,
+  SUBAGENT_CREDENTIAL_STALL_FORCED_FINALIZE_GRACE_MS,
+  SUBAGENT_CREDENTIAL_STALL_THRESHOLD_MS,
   SUBAGENT_DEFAULT_MAX_CONCURRENCY,
   SUBAGENT_MAX_CONFIGURABLE_CONCURRENCY,
   SUBAGENT_MIN_CONCURRENCY,
@@ -34,6 +36,12 @@ export type DelegatedExtensionsConfig = DelegatedExtensionConfigEntry[];
 
 export type CredentialFallbackPolicy = "parent-env" | "distributed-only";
 
+export interface SubagentCredentialStallConfig {
+  enabled: boolean;
+  thresholdMs: number;
+  forcedFinalizeGraceMs: number;
+}
+
 export interface PiAgentRouterConfig {
   debug: boolean;
   maxParallelDelegationConcurrency: number;
@@ -46,6 +54,7 @@ export interface PiAgentRouterConfig {
   primaryAgents: string[];
   agentEmojis: Record<string, string>;
   subagentWidgetIconMode: SubagentWidgetIconConfigMode;
+  subagentCredentialStall: SubagentCredentialStallConfig;
 }
 
 export interface PiAgentRouterConfigLoadResult {
@@ -143,6 +152,12 @@ export const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
   "anthropic-messages",
 ];
 
+const DEFAULT_SUBAGENT_CREDENTIAL_STALL_CONFIG: SubagentCredentialStallConfig = {
+  enabled: true,
+  thresholdMs: SUBAGENT_CREDENTIAL_STALL_THRESHOLD_MS,
+  forcedFinalizeGraceMs: SUBAGENT_CREDENTIAL_STALL_FORCED_FINALIZE_GRACE_MS,
+};
+
 export const DEFAULT_PI_AGENT_ROUTER_CONFIG: PiAgentRouterConfig = {
   debug: false,
   maxParallelDelegationConcurrency: SUBAGENT_DEFAULT_MAX_CONCURRENCY,
@@ -155,6 +170,7 @@ export const DEFAULT_PI_AGENT_ROUTER_CONFIG: PiAgentRouterConfig = {
   primaryAgents: [...DEFAULT_PRIMARY_AGENTS],
   agentEmojis: AGENT_EMOJIS,
   subagentWidgetIconMode: "auto",
+  subagentCredentialStall: DEFAULT_SUBAGENT_CREDENTIAL_STALL_CONFIG,
 };
 
 export function resolveExtensionRoot(moduleUrl = import.meta.url): string {
@@ -218,6 +234,9 @@ function cloneDefaultConfig(): PiAgentRouterConfig {
     primaryAgents: cloneStringArray(DEFAULT_PI_AGENT_ROUTER_CONFIG.primaryAgents),
     agentEmojis: cloneStringRecord(DEFAULT_PI_AGENT_ROUTER_CONFIG.agentEmojis),
     subagentWidgetIconMode: DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode,
+    subagentCredentialStall: {
+      ...DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall,
+    },
   };
 }
 
@@ -801,6 +820,34 @@ function normalizeSubagentWidgetIconMode(
   return DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode;
 }
 
+function normalizeSubagentCredentialStallConfig(
+  value: unknown,
+  warnings: string[],
+): SubagentCredentialStallConfig {
+  const defaults = DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall;
+  const record = asRecord(value) ?? {};
+
+  if (value !== undefined && !asRecord(value)) {
+    warnInvalidConfigValue(warnings, "subagentCredentialStall", "an object", value);
+  }
+
+  return {
+    enabled: record.enabled === undefined ? defaults.enabled : record.enabled === true,
+    thresholdMs: normalizePositiveInteger(
+      record.thresholdMs,
+      defaults.thresholdMs,
+      "subagentCredentialStall.thresholdMs",
+      warnings,
+    ),
+    forcedFinalizeGraceMs: normalizePositiveInteger(
+      record.forcedFinalizeGraceMs,
+      defaults.forcedFinalizeGraceMs,
+      "subagentCredentialStall.forcedFinalizeGraceMs",
+      warnings,
+    ),
+  };
+}
+
 function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings: string[] } {
   const warnings: string[] = [];
   const record = asRecord(raw);
@@ -866,6 +913,10 @@ function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings:
       ),
       subagentWidgetIconMode: normalizeSubagentWidgetIconMode(
         normalizedRecord.subagentWidgetIconMode,
+        warnings,
+      ),
+      subagentCredentialStall: normalizeSubagentCredentialStallConfig(
+        normalizedRecord.subagentCredentialStall,
         warnings,
       ),
     },
