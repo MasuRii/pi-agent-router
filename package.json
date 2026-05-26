@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-router",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Pi extension for active-agent routing, controlled subagent delegation, and task result rendering.",
   "type": "module",
   "main": "./index.ts",
@@ -62,9 +62,9 @@
   },
   "peerDependencies": {
     "typebox": "^1.1.38",
-    "@earendil-works/pi-ai": "^0.75.4",
-    "@earendil-works/pi-coding-agent": "^0.75.4",
-    "@earendil-works/pi-tui": "^0.75.4"
+    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0"
   },
   "overrides": {
     "fast-xml-builder": "1.1.7",
