@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-26
+
+### Added
+- Added credential stall detection with automatic process termination so delegated subagent runtimes no longer hang indefinitely when authentication providers stop responding.
+- Added semantic completion detection and forced finalization so delegated tasks that stall after producing a valid result are finalized automatically instead of waiting for a clean shutdown signal.
+
+### Changed
+- Extracted tool-use continuation logic to a dedicated `tool-use-continuation` module under `src/subagent/` for clearer separation of concerns and easier maintenance.
+
 ## [0.6.0] - 2026-05-22
 
 ### Added

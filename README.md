@@ -16,6 +16,9 @@ Active-agent routing and controlled subagent delegation for the [Pi coding agent
 - **Delegated runtime safety controls** for optional compatibility extensions and fail-closed security companions
 - **Compact task result rendering** for running, completed, failed, and aborted delegation batches
 - **Output contract warnings** that surface malformed or incomplete delegated results
+- **Credential stall detection** with automatic process termination when authentication providers stop responding
+- **Semantic completion detection** with forced finalization so delegated tasks that produce valid results are finalized automatically instead of waiting for a clean shutdown signal
+- **Tool-use continuation** extracted to a dedicated module for clearer separation of concerns
 - **Debug logging control** through `debug`, with logs written only under the extension-local `debug/` directory when enabled
 
 ## Installation
