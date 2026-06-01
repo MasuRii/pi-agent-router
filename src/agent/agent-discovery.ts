@@ -20,7 +20,11 @@ import {
   PRIMARY_MODE_VALUES,
   VALID_THINKING_LEVELS,
 } from "../constants";
-import { DEFAULT_AGENT_MARKDOWN_MAX_BYTES, loadPiAgentRouterConfig } from "../config";
+import {
+  DEFAULT_AGENT_MARKDOWN_MAX_BYTES,
+  invalidatePiAgentRouterConfigCache,
+  loadPiAgentRouterConfig,
+} from "../config";
 import type { AgentDiscoveryConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { normalizeInputText } from "../input-normalization";
@@ -43,9 +47,6 @@ type AgentMarkdownReadOptions = {
 
 type AgentDiscoveryConfigSlices = {
   agentDiscovery: AgentDiscoveryConfig;
-  primaryAgents: readonly string[];
-  primaryAgentSet: ReadonlySet<string>;
-  agentEmojis: Readonly<Record<string, string>>;
 };
 
 let cachedAgentDiscoveryConfigSlices: AgentDiscoveryConfigSlices | undefined;
@@ -62,9 +63,6 @@ function getConfiguredAgentDiscoverySlices(): AgentDiscoveryConfigSlices {
       userSourceDirs: [...config.agentDiscovery.userSourceDirs],
       maxMarkdownBytes: config.agentDiscovery.maxMarkdownBytes,
     },
-    primaryAgents: [...config.primaryAgents],
-    primaryAgentSet: new Set(config.primaryAgents),
-    agentEmojis: { ...config.agentEmojis },
   };
   return cachedAgentDiscoveryConfigSlices;
 }
@@ -188,6 +186,11 @@ function createDiscoveryCacheKey(cwd: string, scope: AgentScope): string {
   return `${scope}\u0000${resolve(normalizedCwd)}`;
 }
 
+function extractLeadingEmoji(value: string): string | undefined {
+  const match = value.trim().match(/^(\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?)*)/u);
+  return match?.[1] || undefined;
+}
+
 function parseAgentContent(rawContent: string): Agent | null {
   const raw = rawContent.replace(/\r\n/g, "\n");
   if (!raw.startsWith("---\n")) {
@@ -226,9 +229,12 @@ function parseAgentContent(rawContent: string): Agent | null {
     fm.thinkingLevel || fm.thinking || fm.reasoningLevel || fm.reasoningEffort || fm.reasoningeffort || fm.reasoning,
   );
 
+  const description = fm.description || `Agent ${fm.name}`;
+
   return {
     name: fm.name,
-    description: fm.description || `Agent ${fm.name}`,
+    description,
+    emoji: extractLeadingEmoji(fm.emoji || description),
     color: normalizeAgentColor(fm.color),
     model: fm.model || undefined,
     mode: normalizeAgentMode(fm.mode),
@@ -246,6 +252,7 @@ export function getAgentDiscoveryCacheSnapshot(): AgentDiscoveryCacheSnapshot {
 }
 
 export function invalidateAgentDiscoveryCaches(): void {
+  invalidatePiAgentRouterConfigCache();
   const removedDirectoryEntries = agentDirectoryCache.size();
   const removedDiscoveryEntries = agentDiscoveryCache.size();
 
@@ -267,6 +274,7 @@ export function invalidateAgentDiscoveryCaches(): void {
 }
 
 export function resetAgentDiscoveryCacheState(): void {
+  invalidatePiAgentRouterConfigCache();
   agentDiscoveryCacheRevision += 1;
   resetConfiguredAgentDiscoverySlices();
   agentDirectoryCache.clear();
@@ -725,42 +733,22 @@ export async function discoverAgentsAsync(
   }
 }
 
-function isPrimaryAgentWithConfig(agent: Agent, configuredPrimaryAgentSet: ReadonlySet<string>): boolean {
-  if (agent.mode) {
-    return PRIMARY_MODE_VALUES.has(agent.mode);
-  }
-
-  return configuredPrimaryAgentSet.has(agent.name);
-}
-
 export function isPrimaryAgent(agent: Agent): boolean {
-  return isPrimaryAgentWithConfig(
-    agent,
-    getConfiguredAgentDiscoverySlices().primaryAgentSet,
-  );
+  return Boolean(agent.mode && PRIMARY_MODE_VALUES.has(agent.mode));
 }
 
 export function getPrimaryAgents(agents: Agent[]): Agent[] {
-  const configuredPrimaryAgentSet = getConfiguredAgentDiscoverySlices().primaryAgentSet;
-  return agents.filter((agent) => isPrimaryAgentWithConfig(agent, configuredPrimaryAgentSet));
+  return agents.filter((agent) => isPrimaryAgent(agent));
 }
 
 export function getCyclablePrimaryAgents(agents: Agent[]): string[] {
-  const configuredSlices = getConfiguredAgentDiscoverySlices();
-  const configuredPrimaryAgents = configuredSlices.primaryAgents;
-  const configuredPrimaryAgentSet = configuredSlices.primaryAgentSet;
-  const primaryNames = new Set(
-    agents
-      .filter((agent) => isPrimaryAgentWithConfig(agent, configuredPrimaryAgentSet))
-      .map((agent) => agent.name),
-  );
-  const orderedDefaults = configuredPrimaryAgents.filter((name) => primaryNames.has(name));
-  const extras = [...primaryNames].filter((name) => !configuredPrimaryAgentSet.has(name));
-  return [...orderedDefaults, ...extras.sort((a, b) => a.localeCompare(b))];
+  return agents
+    .filter((agent) => isPrimaryAgent(agent))
+    .map((agent) => agent.name);
 }
 
-export function getAgentEmoji(name: string): string {
-  return getConfiguredAgentDiscoverySlices().agentEmojis[name] || "🤖";
+export function getAgentEmoji(name: string, agents: readonly Agent[] = []): string {
+  return agents.find((agent) => agent.name === name)?.emoji || "🤖";
 }
 
 export function getPersistedActiveAgentName(ctx: ExtensionContext): string | null | undefined {

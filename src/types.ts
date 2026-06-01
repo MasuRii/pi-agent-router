@@ -18,6 +18,7 @@ export type AgentScope = "user" | "project" | "both";
 export type Agent = {
   name: string;
   description: string;
+  emoji?: string;
   color?: string;
   model?: string;
   mode?: AgentMode;

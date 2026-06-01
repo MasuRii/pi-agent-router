@@ -4,12 +4,15 @@
 
 import type { Api, AssistantMessageEventStream, Context as LlmContext, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 
-import { DEFAULT_COPILOT_INITIATOR_TARGET_APIS } from "../config";
-
 import type { Agent, ApiStreamSimpleDelegate, GlobalWithAgentRouterBaseApiStreams } from "../types";
 
 const ACTIVE_AGENT_PROMPT_MODULE_URL = new URL("./active-agent-prompt.ts", import.meta.url).href;
 const TEMPERATURE_SUPPORT_MODULE_URL = new URL("./temperature-support.ts", import.meta.url).href;
+const COPILOT_INITIATOR_TARGET_APIS = [
+  "openai-completions",
+  "openai-responses",
+  "anthropic-messages",
+] as const;
 
 export function getAgentRouterBaseApiStreams(): Map<string, ApiStreamSimpleDelegate> {
   const globalScope = globalThis as GlobalWithAgentRouterBaseApiStreams;
@@ -111,7 +114,7 @@ export function buildDelegatedTemperatureExtensionSource(temperature: number): s
 }
 
 export function buildDelegatedCopilotInitiatorExtensionSource(
-  targetApis: readonly string[] = DEFAULT_COPILOT_INITIATOR_TARGET_APIS,
+  targetApis: readonly string[] = COPILOT_INITIATOR_TARGET_APIS,
 ): string {
   return [
     "import { getApiProvider, type Api, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from \"@earendil-works/pi-ai\";",

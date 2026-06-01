@@ -19,35 +19,20 @@ function createContext(overrides: Partial<SubagentWidgetIconDetectionContext> = 
   };
 }
 
-runTest("subagent widget icon env mode overrides config preference", () => {
+runTest("subagent widget icons always use automatic font detection", () => {
+  assert.equal(resolveSubagentWidgetIconsForContext(createContext()).mode, "fallback");
   assert.equal(
     resolveSubagentWidgetIconsForContext(
-      createContext({ env: { PI_AGENT_ROUTER_ICON_MODE: "fallback" } }),
-      "nerd",
-    ).mode,
-    "fallback",
-  );
-
-  assert.equal(
-    resolveSubagentWidgetIconsForContext(
-      createContext({ env: { PI_AGENT_ROUTER_NERD_FONT: "true" } }),
-      "fallback",
+      createContext({ env: { PI_AGENT_ROUTER_FONT_FAMILY: "JetBrainsMono Nerd Font" } }),
     ).mode,
     "nerd",
   );
-});
-
-runTest("subagent widget icon config preference is used when env is not explicit", () => {
-  assert.equal(resolveSubagentWidgetIconsForContext(createContext(), "nerd").mode, "nerd");
-  assert.equal(resolveSubagentWidgetIconsForContext(createContext(), "fallback").mode, "fallback");
-  assert.equal(resolveSubagentWidgetIconsForContext(createContext(), "auto").mode, "fallback");
 });
 
 runTest("subagent widget icon auto mode detects nerd font hints from environment", () => {
   assert.equal(
     resolveSubagentWidgetIconsForContext(
       createContext({ env: { PI_AGENT_ROUTER_FONT_FAMILY: "JetBrainsMono Nerd Font" } }),
-      "auto",
     ).mode,
     "nerd",
   );
@@ -86,14 +71,13 @@ runTest("subagent widget icon auto mode detects Windows Terminal active profile 
           }`
         : null,
     }),
-    "auto",
   );
 
   assert.equal(result.mode, "nerd");
 });
 
 runTest("subagent widget icon auto mode falls back on non-Windows without nerd hints", () => {
-  const result = resolveSubagentWidgetIconsForContext(createContext({ platform: "darwin" }), "auto");
+  const result = resolveSubagentWidgetIconsForContext(createContext({ platform: "darwin" }));
   assert.equal(result.mode, "fallback");
   assert.equal(result.icons.running, "⏳");
 });

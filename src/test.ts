@@ -264,11 +264,8 @@ runTest("subagent output analysis cache keys do not retain oversized raw output"
   assert.deepEqual(firstAnalysis.commands, ["read src/index.ts"]);
 });
 
-runTest("default delegated extension config requires security companions", () => {
-  assert.deepEqual(DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions, [
-    { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
-    { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
-  ]);
+runTest("default delegated extension config is share-friendly without user-specific companions", () => {
+  assert.deepEqual(DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions, []);
 });
 
 runTest("delegated extension metadata declares generic runtime skip rules", () => {
@@ -289,11 +286,16 @@ runTest("delegated subagents disable automatic extension discovery before applyi
     sessionDir: "/tmp/pi-agent-router-sessions",
   });
 
-  assert.deepEqual(args.slice(0, 6), [
+  assert.deepEqual(args.slice(0, 12), [
     "--mode",
     "json",
     "-p",
     "--no-extensions",
+    "--offline",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
     "--session-dir",
     "/tmp/pi-agent-router-sessions",
   ]);

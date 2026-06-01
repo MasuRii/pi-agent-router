@@ -3,10 +3,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  AGENT_EMOJIS,
-  DEFAULT_PRIMARY_AGENTS,
-  SUBAGENT_CREDENTIAL_STALL_FORCED_FINALIZE_GRACE_MS,
-  SUBAGENT_CREDENTIAL_STALL_THRESHOLD_MS,
   SUBAGENT_DEFAULT_MAX_CONCURRENCY,
   SUBAGENT_MAX_CONFIGURABLE_CONCURRENCY,
   SUBAGENT_MIN_CONCURRENCY,
@@ -15,8 +11,6 @@ import { getErrorMessage } from "./error-utils";
 import { asRecord } from "./record-utils";
 
 export const PI_AGENT_ROUTER_EXTENSION_ID = "pi-agent-router";
-
-export type SubagentWidgetIconConfigMode = "auto" | "nerd" | "fallback";
 
 export interface AgentDiscoveryConfig {
   projectSourceDirs: string[];
@@ -34,27 +28,11 @@ export interface DelegatedExtensionConfigEntry {
 
 export type DelegatedExtensionsConfig = DelegatedExtensionConfigEntry[];
 
-export type CredentialFallbackPolicy = "parent-env" | "distributed-only";
-
-export interface SubagentCredentialStallConfig {
-  enabled: boolean;
-  thresholdMs: number;
-  forcedFinalizeGraceMs: number;
-}
-
 export interface PiAgentRouterConfig {
   debug: boolean;
   maxParallelDelegationConcurrency: number;
   agentDiscovery: AgentDiscoveryConfig;
   delegatedExtensions: DelegatedExtensionsConfig;
-  providerEnvKeys: Record<string, string>;
-  directEnvDelegationProviderIds: string[];
-  providerCredentialFallbackPolicies: Record<string, CredentialFallbackPolicy>;
-  copilotInitiatorTargetApis: string[];
-  primaryAgents: string[];
-  agentEmojis: Record<string, string>;
-  subagentWidgetIconMode: SubagentWidgetIconConfigMode;
-  subagentCredentialStall: SubagentCredentialStallConfig;
 }
 
 export interface PiAgentRouterConfigLoadResult {
@@ -90,87 +68,13 @@ export function isSafeDelegatedExtensionCandidateName(value: string): boolean {
   return SAFE_DELEGATED_EXTENSION_NAME_PATTERN.test(normalized);
 }
 
-const DEFAULT_DELEGATED_EXTENSIONS_CONFIG: DelegatedExtensionsConfig = [
-  { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
-  { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
-];
-
-const DEFAULT_PROVIDER_ENV_KEYS: Record<string, string> = {
-  anthropic: "ANTHROPIC_API_KEY",
-  openai: "OPENAI_API_KEY",
-  "openai-codex": "OPENAI_API_KEY",
-};
-
-const DEFAULT_DIRECT_ENV_DELEGATION_PROVIDER_IDS = [
-  "amazon-bedrock",
-  "anthropic",
-  "azure-openai-responses",
-  "cerebras",
-  "github-copilot",
-  "google",
-  "google-vertex",
-  "groq",
-  "huggingface",
-  "kimi-coding",
-  "minimax",
-  "minimax-cn",
-  "mistral",
-  "openai",
-  "opencode",
-  "opencode-go",
-  "openrouter",
-  "xai",
-  "zai",
-];
-
-const DEFAULT_PROVIDER_CREDENTIAL_FALLBACK_POLICIES: Record<string, CredentialFallbackPolicy> = {
-  "amazon-bedrock": "parent-env",
-  anthropic: "parent-env",
-  "azure-openai-responses": "parent-env",
-  cerebras: "parent-env",
-  "github-copilot": "parent-env",
-  google: "parent-env",
-  "google-vertex": "parent-env",
-  groq: "parent-env",
-  huggingface: "parent-env",
-  "kimi-coding": "parent-env",
-  minimax: "parent-env",
-  "minimax-cn": "parent-env",
-  mistral: "parent-env",
-  openai: "parent-env",
-  "openai-codex": "distributed-only",
-  opencode: "parent-env",
-  "opencode-go": "parent-env",
-  openrouter: "parent-env",
-  xai: "parent-env",
-  zai: "parent-env",
-};
-
-export const DEFAULT_COPILOT_INITIATOR_TARGET_APIS = [
-  "openai-completions",
-  "openai-responses",
-  "anthropic-messages",
-];
-
-const DEFAULT_SUBAGENT_CREDENTIAL_STALL_CONFIG: SubagentCredentialStallConfig = {
-  enabled: true,
-  thresholdMs: SUBAGENT_CREDENTIAL_STALL_THRESHOLD_MS,
-  forcedFinalizeGraceMs: SUBAGENT_CREDENTIAL_STALL_FORCED_FINALIZE_GRACE_MS,
-};
+const DEFAULT_DELEGATED_EXTENSIONS_CONFIG: DelegatedExtensionsConfig = [];
 
 export const DEFAULT_PI_AGENT_ROUTER_CONFIG: PiAgentRouterConfig = {
   debug: false,
   maxParallelDelegationConcurrency: SUBAGENT_DEFAULT_MAX_CONCURRENCY,
   agentDiscovery: DEFAULT_AGENT_DISCOVERY_CONFIG,
   delegatedExtensions: DEFAULT_DELEGATED_EXTENSIONS_CONFIG,
-  providerEnvKeys: DEFAULT_PROVIDER_ENV_KEYS,
-  directEnvDelegationProviderIds: DEFAULT_DIRECT_ENV_DELEGATION_PROVIDER_IDS,
-  providerCredentialFallbackPolicies: DEFAULT_PROVIDER_CREDENTIAL_FALLBACK_POLICIES,
-  copilotInitiatorTargetApis: DEFAULT_COPILOT_INITIATOR_TARGET_APIS,
-  primaryAgents: [...DEFAULT_PRIMARY_AGENTS],
-  agentEmojis: AGENT_EMOJIS,
-  subagentWidgetIconMode: "auto",
-  subagentCredentialStall: DEFAULT_SUBAGENT_CREDENTIAL_STALL_CONFIG,
 };
 
 export function resolveExtensionRoot(moduleUrl = import.meta.url): string {
@@ -182,16 +86,14 @@ export const CONFIG_PATH = join(EXTENSION_ROOT, "config.json");
 export const DEBUG_DIR = join(EXTENSION_ROOT, "debug");
 export const DEBUG_LOG_PATH = join(DEBUG_DIR, `${PI_AGENT_ROUTER_EXTENSION_ID}-debug.jsonl`);
 
+let cachedDefaultConfigLoadResult: PiAgentRouterConfigLoadResult | undefined;
+
 function cloneStringArray(values: readonly string[]): string[] {
   return [...values];
 }
 
 function cloneStringMatrix(values: readonly (readonly string[])[]): string[][] {
   return values.map((entry) => [...entry]);
-}
-
-function cloneStringRecord(values: Readonly<Record<string, string>>): Record<string, string> {
-  return { ...values };
 }
 
 function cloneDelegatedExtensionEntries(
@@ -204,39 +106,28 @@ function cloneDelegatedExtensionEntries(
   }));
 }
 
-function cloneDefaultConfig(): PiAgentRouterConfig {
+function cloneConfig(config: PiAgentRouterConfig): PiAgentRouterConfig {
   return {
-    debug: DEFAULT_PI_AGENT_ROUTER_CONFIG.debug,
-    maxParallelDelegationConcurrency:
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.maxParallelDelegationConcurrency,
+    debug: config.debug,
+    maxParallelDelegationConcurrency: config.maxParallelDelegationConcurrency,
     agentDiscovery: {
-      projectSourceDirs: cloneStringArray(
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.projectSourceDirs,
-      ),
-      userSourceDirs: cloneStringArray(
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.userSourceDirs,
-      ),
-      maxMarkdownBytes: DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.maxMarkdownBytes,
+      projectSourceDirs: cloneStringArray(config.agentDiscovery.projectSourceDirs),
+      userSourceDirs: cloneStringArray(config.agentDiscovery.userSourceDirs),
+      maxMarkdownBytes: config.agentDiscovery.maxMarkdownBytes,
     },
-    delegatedExtensions: cloneDelegatedExtensionEntries(
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.delegatedExtensions,
-    ),
-    providerEnvKeys: cloneStringRecord(DEFAULT_PI_AGENT_ROUTER_CONFIG.providerEnvKeys),
-    directEnvDelegationProviderIds: cloneStringArray(
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.directEnvDelegationProviderIds,
-    ),
-    providerCredentialFallbackPolicies: {
-      ...DEFAULT_PI_AGENT_ROUTER_CONFIG.providerCredentialFallbackPolicies,
-    },
-    copilotInitiatorTargetApis: cloneStringArray(
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.copilotInitiatorTargetApis,
-    ),
-    primaryAgents: cloneStringArray(DEFAULT_PI_AGENT_ROUTER_CONFIG.primaryAgents),
-    agentEmojis: cloneStringRecord(DEFAULT_PI_AGENT_ROUTER_CONFIG.agentEmojis),
-    subagentWidgetIconMode: DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode,
-    subagentCredentialStall: {
-      ...DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall,
-    },
+    delegatedExtensions: cloneDelegatedExtensionEntries(config.delegatedExtensions),
+  };
+}
+
+function cloneDefaultConfig(): PiAgentRouterConfig {
+  return cloneConfig(DEFAULT_PI_AGENT_ROUTER_CONFIG);
+}
+
+function cloneConfigLoadResult(result: PiAgentRouterConfigLoadResult): PiAgentRouterConfigLoadResult {
+  return {
+    config: cloneConfig(result.config),
+    created: result.created,
+    warning: result.warning,
   };
 }
 
@@ -365,114 +256,6 @@ function expandDelegatedExtensionCandidateAliases(candidates: readonly string[])
   }
 
   return expanded;
-}
-
-function normalizeStringRecord(
-  value: unknown,
-  fallback: Readonly<Record<string, string>>,
-  field: string,
-  warnings: string[],
-): Record<string, string> {
-  if (value === undefined) {
-    return cloneStringRecord(fallback);
-  }
-
-  const record = asRecord(value);
-  if (!record) {
-    warnInvalidConfigValue(warnings, field, "an object with non-empty string values", value);
-    return cloneStringRecord(fallback);
-  }
-
-  const normalized: Record<string, string> = {};
-  for (const [rawKey, rawValue] of Object.entries(record)) {
-    const key = rawKey.trim();
-    const normalizedValue = normalizeTrimmedString(rawValue);
-    if (!key || !normalizedValue) {
-      warnInvalidConfigValue(
-        warnings,
-        `${field}.${rawKey}`,
-        "a non-empty string value with a non-empty key",
-        rawValue,
-      );
-      continue;
-    }
-
-    normalized[key] = normalizedValue;
-  }
-
-  return normalized;
-}
-
-function normalizeProviderIdList(
-  value: unknown,
-  fallback: readonly string[],
-  field: string,
-  warnings: string[],
-): string[] {
-  return normalizeStringList(value, fallback, field, warnings).map((providerId) =>
-    providerId.toLowerCase(),
-  );
-}
-
-function normalizeProviderCredentialFallbackPolicies(
-  value: unknown,
-  fallback: Readonly<Record<string, CredentialFallbackPolicy>>,
-  warnings: string[],
-): Record<string, CredentialFallbackPolicy> {
-  if (value === undefined) {
-    return { ...fallback };
-  }
-
-  const record = asRecord(value);
-  if (!record) {
-    warnInvalidConfigValue(
-      warnings,
-      "providerCredentialFallbackPolicies",
-      "an object mapping provider IDs to 'parent-env' or 'distributed-only'",
-      value,
-    );
-    return { ...fallback };
-  }
-
-  const normalized: Record<string, CredentialFallbackPolicy> = {};
-  for (const [rawProviderId, rawPolicy] of Object.entries(record)) {
-    const providerId = normalizeTrimmedString(rawProviderId)?.toLowerCase();
-    const policy = normalizeTrimmedString(rawPolicy)?.toLowerCase();
-    if (!providerId || (policy !== "parent-env" && policy !== "distributed-only")) {
-      warnInvalidConfigValue(
-        warnings,
-        `providerCredentialFallbackPolicies.${rawProviderId}`,
-        "'parent-env' or 'distributed-only'",
-        rawPolicy,
-      );
-      continue;
-    }
-
-    normalized[providerId] = policy;
-  }
-
-  return { ...fallback, ...normalized };
-}
-
-function ensureExplicitProviderCredentialFallbackPolicies(
-  directEnvDelegationProviderIds: readonly string[],
-  policies: Readonly<Record<string, CredentialFallbackPolicy>>,
-  warnings: string[],
-): Record<string, CredentialFallbackPolicy> {
-  const normalized: Record<string, CredentialFallbackPolicy> = { ...policies };
-
-  for (const providerId of directEnvDelegationProviderIds) {
-    if (normalized[providerId]) {
-      continue;
-    }
-
-    normalized[providerId] = "parent-env";
-    warnings.push(
-      `Missing pi-agent-router config setting 'providerCredentialFallbackPolicies.${providerId}'; defaulting to 'parent-env'.`,
-    );
-  }
-
-  return normalized;
 }
 
 function normalizePositiveInteger(
@@ -798,56 +581,6 @@ function normalizeMaxParallelDelegationConcurrency(
   return value;
 }
 
-function normalizeSubagentWidgetIconMode(
-  value: unknown,
-  warnings: string[],
-): SubagentWidgetIconConfigMode {
-  if (value === undefined) {
-    return DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode;
-  }
-
-  const normalized = normalizeTrimmedString(value)?.toLowerCase();
-  if (normalized === "auto" || normalized === "nerd" || normalized === "fallback") {
-    return normalized;
-  }
-
-  warnInvalidConfigValue(
-    warnings,
-    "subagentWidgetIconMode",
-    "'auto', 'nerd', or 'fallback'",
-    value,
-  );
-  return DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode;
-}
-
-function normalizeSubagentCredentialStallConfig(
-  value: unknown,
-  warnings: string[],
-): SubagentCredentialStallConfig {
-  const defaults = DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall;
-  const record = asRecord(value) ?? {};
-
-  if (value !== undefined && !asRecord(value)) {
-    warnInvalidConfigValue(warnings, "subagentCredentialStall", "an object", value);
-  }
-
-  return {
-    enabled: record.enabled === undefined ? defaults.enabled : record.enabled === true,
-    thresholdMs: normalizePositiveInteger(
-      record.thresholdMs,
-      defaults.thresholdMs,
-      "subagentCredentialStall.thresholdMs",
-      warnings,
-    ),
-    forcedFinalizeGraceMs: normalizePositiveInteger(
-      record.forcedFinalizeGraceMs,
-      defaults.forcedFinalizeGraceMs,
-      "subagentCredentialStall.forcedFinalizeGraceMs",
-      warnings,
-    ),
-  };
-}
-
 function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings: string[] } {
   const warnings: string[] = [];
   const record = asRecord(raw);
@@ -856,22 +589,6 @@ function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings:
   }
 
   const normalizedRecord = record ?? {};
-
-  const directEnvDelegationProviderIds = normalizeProviderIdList(
-    normalizedRecord.directEnvDelegationProviderIds,
-    DEFAULT_PI_AGENT_ROUTER_CONFIG.directEnvDelegationProviderIds,
-    "directEnvDelegationProviderIds",
-    warnings,
-  );
-  const providerCredentialFallbackPolicies = ensureExplicitProviderCredentialFallbackPolicies(
-    directEnvDelegationProviderIds,
-    normalizeProviderCredentialFallbackPolicies(
-      normalizedRecord.providerCredentialFallbackPolicies,
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.providerCredentialFallbackPolicies,
-      warnings,
-    ),
-    warnings,
-  );
 
   return {
     config: {
@@ -883,40 +600,6 @@ function normalizeConfig(raw: unknown): { config: PiAgentRouterConfig; warnings:
       agentDiscovery: normalizeAgentDiscoveryConfig(normalizedRecord.agentDiscovery, warnings),
       delegatedExtensions: normalizeDelegatedExtensionsConfig(
         normalizedRecord.delegatedExtensions,
-        warnings,
-      ),
-      providerEnvKeys: normalizeStringRecord(
-        normalizedRecord.providerEnvKeys,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.providerEnvKeys,
-        "providerEnvKeys",
-        warnings,
-      ),
-      directEnvDelegationProviderIds,
-      providerCredentialFallbackPolicies,
-      copilotInitiatorTargetApis: normalizeStringList(
-        normalizedRecord.copilotInitiatorTargetApis,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.copilotInitiatorTargetApis,
-        "copilotInitiatorTargetApis",
-        warnings,
-      ),
-      primaryAgents: normalizeStringList(
-        normalizedRecord.primaryAgents,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.primaryAgents,
-        "primaryAgents",
-        warnings,
-      ),
-      agentEmojis: normalizeStringRecord(
-        normalizedRecord.agentEmojis,
-        DEFAULT_PI_AGENT_ROUTER_CONFIG.agentEmojis,
-        "agentEmojis",
-        warnings,
-      ),
-      subagentWidgetIconMode: normalizeSubagentWidgetIconMode(
-        normalizedRecord.subagentWidgetIconMode,
-        warnings,
-      ),
-      subagentCredentialStall: normalizeSubagentCredentialStallConfig(
-        normalizedRecord.subagentCredentialStall,
         warnings,
       ),
     },
@@ -952,7 +635,7 @@ function combineConfigWarnings(warnings: string[]): string | undefined {
   return warnings.length > 0 ? warnings.join(" ") : undefined;
 }
 
-export function loadPiAgentRouterConfig(configPath = CONFIG_PATH): PiAgentRouterConfigLoadResult {
+function loadPiAgentRouterConfigUncached(configPath: string): PiAgentRouterConfigLoadResult {
   const ensureResult = ensurePiAgentRouterConfig(configPath);
 
   try {
@@ -976,6 +659,19 @@ export function loadPiAgentRouterConfig(configPath = CONFIG_PATH): PiAgentRouter
         ensureResult.warning ?? `Failed to read pi-agent-router config at '${configPath}': ${message}`,
     };
   }
+}
+
+export function invalidatePiAgentRouterConfigCache(): void {
+  cachedDefaultConfigLoadResult = undefined;
+}
+
+export function loadPiAgentRouterConfig(configPath = CONFIG_PATH): PiAgentRouterConfigLoadResult {
+  if (configPath !== CONFIG_PATH) {
+    return loadPiAgentRouterConfigUncached(configPath);
+  }
+
+  cachedDefaultConfigLoadResult ??= loadPiAgentRouterConfigUncached(configPath);
+  return cloneConfigLoadResult(cachedDefaultConfigLoadResult);
 }
 
 export function ensurePiAgentRouterDebugDirectory(debugDir = DEBUG_DIR): string | undefined {

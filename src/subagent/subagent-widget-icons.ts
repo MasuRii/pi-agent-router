@@ -1,8 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { loadPiAgentRouterConfig, type SubagentWidgetIconConfigMode } from "../config";
-
 export type SubagentWidgetIconMode = "nerd" | "fallback";
 
 export type SubagentWidgetIcons = {
@@ -21,8 +19,6 @@ export type SubagentWidgetIconDetectionContext = {
   pathExists: (path: string) => boolean;
   readTextFile: (path: string) => string | null;
 };
-
-type SubagentWidgetIconPreference = SubagentWidgetIconConfigMode;
 
 const NERD_ICONS: SubagentWidgetIcons = {
   running: "",
@@ -63,55 +59,6 @@ function createDefaultContext(): SubagentWidgetIconDetectionContext {
       }
     },
   };
-}
-
-function parseEnvBoolean(value: string | undefined): boolean | null {
-  if (!value) {
-    return null;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-
-  return null;
-}
-
-function parsePreference(value: string | undefined): SubagentWidgetIconPreference | null {
-  if (!value) {
-    return null;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "auto" || normalized === "nerd" || normalized === "fallback") {
-    return normalized;
-  }
-
-  return null;
-}
-
-function resolvePreference(
-  env: Record<string, string | undefined>,
-  configuredPreference: SubagentWidgetIconPreference,
-): SubagentWidgetIconPreference {
-  const explicitMode = parsePreference(env.PI_AGENT_ROUTER_ICON_MODE);
-  if (explicitMode) {
-    return explicitMode;
-  }
-
-  const explicitBoolean = parseEnvBoolean(
-    env.PI_AGENT_ROUTER_NERD_FONT ?? env.PI_NERD_FONT,
-  );
-  if (explicitBoolean !== null) {
-    return explicitBoolean ? "nerd" : "fallback";
-  }
-
-  return configuredPreference;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -400,15 +347,8 @@ function iconsForMode(mode: SubagentWidgetIconMode): SubagentWidgetIcons {
 
 export function resolveSubagentWidgetIconsForContext(
   context: SubagentWidgetIconDetectionContext,
-  configuredPreference: SubagentWidgetIconPreference = "auto",
 ): ResolvedSubagentWidgetIcons {
-  const preference = resolvePreference(context.env, configuredPreference);
-  const mode =
-    preference === "auto"
-      ? resolveAutoMode(context)
-      : preference === "nerd"
-        ? "nerd"
-        : "fallback";
+  const mode = resolveAutoMode(context);
 
   return {
     mode,
@@ -417,8 +357,5 @@ export function resolveSubagentWidgetIconsForContext(
 }
 
 export function resolveSubagentWidgetIcons(): ResolvedSubagentWidgetIcons {
-  return resolveSubagentWidgetIconsForContext(
-    createDefaultContext(),
-    loadPiAgentRouterConfig().config.subagentWidgetIconMode,
-  );
+  return resolveSubagentWidgetIconsForContext(createDefaultContext());
 }

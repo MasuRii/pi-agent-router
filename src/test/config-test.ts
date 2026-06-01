@@ -24,10 +24,7 @@ await runTest("loadPiAgentRouterConfig creates default config when absent", () =
 
     const persisted = JSON.parse(readFileSync(configPath, "utf-8")) as unknown;
     assert.deepEqual(persisted, DEFAULT_PI_AGENT_ROUTER_CONFIG);
-    assert.deepEqual(result.config.delegatedExtensions, [
-      { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
-      { candidates: ["pi-sensitive-guard", "env-protection"], skipWhen: [], optional: false },
-    ]);
+    assert.deepEqual(result.config.delegatedExtensions, []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -105,38 +102,6 @@ await runTest("loadPiAgentRouterConfig normalizes agent discovery markdown size 
       DEFAULT_PI_AGENT_ROUTER_CONFIG.agentDiscovery.maxMarkdownBytes,
     );
     assert.match(invalidResult.warning || "", /agentDiscovery\.maxMarkdownBytes/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-await runTest("loadPiAgentRouterConfig normalizes subagent widget icon mode", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
-  const configPath = join(root, "config.json");
-
-  try {
-    writeFileSync(
-      configPath,
-      `${JSON.stringify({ subagentWidgetIconMode: " NERD " }, null, 2)}\n`,
-      "utf-8",
-    );
-
-    const result = loadPiAgentRouterConfig(configPath);
-    assert.equal(result.config.subagentWidgetIconMode, "nerd");
-    assert.equal(result.warning, undefined);
-
-    writeFileSync(
-      configPath,
-      `${JSON.stringify({ subagentWidgetIconMode: "emoji" }, null, 2)}\n`,
-      "utf-8",
-    );
-
-    const invalidResult = loadPiAgentRouterConfig(configPath);
-    assert.equal(
-      invalidResult.config.subagentWidgetIconMode,
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentWidgetIconMode,
-    );
-    assert.match(invalidResult.warning || "", /subagentWidgetIconMode/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -232,71 +197,6 @@ await runTest("loadPiAgentRouterConfig converts legacy delegated extension confi
       { candidates: ["pi-permission-system"], skipWhen: [], optional: false },
       { candidates: ["pi-multi-auth"], skipWhen: ["directEnvAuthAvailable"], optional: true },
     ]);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-await runTest("loadPiAgentRouterConfig makes custom direct-env credential fallback explicit", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
-  const configPath = join(root, "config.json");
-
-  try {
-    writeFileSync(
-      configPath,
-      `${JSON.stringify({
-        directEnvDelegationProviderIds: ["custom-provider"],
-        providerCredentialFallbackPolicies: {},
-      }, null, 2)}\n`,
-      "utf-8",
-    );
-
-    const result = loadPiAgentRouterConfig(configPath);
-    assert.equal(result.config.providerCredentialFallbackPolicies["custom-provider"], "parent-env");
-    assert.match(result.warning || "", /providerCredentialFallbackPolicies\.custom-provider/);
-    assert.match(result.warning || "", /parent-env/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-await runTest("loadPiAgentRouterConfig normalizes credential stall detection settings", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-agent-router-config-"));
-  const configPath = join(root, "config.json");
-
-  try {
-    writeFileSync(
-      configPath,
-      `${JSON.stringify({
-        subagentCredentialStall: {
-          enabled: false,
-          thresholdMs: 75_000,
-          forcedFinalizeGraceMs: 250,
-        },
-      }, null, 2)}\n`,
-      "utf-8",
-    );
-
-    const result = loadPiAgentRouterConfig(configPath);
-    assert.equal(result.warning, undefined);
-    assert.deepEqual(result.config.subagentCredentialStall, {
-      enabled: false,
-      thresholdMs: 75_000,
-      forcedFinalizeGraceMs: 250,
-    });
-
-    writeFileSync(
-      configPath,
-      `${JSON.stringify({ subagentCredentialStall: { thresholdMs: 0 } }, null, 2)}\n`,
-      "utf-8",
-    );
-
-    const invalidResult = loadPiAgentRouterConfig(configPath);
-    assert.equal(
-      invalidResult.config.subagentCredentialStall.thresholdMs,
-      DEFAULT_PI_AGENT_ROUTER_CONFIG.subagentCredentialStall.thresholdMs,
-    );
-    assert.match(invalidResult.warning || "", /subagentCredentialStall\.thresholdMs/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

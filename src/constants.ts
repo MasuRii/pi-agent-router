@@ -13,18 +13,8 @@ export const SESSIONS_DIR = join(AGENT_DIR, "sessions");
 export const SUBAGENT_SESSIONS_DIR = join(AGENT_DIR, "subagent-sessions");
 
 export const DEFAULT_AGENT = "orchestrator";
-export const DEFAULT_PRIMARY_AGENTS = ["code", "ask", "debug", "architect", "orchestrator"] as const;
-export const DEFAULT_PRIMARY_AGENT_SET = new Set<string>(DEFAULT_PRIMARY_AGENTS);
 export const PRIMARY_MODE_VALUES = new Set<AgentMode>(["primary", "all"]);
 export const VALID_THINKING_LEVELS = new Set<AgentThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
-
-export const AGENT_EMOJIS: Record<string, string> = {
-  code: "💻",
-  ask: "❓",
-  debug: "🐛",
-  architect: "🏗️",
-  orchestrator: "🎯",
-};
 
 export const AGENT_DISCOVERY_CACHE_MAX_ENTRIES = 64;
 export const TASK_CONTROLS_CACHE_MAX_ENTRIES = 64;

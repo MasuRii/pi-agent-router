@@ -44,25 +44,6 @@ function writeRouterConfig(config: Record<string, unknown>): void {
   writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
 }
 
-function withRouterConfig(config: Record<string, unknown>, testFn: () => void): void {
-  const previousConfig = existsSync(CONFIG_PATH)
-    ? readFileSync(CONFIG_PATH, "utf-8")
-    : undefined;
-
-  try {
-    writeRouterConfig(config);
-    resetAgentDiscoveryCacheState();
-    testFn();
-  } finally {
-    if (previousConfig === undefined) {
-      rmSync(CONFIG_PATH, { force: true });
-    } else {
-      writeFileSync(CONFIG_PATH, previousConfig, "utf-8");
-    }
-    resetAgentDiscoveryCacheState();
-  }
-}
-
 async function withRouterConfigAsync(
   config: Record<string, unknown>,
   testFn: () => Promise<void>,
@@ -261,49 +242,27 @@ await runTest("discoverAgents sync API preserves cached semantics for compatibil
   }
 });
 
-await runTest("primary agent and emoji config slices cache until agent discovery invalidation", () => {
-  withRouterConfig(
-    {
-      primaryAgents: ["cached-primary"],
-      agentEmojis: {
-        "cached-primary": "🧪",
-      },
-    },
-    () => {
-      const cachedPrimaryAgent = {
-        name: "cached-primary",
-        description: "cached",
-        systemPrompt: "cached",
-      };
-      const updatedPrimaryAgent = {
-        name: "updated-primary",
-        description: "updated",
-        systemPrompt: "updated",
-      };
+await runTest("primary agents and emojis are derived from agent frontmatter", () => {
+  const primaryAgent = {
+    name: "frontmatter-primary",
+    description: "🧪 primary",
+    emoji: "🧪",
+    mode: "primary" as const,
+    systemPrompt: "primary",
+  };
+  const subagentOnly = {
+    name: "frontmatter-subagent",
+    description: "🔧 subagent",
+    emoji: "🔧",
+    mode: "subagent" as const,
+    systemPrompt: "subagent",
+  };
 
-      assert.equal(isPrimaryAgent(cachedPrimaryAgent), true);
-      assert.equal(getAgentEmoji("cached-primary"), "🧪");
-
-      writeRouterConfig({
-        primaryAgents: ["updated-primary"],
-        agentEmojis: {
-          "cached-primary": "🔁",
-          "updated-primary": "✅",
-        },
-      });
-
-      assert.equal(isPrimaryAgent(cachedPrimaryAgent), true);
-      assert.equal(isPrimaryAgent(updatedPrimaryAgent), false);
-      assert.equal(getAgentEmoji("cached-primary"), "🧪");
-
-      invalidateAgentDiscoveryCaches();
-
-      assert.equal(isPrimaryAgent(cachedPrimaryAgent), false);
-      assert.equal(isPrimaryAgent(updatedPrimaryAgent), true);
-      assert.equal(getAgentEmoji("cached-primary"), "🔁");
-      assert.equal(getAgentEmoji("updated-primary"), "✅");
-    },
-  );
+  assert.equal(isPrimaryAgent(primaryAgent), true);
+  assert.equal(isPrimaryAgent(subagentOnly), false);
+  assert.equal(getAgentEmoji("frontmatter-primary", [primaryAgent, subagentOnly]), "🧪");
+  assert.equal(getAgentEmoji("frontmatter-subagent", [primaryAgent, subagentOnly]), "🔧");
+  assert.equal(getAgentEmoji("unknown", [primaryAgent, subagentOnly]), "🤖");
 });
 
 await runTest("loadAgents supports project-local agents when scope includes project", () => {
