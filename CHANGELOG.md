@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-01
+
+### Added
+- Added delegated subagent runtime isolation flags for offline mode, skills, prompt templates, themes, and context files.
+- Added a generic delegated authentication broker path for provider-scoped runtime environment injection.
+
+### Changed
+- Extracted the heavy router runtime behind a lightweight entrypoint for deferred loading.
+- Simplified router configuration defaults and delegated extension handling while preserving fail-closed security companion behavior.
+- Updated Pi and TypeBox peer dependency ranges and switched regression tests to the Node/tsx runner.
+
+### Fixed
+- Updated the delegated zellij modal import path to `modal.js`.
+
 ## [0.7.0] - 2026-05-26
 
 ### Added
