@@ -14,6 +14,7 @@ Active-agent routing and controlled subagent delegation for the [Pi coding agent
 - **Configurable parallel delegation concurrency** through `maxParallelDelegationConcurrency`
 - **Tracked delegated sessions** with attach and dismiss workflows
 - **Delegated runtime safety controls** for optional compatibility extensions and fail-closed security companions
+- **Delegated authentication broker support** for provider-scoped runtime environment injection without centralized credential config
 - **Compact task result rendering** for running, completed, failed, and aborted delegation batches
 - **Output contract warnings** that surface malformed or incomplete delegated results
 - **Credential stall detection** with automatic process termination when authentication providers stop responding
@@ -171,7 +172,11 @@ Extensions can also declare their own delegated-runtime metadata in `package.jso
 
 Router config rules and extension metadata rules are merged. Security companion candidates named `pi-permission-system`, `pi-sensitive-guard`, or `env-protection` are required by default because delegated subagents run with `--no-extensions`; delegation fails closed when those candidates are missing unless the entry sets `optional: true`. The legacy object shape with `requiredExtensionCandidates`, `optionalExtensionNames`, and `delegatedMultiAuthExtensionNames` is still accepted for compatibility and normalized into the unified list internally.
 
-When a delegated model has already been resolved and is launched with `--model`, the router marks the subagent runtime with `PI_MODEL_DISCOVERY_CACHE_ONLY=1`. Compatible `model-discovery` versions still register cached provider metadata but skip startup background discovery and catalog HTTP requests in that subagent.
+### Delegated authentication
+
+Direct environment credential delegation is brokered by compatible auth extensions and provider metadata instead of router-specific credential config keys. When a delegated provider exposes runtime environment records, the router injects only those records into the subagent launch environment.
+
+When a delegated model has already been resolved and is launched with `--model`, the router marks the subagent runtime with `PI_MODEL_DISCOVERY_CACHE_ONLY=1`. Compatible `pi-model-discovery` versions still register cached provider metadata but skip startup background discovery and catalog HTTP requests in that subagent.
 
 ### Additional task controls
 
@@ -218,7 +223,7 @@ pi-agent-router/
 │   ├── debug-logger.ts              # File-only debug logger gated by config.json
 │   ├── subagent/                    # Delegated runtime, session, credential, and metadata helpers
 │   ├── task/                        # Task delegation controls, rendering, and parallel execution helpers
-│   └── test/                        # Bun-based extension regression tests
+│   └── test/                        # Node/tsx extension regression tests
 ├── config/
 │   └── config.example.json          # Starter config template
 ├── CHANGELOG.md
@@ -237,10 +242,7 @@ npm run build
 # Strict type check
 npm run lint
 
-# Verify Bun is installed for the Bun-based regression suite
-npm run test:runtime
-
-# Run regression tests (requires Bun on PATH; see https://bun.sh/docs/installation)
+# Run regression tests through Node.js with tsx
 npm run test
 
 # Full verification
