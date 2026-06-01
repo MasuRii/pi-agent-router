@@ -10,7 +10,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-import { ZellijModal, type ZellijModalContentRenderer } from "../../../zellij-modal";
+import { ZellijModal, type ZellijModalContentRenderer } from "../../../zellij-modal/modal.js";
 import { getCircularSpinnerFrame } from "../progress-spinner";
 
 type StatusColor = "success" | "warning" | "error";
