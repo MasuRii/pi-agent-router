@@ -32,6 +32,11 @@ export function createDelegatedSubagentBaseArgs(
     "json",
     "-p",
     "--no-extensions",
+    "--offline",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
     "--session-dir",
     options.sessionDir,
   ];
