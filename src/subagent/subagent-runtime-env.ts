@@ -1,10 +1,7 @@
 export const PI_AGENT_ROUTER_SUBAGENT_ENV = "PI_AGENT_ROUTER_SUBAGENT";
 export const PI_AGENT_ROUTER_PARENT_SESSION_ID_ENV = "PI_AGENT_ROUTER_PARENT_SESSION_ID";
-export const PI_MULTI_AUTH_RUNTIME_DIR_ENV = "PI_MULTI_AUTH_RUNTIME_DIR";
+export const PI_DELEGATED_AUTH_RUNTIME_DIR_ENV = "PI_DELEGATED_AUTH_RUNTIME_DIR";
 export const PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR_ENV = "PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR";
-export const PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID";
-export const PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID";
-export const PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV = "PI_AGENT_ROUTER_DELEGATED_API_KEY";
 
 export const PI_MODEL_DISCOVERY_CACHE_ONLY_ENV = "PI_MODEL_DISCOVERY_CACHE_ONLY";
 const SUBAGENT_PARENT_ENV_ALLOWLIST = [
@@ -34,6 +31,7 @@ const SUBAGENT_PARENT_ENV_ALLOWLIST = [
   "PI_MODE",
   "PI_NERD_FONT",
   "PI_OUTPUT_MODE",
+  "PI_TIMING",
   "PWD",
   "SHELL",
   "SYSTEMROOT",
@@ -88,6 +86,12 @@ function setNormalizedEnvValue(
   env[key] = normalizedValue;
 }
 
+function injectEnvRecord(env: NodeJS.ProcessEnv, values: Record<string, string> | undefined): void {
+  for (const [key, value] of Object.entries(values ?? {})) {
+    setNormalizedEnvValue(env, key, value);
+  }
+}
+
 export function createSubagentRuntimeEnv(parentSessionId?: string): NodeJS.ProcessEnv {
   const runtimeEnv: NodeJS.ProcessEnv = {
     [PI_AGENT_ROUTER_SUBAGENT_ENV]: "1",
@@ -134,50 +138,24 @@ export function buildSubagentSpawnEnv(options: {
   parentEnv: NodeJS.ProcessEnv;
   parentSessionId?: string;
   isolatedAgentDir?: string;
-  multiAuthRuntimeDir?: string;
+  delegatedAuthRuntimeDir?: string;
   permissionPolicyAgentDir?: string;
   modelDiscoveryCacheOnly?: boolean;
   inheritedEnvKeys?: readonly string[];
-  delegatedCredential?: {
-    providerId: string;
-    credentialId: string;
-    envKey: string;
-    apiKey: string;
-  };
+  delegatedAuthEnv?: Record<string, string>;
 }): NodeJS.ProcessEnv {
   const env = createSubagentBaseEnv(options.parentEnv, {
     inheritedEnvKeys: options.inheritedEnvKeys,
   });
 
   setNormalizedEnvValue(env, "PI_CODING_AGENT_DIR", options.isolatedAgentDir);
-  setNormalizedEnvValue(env, PI_MULTI_AUTH_RUNTIME_DIR_ENV, options.multiAuthRuntimeDir);
+  setNormalizedEnvValue(env, PI_DELEGATED_AUTH_RUNTIME_DIR_ENV, options.delegatedAuthRuntimeDir);
   setNormalizedEnvValue(env, PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR_ENV, options.permissionPolicyAgentDir);
   if (options.modelDiscoveryCacheOnly) {
     setNormalizedEnvValue(env, PI_MODEL_DISCOVERY_CACHE_ONLY_ENV, "1");
   }
 
-  if (options.delegatedCredential) {
-    setNormalizedEnvValue(
-      env,
-      options.delegatedCredential.envKey,
-      options.delegatedCredential.apiKey,
-    );
-    setNormalizedEnvValue(
-      env,
-      PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
-      options.delegatedCredential.providerId,
-    );
-    setNormalizedEnvValue(
-      env,
-      PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
-      options.delegatedCredential.credentialId,
-    );
-    setNormalizedEnvValue(
-      env,
-      PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
-      options.delegatedCredential.apiKey,
-    );
-  }
+  injectEnvRecord(env, options.delegatedAuthEnv);
 
   return injectSubagentRuntimeEnv(env, options.parentSessionId);
 }

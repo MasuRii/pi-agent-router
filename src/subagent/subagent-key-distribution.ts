@@ -1,5 +1,9 @@
 /**
- * Shared key distribution helpers for delegated subagent processes.
+ * Generic delegated auth broker helpers for delegated subagent processes.
+ *
+ * The router owns process orchestration only. Credential selection, rotation,
+ * cooldowns, and provider-specific auth handling belong to whichever extension
+ * registers a delegated auth broker.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -7,15 +11,6 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import {
-  computeExponentialBackoffMs,
-  getWeeklyQuotaCooldownMs,
-  parseRetryAfterCooldownMs,
-  TRANSIENT_COOLDOWN_BASE_MS,
-  TRANSIENT_COOLDOWN_MAX_MS,
-} from "./credential-backoff";
-import { createBoundedCache } from "../cache/bounded-cache";
-import { loadPiAgentRouterConfig } from "../config";
 import { piAgentRouterDebugLogger } from "../debug-logger";
 import { getErrorMessage } from "../error-utils";
 
@@ -23,16 +18,14 @@ import { getErrorMessage } from "../error-utils";
  * Cached provider env keys loaded from models.json.
  * Undefined means not yet loaded, null means load failed, object means loaded.
  */
-let cachedProviderEnvKeys: Record<string, string> | null | undefined = undefined;
-let providerEnvKeysLoadPromise: Promise<Record<string, string> | null> | undefined;
-let providerEnvKeysCacheRevision = 0;
+let cachedProviderCredentialEnvKeys: Record<string, string> | null | undefined = undefined;
+let providerCredentialEnvKeysLoadPromise: Promise<Record<string, string> | null> | undefined;
+let providerCredentialEnvKeysCacheRevision = 0;
 
-type CredentialFallbackPolicy = "parent-env" | "distributed-only";
-
-type KeyDistributionConfigSlices = {
-  providerEnvKeys: Readonly<Record<string, string>>;
-  directEnvDelegationProviderIds: ReadonlySet<string>;
-  providerCredentialFallbackPolicies: Readonly<Record<string, CredentialFallbackPolicy>>;
+const DEFAULT_PROVIDER_ENV_KEYS: Readonly<Record<string, string>> = {
+  anthropic: "ANTHROPIC_API_KEY",
+  openai: "OPENAI_API_KEY",
+  "openai-codex": "OPENAI_API_KEY",
 };
 
 function isRemovedLegacyGoogleProviderId(providerId: string | undefined): boolean {
@@ -43,44 +36,16 @@ function isRemovedLegacyGoogleProviderId(providerId: string | undefined): boolea
   );
 }
 
-function filterRemovedLegacyProviderEnvKeys(
-  providerEnvKeys: Readonly<Record<string, string>>,
+function filterRemovedLegacyProviderCredentialEnvKeys(
+  providerCredentialEnvKeys: Readonly<Record<string, string>>,
 ): Record<string, string> {
   const filteredProviderEnvKeys: Record<string, string> = {};
-  for (const [providerId, envKey] of Object.entries(providerEnvKeys)) {
+  for (const [providerId, envKey] of Object.entries(providerCredentialEnvKeys)) {
     if (!isRemovedLegacyGoogleProviderId(providerId)) {
       filteredProviderEnvKeys[providerId] = envKey;
     }
   }
   return filteredProviderEnvKeys;
-}
-
-function filterRemovedLegacyProviderIds(providerIds: readonly string[]): string[] {
-  return providerIds.filter((providerId) => !isRemovedLegacyGoogleProviderId(providerId));
-}
-
-let cachedKeyDistributionConfigSlices: KeyDistributionConfigSlices | undefined;
-
-function getConfiguredKeyDistributionSlices(): KeyDistributionConfigSlices {
-  if (cachedKeyDistributionConfigSlices) {
-    return cachedKeyDistributionConfigSlices;
-  }
-
-  const config = loadPiAgentRouterConfig().config;
-  cachedKeyDistributionConfigSlices = {
-    providerEnvKeys: filterRemovedLegacyProviderEnvKeys(config.providerEnvKeys),
-    directEnvDelegationProviderIds: new Set(
-      filterRemovedLegacyProviderIds(config.directEnvDelegationProviderIds),
-    ),
-    providerCredentialFallbackPolicies: {
-      ...config.providerCredentialFallbackPolicies,
-    },
-  };
-  return cachedKeyDistributionConfigSlices;
-}
-
-function resetConfiguredKeyDistributionSlices(): void {
-  cachedKeyDistributionConfigSlices = undefined;
 }
 
 /**
@@ -124,10 +89,6 @@ function extractProviderEnvKeys(parsed: unknown): Record<string, string> | null 
   return Object.keys(envKeys).length > 0 ? envKeys : null;
 }
 
-/**
- * Load provider env keys from models.json dynamically.
- * Each provider entry can have an "apiKey" field that specifies the env var name.
- */
 function loadProviderEnvKeysFromModelsJson(): Record<string, string> | null {
   try {
     const modelsPath = getModelsJsonPath();
@@ -153,179 +114,53 @@ async function loadProviderEnvKeysFromModelsJsonAsync(): Promise<Record<string, 
   }
 }
 
-function mergeProviderEnvKeys(dynamicKeys: Record<string, string> | null | undefined): Record<string, string> {
-  const configuredProviderEnvKeys = getConfiguredKeyDistributionSlices().providerEnvKeys;
+function mergeProviderCredentialEnvKeys(dynamicKeys: Record<string, string> | null | undefined): Record<string, string> {
+  const defaults = filterRemovedLegacyProviderCredentialEnvKeys(DEFAULT_PROVIDER_ENV_KEYS);
   return dynamicKeys
-    ? { ...configuredProviderEnvKeys, ...dynamicKeys }
-    : { ...configuredProviderEnvKeys };
+    ? { ...defaults, ...filterRemovedLegacyProviderCredentialEnvKeys(dynamicKeys) }
+    : { ...defaults };
 }
 
-/**
- * Get provider env keys, combining core providers with dynamically loaded ones.
- * Uses cached result to avoid repeated file reads.
- */
-function getProviderEnvKeys(): Record<string, string> {
-  if (cachedProviderEnvKeys === undefined) {
+function getProviderCredentialEnvKeys(): Record<string, string> {
+  if (cachedProviderCredentialEnvKeys === undefined) {
     const dynamicKeys = loadProviderEnvKeysFromModelsJson();
-    cachedProviderEnvKeys = dynamicKeys;
+    cachedProviderCredentialEnvKeys = dynamicKeys;
   }
 
-  return mergeProviderEnvKeys(cachedProviderEnvKeys);
+  return mergeProviderCredentialEnvKeys(cachedProviderCredentialEnvKeys);
 }
 
-async function getProviderEnvKeysAsync(): Promise<Record<string, string>> {
-  if (cachedProviderEnvKeys !== undefined) {
-    return mergeProviderEnvKeys(cachedProviderEnvKeys);
+async function getProviderCredentialEnvKeysAsync(): Promise<Record<string, string>> {
+  if (cachedProviderCredentialEnvKeys !== undefined) {
+    return mergeProviderCredentialEnvKeys(cachedProviderCredentialEnvKeys);
   }
 
-  if (!providerEnvKeysLoadPromise) {
-    const cacheRevision = providerEnvKeysCacheRevision;
-    providerEnvKeysLoadPromise = (async () => {
+  if (!providerCredentialEnvKeysLoadPromise) {
+    const cacheRevision = providerCredentialEnvKeysCacheRevision;
+    providerCredentialEnvKeysLoadPromise = (async () => {
       const dynamicKeys = await loadProviderEnvKeysFromModelsJsonAsync();
-      if (cacheRevision === providerEnvKeysCacheRevision) {
-        cachedProviderEnvKeys = dynamicKeys;
+      if (cacheRevision === providerCredentialEnvKeysCacheRevision) {
+        cachedProviderCredentialEnvKeys = dynamicKeys;
       }
       return dynamicKeys;
     })();
   }
 
   try {
-    return mergeProviderEnvKeys(await providerEnvKeysLoadPromise);
+    return mergeProviderCredentialEnvKeys(await providerCredentialEnvKeysLoadPromise);
   } finally {
-    providerEnvKeysLoadPromise = undefined;
+    providerCredentialEnvKeysLoadPromise = undefined;
   }
 }
 
 export function resetProviderEnvKeyCacheState(): void {
-  providerEnvKeysCacheRevision += 1;
-  cachedProviderEnvKeys = undefined;
-  providerEnvKeysLoadPromise = undefined;
-  resetConfiguredKeyDistributionSlices();
+  providerCredentialEnvKeysCacheRevision += 1;
+  cachedProviderCredentialEnvKeys = undefined;
+  providerCredentialEnvKeysLoadPromise = undefined;
 }
-
 
 const PROVIDER_ID_ALIASES: Record<string, string> = {
   codex: "openai-codex",
-};
-
-function getDirectEnvDelegationProviderIds(): ReadonlySet<string> {
-  return getConfiguredKeyDistributionSlices().directEnvDelegationProviderIds;
-}
-
-function getCredentialFallbackPolicy(providerId: string | undefined): CredentialFallbackPolicy {
-  const normalizedProviderId = normalizeProviderId(providerId);
-  if (!normalizedProviderId) {
-    return "parent-env";
-  }
-
-  return (
-    getConfiguredKeyDistributionSlices().providerCredentialFallbackPolicies[normalizedProviderId] ??
-    "parent-env"
-  );
-}
-
-function shouldInheritParentCredentialEnv(providerId: string | undefined): boolean {
-  return getCredentialFallbackPolicy(providerId) === "parent-env";
-}
-
-const DEFAULT_ACQUIRE_TIMEOUT_MS = 1_500;
-const DISTRIBUTED_ONLY_ACQUIRE_TIMEOUT_MS = 30_000;
-const FALLBACK_ENV_ACQUIRE_TIMEOUT_MS = 250;
-
-type KeyLease = {
-  credentialId: string;
-  apiKey: string;
-};
-
-export type DelegatedCredentialRequest = {
-  sessionId: string;
-  providerId: string;
-  timeoutMs?: number;
-  modelId?: string;
-  modelRef?: string;
-  api?: string;
-  signal?: AbortSignal;
-  parentSessionId?: string;
-};
-
-export type DelegatedRoutingCapabilities = {
-  providerId: string;
-  modelId?: string;
-  modelRef?: string;
-  api?: string;
-  credentialCounts: {
-    total: number;
-    structurallyEligible: number;
-    modelEligible: number;
-  };
-  modelConstraintApplied: boolean;
-  failureMessage?: string;
-};
-
-export type GlobalKeyDistributor = {
-  acquireForSubagent: {
-    (request: DelegatedCredentialRequest): Promise<KeyLease | string | null | undefined>;
-    (
-      sessionId: string,
-      providerId: string,
-      options?: {
-        timeoutMs?: number;
-        modelId?: string;
-        modelRef?: string;
-        api?: string;
-        signal?: AbortSignal;
-        parentSessionId?: string;
-        excludedIds?: readonly string[];
-      },
-    ): Promise<KeyLease | string | null | undefined>;
-  };
-  releaseFromSubagent: (sessionId: string) => void;
-  releaseLightweightSessionLeases?: (parentSessionId: string, providerId?: string) => void;
-  getLeaseForSession?: (
-    sessionId: string,
-  ) => Promise<KeyLease | null | undefined> | KeyLease | null | undefined;
-  getKeyForSession?: (sessionId: string) => string | null | undefined;
-  getMetrics?: () => unknown;
-  shouldBypassDelegatedSubagentAcquisition?: (
-    providerId: string,
-    options?: {
-      modelId?: string;
-      modelRef?: string;
-      api?: string;
-      signal?: AbortSignal;
-    },
-  ) => Promise<boolean> | boolean;
-  getDelegatedCredentialRoutingCapabilities?: (
-    request: DelegatedCredentialRequest,
-  ) => Promise<DelegatedRoutingCapabilities> | DelegatedRoutingCapabilities;
-  applyCooldown?: (
-    credentialId: string,
-    durationMs: number,
-    reason: string,
-    providerId?: string,
-    isWeekly?: boolean,
-    errorMessage?: string,
-  ) => Promise<void> | void;
-  disableCredential?: (
-    credentialId: string,
-    reason: string,
-    providerId?: string,
-  ) => Promise<void> | void;
-  clearTransientError?: (
-    credentialId: string,
-    providerId?: string,
-  ) => Promise<void> | void;
-};
-
-type GlobalWithKeyDistributor = typeof globalThis & {
-  __piMultiAuthKeyDistributor?: GlobalKeyDistributor;
-};
-
-export type SubagentKeyLease = {
-  providerId: string;
-  envKey: string;
-  credentialId: string;
-  apiKey: string;
 };
 
 function normalizeProviderId(providerId: string | undefined): string | undefined {
@@ -383,58 +218,6 @@ function normalizeOptionalRoutingValue(value: string | undefined): string | unde
   return normalized ? normalized : undefined;
 }
 
-function normalizeExcludedCredentialIds(value: readonly string[] | undefined): string[] {
-  if (!value || value.length === 0) {
-    return [];
-  }
-
-  const credentialIds: string[] = [];
-  const seenCredentialIds = new Set<string>();
-  for (const credentialId of value) {
-    const normalizedCredentialId = credentialId.trim();
-    if (!normalizedCredentialId || seenCredentialIds.has(normalizedCredentialId)) {
-      continue;
-    }
-    seenCredentialIds.add(normalizedCredentialId);
-    credentialIds.push(normalizedCredentialId);
-  }
-
-  return credentialIds;
-}
-
-function resolveDelegatedCredentialRequest(options: {
-  sessionId: string;
-  providerId: string;
-  timeoutMs?: number;
-  requestedModel?: string;
-  modelContext?: {
-    providerId?: string;
-    modelId?: string;
-    modelRef?: string;
-    api?: string;
-  };
-  parentSessionId?: string;
-  signal: AbortSignal;
-}): DelegatedCredentialRequest {
-  const modelId =
-    normalizeOptionalRoutingValue(options.modelContext?.modelId) ??
-    parseModelIdFromReference(options.requestedModel);
-  const modelRef =
-    normalizeOptionalRoutingValue(options.modelContext?.modelRef) ??
-    normalizeOptionalRoutingValue(options.requestedModel);
-
-  return {
-    sessionId: options.sessionId,
-    providerId: options.providerId,
-    timeoutMs: options.timeoutMs,
-    modelId,
-    modelRef,
-    api: normalizeOptionalRoutingValue(options.modelContext?.api),
-    parentSessionId: normalizeOptionalRoutingValue(options.parentSessionId),
-    signal: options.signal,
-  };
-}
-
 function hasUsableEnvValue(env: NodeJS.ProcessEnv, envKey: string | undefined): boolean {
   if (!envKey) {
     return false;
@@ -444,85 +227,391 @@ function hasUsableEnvValue(env: NodeJS.ProcessEnv, envKey: string | undefined): 
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function resolveAcquireTimeoutMs(
-  requestedTimeoutMs: number | undefined,
-  hasParentFallbackCredential: boolean,
-  parentFallbackAllowed: boolean,
-): number {
-  if (Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0) {
-    return Math.max(1, Math.trunc(requestedTimeoutMs));
-  }
+export type DelegatedAuthPrepareRequest = {
+  providerId?: string;
+  modelId?: string;
+  modelRef?: string;
+  api?: string;
+  parentSessionId?: string;
+  subagentSessionId: string;
+};
 
-  if (!parentFallbackAllowed) {
-    return DISTRIBUTED_ONLY_ACQUIRE_TIMEOUT_MS;
-  }
+export type DelegatedAuthAttemptResult = {
+  providerId?: string;
+  modelId?: string;
+  modelRef?: string;
+  api?: string;
+  parentSessionId?: string;
+  subagentSessionId: string;
+  mode: DelegatedAuthPrepareResult["mode"];
+  leaseId?: string;
+  exitCode: number;
+  timedOut: boolean;
+  stderr?: string;
+};
 
-  return hasParentFallbackCredential
-    ? FALLBACK_ENV_ACQUIRE_TIMEOUT_MS
-    : DEFAULT_ACQUIRE_TIMEOUT_MS;
-}
-
-function getGlobalKeyDistributor(): GlobalKeyDistributor | null {
-  const globalScope = globalThis as GlobalWithKeyDistributor;
-  return globalScope.__piMultiAuthKeyDistributor ?? null;
-}
-
-async function getRoutingCapabilitiesSafe(
-  distributor: GlobalKeyDistributor,
-  request: DelegatedCredentialRequest,
-): Promise<DelegatedRoutingCapabilities | undefined> {
-  try {
-    return await distributor.getDelegatedCredentialRoutingCapabilities?.(request);
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.routing_capabilities_failed", {
-      error: message,
-      message: `[pi-agent-router] Failed to resolve redacted routing capabilities for ${request.providerId}: ${message}`,
-      providerId: request.providerId,
-      sessionId: request.sessionId,
-    });
-    return undefined;
-  }
-}
-
-function resolveApiKeyFromLease(
-  lease: KeyLease | string | null | undefined,
-  distributor: GlobalKeyDistributor,
-  sessionId: string,
-): KeyLease | null {
-  if (!lease) {
-    return null;
-  }
-
-  if (typeof lease === "object") {
-    const credentialId =
-      typeof lease.credentialId === "string" ? lease.credentialId.trim() : "";
-    const apiKey = typeof lease.apiKey === "string" ? lease.apiKey.trim() : "";
-    if (credentialId && apiKey) {
-      return { credentialId, apiKey };
+export type DelegatedAuthPrepareResult =
+  | {
+      mode: "self-managed";
+      extensionDirs: string[];
+      env?: Record<string, string>;
     }
-    return null;
+  | {
+      mode: "lease";
+      env: Record<string, string>;
+      leaseId: string;
+    }
+  | {
+      mode: "none";
+      env?: Record<string, string>;
+      extensionDirs?: string[];
+    };
+
+export type DelegatedAuthBroker = {
+  id: string;
+  capabilities: readonly string[];
+  prepareSubagentAuth: (
+    request: DelegatedAuthPrepareRequest,
+  ) => Promise<DelegatedAuthPrepareResult> | DelegatedAuthPrepareResult;
+  release?: (request: {
+    leaseId?: string;
+    parentSessionId?: string;
+    subagentSessionId: string;
+    providerId?: string;
+  }) => Promise<void> | void;
+  reportAttemptResult?: (
+    result: DelegatedAuthAttemptResult,
+  ) => Promise<void> | void;
+};
+
+export type DelegatedAuthBrokerRegistry = {
+  register: (broker: DelegatedAuthBroker) => void;
+  unregister: (brokerId: string) => void;
+  list: () => DelegatedAuthBroker[];
+  get: (brokerId: string) => DelegatedAuthBroker | undefined;
+};
+
+type GlobalWithDelegatedAuthBrokerRegistry = typeof globalThis & {
+  __piDelegatedAuthBrokerRegistry?: DelegatedAuthBrokerRegistry;
+};
+
+function isDelegatedAuthBroker(value: unknown): value is DelegatedAuthBroker {
+  if (!value || typeof value !== "object") {
+    return false;
   }
 
-  const credentialId = lease.trim();
-  if (!credentialId) {
-    return null;
+  const broker = value as DelegatedAuthBroker;
+  return (
+    typeof broker.id === "string" &&
+    broker.id.trim().length > 0 &&
+    Array.isArray(broker.capabilities) &&
+    broker.capabilities.includes("delegated-auth") &&
+    typeof broker.prepareSubagentAuth === "function"
+  );
+}
+
+export function getOrCreateDelegatedAuthBrokerRegistry(): DelegatedAuthBrokerRegistry {
+  const globalScope = globalThis as GlobalWithDelegatedAuthBrokerRegistry;
+  if (globalScope.__piDelegatedAuthBrokerRegistry) {
+    return globalScope.__piDelegatedAuthBrokerRegistry;
   }
 
-  const sessionKey = distributor.getKeyForSession?.(sessionId);
-  if (typeof sessionKey !== "string") {
-    return null;
+  const brokers = new Map<string, DelegatedAuthBroker>();
+  const registry: DelegatedAuthBrokerRegistry = {
+    register: (broker) => {
+      if (!isDelegatedAuthBroker(broker)) {
+        return;
+      }
+      brokers.set(broker.id.trim(), broker);
+    },
+    unregister: (brokerId) => {
+      brokers.delete(brokerId.trim());
+    },
+    list: () => [...brokers.values()],
+    get: (brokerId) => brokers.get(brokerId.trim()),
+  };
+
+  globalScope.__piDelegatedAuthBrokerRegistry = registry;
+  return registry;
+}
+
+function getDelegatedAuthBrokers(): DelegatedAuthBroker[] {
+  const globalScope = globalThis as GlobalWithDelegatedAuthBrokerRegistry;
+  return globalScope.__piDelegatedAuthBrokerRegistry?.list() ?? [];
+}
+
+function normalizeEnvRecord(env: Record<string, string> | undefined): Record<string, string> {
+  const normalizedEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env ?? {})) {
+    const normalizedKey = key.trim();
+    const normalizedValue = value.trim();
+    if (normalizedKey && normalizedValue) {
+      normalizedEnv[normalizedKey] = normalizedValue;
+    }
+  }
+  return normalizedEnv;
+}
+
+function normalizeExtensionDirs(extensionDirs: readonly string[] | undefined): string[] {
+  const normalizedDirs: string[] = [];
+  const seen = new Set<string>();
+  for (const extensionDir of extensionDirs ?? []) {
+    const normalizedDir = extensionDir.trim();
+    if (!normalizedDir || seen.has(normalizedDir)) {
+      continue;
+    }
+    seen.add(normalizedDir);
+    normalizedDirs.push(normalizedDir);
+  }
+  return normalizedDirs;
+}
+
+function normalizeBrokerResult(
+  result: DelegatedAuthPrepareResult,
+): DelegatedAuthPrepareResult {
+  if (result.mode === "self-managed") {
+    return {
+      mode: "self-managed",
+      extensionDirs: normalizeExtensionDirs(result.extensionDirs),
+      env: normalizeEnvRecord(result.env),
+    };
   }
 
-  const apiKey = sessionKey.trim();
-  if (!apiKey || apiKey === credentialId) {
-    return null;
+  if (result.mode === "lease") {
+    return {
+      mode: "lease",
+      leaseId: result.leaseId.trim(),
+      env: normalizeEnvRecord(result.env),
+    };
   }
 
   return {
-    credentialId,
-    apiKey,
+    mode: "none",
+    extensionDirs: normalizeExtensionDirs(result.extensionDirs),
+    env: normalizeEnvRecord(result.env),
   };
+}
+
+export type PreparedSubagentAuth = {
+  mode: DelegatedAuthPrepareResult["mode"] | "direct-env";
+  brokerId?: string;
+  extensionDirs: string[];
+  env: Record<string, string>;
+  inheritedEnvKeys: string[];
+  leaseId?: string;
+  failureMessage?: string;
+};
+
+function createStandaloneAuthFailureMessage(options: {
+  providerId: string;
+  envKey?: string;
+  modelRef?: string;
+}): string {
+  const modelText = options.modelRef ? ` for ${options.modelRef}` : "";
+  const envText = options.envKey
+    ? ` Set ${options.envKey} in the parent environment`
+    : " Configure a provider apiKey mapping in models.json or pi-agent-router config and set that environment variable";
+  return (
+    `[pi-agent-router] No delegated auth broker is registered and no direct parent environment credential is available for ${options.providerId}${modelText}. ` +
+    `${envText}, or install/enable an extension that registers globalThis.__piDelegatedAuthBrokerRegistry with the delegated-auth capability.`
+  );
+}
+
+export async function prepareSubagentAuthForLaunch(options: {
+  providerId: string | undefined;
+  requestedModel?: string;
+  modelContext?: {
+    providerId?: string;
+    modelId?: string;
+    modelRef?: string;
+    api?: string;
+  };
+  parentSessionId?: string;
+  subagentSessionId: string;
+  parentEnv?: NodeJS.ProcessEnv;
+}): Promise<PreparedSubagentAuth> {
+  const normalizedProviderId = normalizeProviderId(options.providerId);
+  const modelId =
+    normalizeOptionalRoutingValue(options.modelContext?.modelId) ??
+    parseModelIdFromReference(options.requestedModel);
+  const modelRef =
+    normalizeOptionalRoutingValue(options.modelContext?.modelRef) ??
+    normalizeOptionalRoutingValue(options.requestedModel);
+  const request: DelegatedAuthPrepareRequest = {
+    providerId: normalizedProviderId,
+    modelId,
+    modelRef,
+    api: normalizeOptionalRoutingValue(options.modelContext?.api),
+    parentSessionId: normalizeOptionalRoutingValue(options.parentSessionId),
+    subagentSessionId: options.subagentSessionId,
+  };
+
+  for (const broker of getDelegatedAuthBrokers()) {
+    try {
+      const prepared = normalizeBrokerResult(await broker.prepareSubagentAuth(request));
+      if (prepared.mode === "none") {
+        continue;
+      }
+
+      void piAgentRouterDebugLogger.info("subagent.delegated_auth_prepared", {
+        brokerId: broker.id,
+        mode: prepared.mode,
+        providerId: normalizedProviderId,
+        sessionId: options.subagentSessionId,
+        extensionDirCount: "extensionDirs" in prepared ? prepared.extensionDirs?.length ?? 0 : 0,
+      });
+
+      return {
+        mode: prepared.mode,
+        brokerId: broker.id,
+        extensionDirs: "extensionDirs" in prepared ? prepared.extensionDirs ?? [] : [],
+        env: prepared.env ?? {},
+        inheritedEnvKeys: [],
+        leaseId: prepared.mode === "lease" ? prepared.leaseId : undefined,
+      };
+    } catch (error) {
+      const message = getErrorMessage(error);
+      void piAgentRouterDebugLogger.warn("subagent.delegated_auth_prepare_failed", {
+        brokerId: broker.id,
+        error: message,
+        message: `[pi-agent-router] Delegated auth broker '${broker.id}' failed to prepare subagent auth: ${message}`,
+        providerId: normalizedProviderId,
+        sessionId: options.subagentSessionId,
+      });
+    }
+  }
+
+  if (!normalizedProviderId) {
+    return {
+      mode: "none",
+      extensionDirs: [],
+      env: {},
+      inheritedEnvKeys: [],
+    };
+  }
+
+  const envKey = await resolveProviderEnvKeyAsync(normalizedProviderId);
+  if (hasUsableEnvValue(options.parentEnv ?? process.env, envKey)) {
+    return {
+      mode: "direct-env",
+      extensionDirs: [],
+      env: {},
+      inheritedEnvKeys: envKey ? [envKey] : [],
+    };
+  }
+
+  return {
+    mode: "none",
+    extensionDirs: [],
+    env: {},
+    inheritedEnvKeys: [],
+    failureMessage: createStandaloneAuthFailureMessage({
+      providerId: normalizedProviderId,
+      envKey,
+      modelRef,
+    }),
+  };
+}
+
+export async function reportSubagentAuthAttemptResult(
+  preparedAuth: PreparedSubagentAuth,
+  result: Omit<DelegatedAuthAttemptResult, "mode" | "leaseId">,
+): Promise<void> {
+  if (!preparedAuth.brokerId) {
+    return;
+  }
+
+  const broker = getOrCreateDelegatedAuthBrokerRegistry().get(preparedAuth.brokerId);
+  if (!broker?.reportAttemptResult) {
+    return;
+  }
+
+  try {
+    await broker.reportAttemptResult({
+      ...result,
+      mode: preparedAuth.mode === "direct-env" ? "none" : preparedAuth.mode,
+      leaseId: preparedAuth.leaseId,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    void piAgentRouterDebugLogger.warn("subagent.delegated_auth_report_failed", {
+      brokerId: preparedAuth.brokerId,
+      error: message,
+      message: `[pi-agent-router] Delegated auth broker '${preparedAuth.brokerId}' failed to record subagent auth result: ${message}`,
+      providerId: result.providerId,
+      sessionId: result.subagentSessionId,
+    });
+  }
+}
+
+export function releaseSubagentAuthForLaunch(
+  preparedAuth: PreparedSubagentAuth | undefined,
+  options: {
+    parentSessionId?: string;
+    subagentSessionId: string;
+    providerId?: string;
+  },
+): void {
+  if (!preparedAuth?.brokerId) {
+    return;
+  }
+
+  const broker = getOrCreateDelegatedAuthBrokerRegistry().get(preparedAuth.brokerId);
+  if (!broker?.release) {
+    return;
+  }
+
+  try {
+    void broker.release({
+      leaseId: preparedAuth.leaseId,
+      parentSessionId: options.parentSessionId,
+      subagentSessionId: options.subagentSessionId,
+      providerId: options.providerId,
+    });
+    void piAgentRouterDebugLogger.info("subagent.delegated_auth_released", {
+      brokerId: preparedAuth.brokerId,
+      mode: preparedAuth.mode,
+      providerId: options.providerId,
+      sessionId: options.subagentSessionId,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    void piAgentRouterDebugLogger.warn("subagent.delegated_auth_release_failed", {
+      brokerId: preparedAuth.brokerId,
+      error: message,
+      message: `[pi-agent-router] Delegated auth broker '${preparedAuth.brokerId}' failed to release subagent auth: ${message}`,
+      providerId: options.providerId,
+      sessionId: options.subagentSessionId,
+    });
+  }
+}
+
+export function releaseSubagentAuthForParentSession(parentSessionId: string): void {
+  const normalizedParentSessionId = parentSessionId.trim();
+  if (!normalizedParentSessionId) {
+    return;
+  }
+
+  for (const broker of getDelegatedAuthBrokers()) {
+    if (!broker.release) {
+      continue;
+    }
+
+    try {
+      void broker.release({
+        parentSessionId: normalizedParentSessionId,
+        subagentSessionId: "",
+      });
+    } catch (error) {
+      const message = getErrorMessage(error);
+      void piAgentRouterDebugLogger.warn("subagent.parent_session_auth_release_failed", {
+        brokerId: broker.id,
+        error: message,
+        message: `[pi-agent-router] Delegated auth broker '${broker.id}' failed to release parent-session auth: ${message}`,
+        parentSessionId: normalizedParentSessionId,
+      });
+    }
+  }
 }
 
 export function detectSubagentProviderId(options: {
@@ -530,15 +619,15 @@ export function detectSubagentProviderId(options: {
   activeProviderId?: string;
   parentEnv?: NodeJS.ProcessEnv;
 }): string | undefined {
-  const providerEnvKeys = getProviderEnvKeys();
+  const providerCredentialEnvKeys = getProviderCredentialEnvKeys();
 
   const modelProvider = parseProviderFromModelReference(options.requestedModel);
   if (modelProvider !== undefined) {
-    return providerEnvKeys[modelProvider] ? modelProvider : undefined;
+    return providerCredentialEnvKeys[modelProvider] ? modelProvider : modelProvider;
   }
 
   const activeProvider = normalizeProviderId(options.activeProviderId);
-  if (activeProvider && providerEnvKeys[activeProvider]) {
+  if (activeProvider) {
     return activeProvider;
   }
 
@@ -547,7 +636,7 @@ export function detectSubagentProviderId(options: {
     return undefined;
   }
 
-  for (const [providerId, envKey] of Object.entries(providerEnvKeys)) {
+  for (const [providerId, envKey] of Object.entries(providerCredentialEnvKeys)) {
     const candidate = parentEnv[envKey];
     if (typeof candidate === "string" && candidate.trim()) {
       return providerId;
@@ -562,15 +651,15 @@ export async function detectSubagentProviderIdAsync(options: {
   activeProviderId?: string;
   parentEnv?: NodeJS.ProcessEnv;
 }): Promise<string | undefined> {
-  const providerEnvKeys = await getProviderEnvKeysAsync();
+  const providerCredentialEnvKeys = await getProviderCredentialEnvKeysAsync();
 
   const modelProvider = parseProviderFromModelReference(options.requestedModel);
   if (modelProvider !== undefined) {
-    return providerEnvKeys[modelProvider] ? modelProvider : undefined;
+    return providerCredentialEnvKeys[modelProvider] ? modelProvider : modelProvider;
   }
 
   const activeProvider = normalizeProviderId(options.activeProviderId);
-  if (activeProvider && providerEnvKeys[activeProvider]) {
+  if (activeProvider) {
     return activeProvider;
   }
 
@@ -579,7 +668,7 @@ export async function detectSubagentProviderIdAsync(options: {
     return undefined;
   }
 
-  for (const [providerId, envKey] of Object.entries(providerEnvKeys)) {
+  for (const [providerId, envKey] of Object.entries(providerCredentialEnvKeys)) {
     const candidate = parentEnv[envKey];
     if (typeof candidate === "string" && candidate.trim()) {
       return providerId;
@@ -597,8 +686,8 @@ export async function resolveProviderEnvKeyAsync(
     return undefined;
   }
 
-  const providerEnvKeys = await getProviderEnvKeysAsync();
-  return providerEnvKeys[normalizedProviderId];
+  const providerCredentialEnvKeys = await getProviderCredentialEnvKeysAsync();
+  return providerCredentialEnvKeys[normalizedProviderId];
 }
 
 export async function hasParentProviderCredentialEnvAsync(
@@ -611,6 +700,7 @@ export async function hasParentProviderCredentialEnvAsync(
 
 export async function isDirectEnvDelegationAuthAvailableForProviderAsync(
   providerId: string | undefined,
+  parentEnv: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
   const normalizedProviderId = normalizeProviderId(providerId);
   if (!normalizedProviderId) {
@@ -618,900 +708,5 @@ export async function isDirectEnvDelegationAuthAvailableForProviderAsync(
   }
 
   const envKey = await resolveProviderEnvKeyAsync(normalizedProviderId);
-  if (typeof envKey !== "string" || envKey.trim().length === 0) {
-    return false;
-  }
-
-  return getDirectEnvDelegationProviderIds().has(normalizedProviderId);
-}
-
-export async function shouldSkipDelegatedMultiAuthForProviderAsync(
-  providerId: string | undefined,
-): Promise<boolean> {
-  return isDirectEnvDelegationAuthAvailableForProviderAsync(providerId);
-}
-
-export function shouldInheritParentCredentialEnvForProvider(
-  providerId: string | undefined,
-): boolean {
-  return shouldInheritParentCredentialEnv(providerId);
-}
-
-export async function resolveSubagentQuotaCredentialRetryLimit(
-  sessionId: string,
-  providerId: string | undefined,
-  options: {
-    requestedModel?: string;
-    modelContext?: {
-      providerId?: string;
-      modelId?: string;
-      modelRef?: string;
-      api?: string;
-    };
-    parentSessionId?: string;
-  } = {},
-): Promise<number> {
-  const normalizedProviderId = normalizeProviderId(providerId);
-  if (!normalizedProviderId) {
-    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.getDelegatedCredentialRoutingCapabilities) {
-    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
-  }
-
-  const abortController = new AbortController();
-  const request = resolveDelegatedCredentialRequest({
-    sessionId,
-    providerId: normalizedProviderId,
-    requestedModel: options.requestedModel,
-    modelContext: options.modelContext,
-    parentSessionId: options.parentSessionId,
-    signal: abortController.signal,
-  });
-
-  const capabilities = await getRoutingCapabilitiesSafe(distributor, request);
-  const eligibleCredentialCount = capabilities?.credentialCounts.modelEligible;
-  if (typeof eligibleCredentialCount !== "number" || !Number.isFinite(eligibleCredentialCount)) {
-    return DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT;
-  }
-
-  if (eligibleCredentialCount <= 1) {
-    return 0;
-  }
-
-  return Math.max(
-    1,
-    Math.min(MAX_QUOTA_CREDENTIAL_RETRY_LIMIT, Math.trunc(eligibleCredentialCount) - 1),
-  );
-}
-
-export async function tryAcquireKeyForSubagent(
-  sessionId: string,
-  providerId: string | undefined,
-  options: {
-    timeoutMs?: number;
-    requestedModel?: string;
-    modelContext?: {
-      providerId?: string;
-      modelId?: string;
-      modelRef?: string;
-      api?: string;
-    };
-    parentSessionId?: string;
-    excludedCredentialIds?: readonly string[];
-  } = {},
-): Promise<SubagentKeyLease | null> {
-  const normalizedProviderId = normalizeProviderId(providerId);
-  if (!normalizedProviderId) {
-    return null;
-  }
-
-  const providerEnvKeys = await getProviderEnvKeysAsync();
-  const envKey = providerEnvKeys[normalizedProviderId];
-  if (!envKey) {
-    return null;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor) {
-    return null;
-  }
-
-  const fallbackPolicy = getCredentialFallbackPolicy(normalizedProviderId);
-  const parentFallbackAllowed = fallbackPolicy === "parent-env";
-  const hasParentFallbackCredential =
-    parentFallbackAllowed && hasUsableEnvValue(process.env, envKey);
-  const effectiveTimeoutMs = resolveAcquireTimeoutMs(
-    options.timeoutMs,
-    hasParentFallbackCredential,
-    parentFallbackAllowed,
-  );
-  const abortController = new AbortController();
-  const delegatedRequest = resolveDelegatedCredentialRequest({
-    sessionId,
-    providerId: normalizedProviderId,
-    timeoutMs: effectiveTimeoutMs,
-    requestedModel: options.requestedModel,
-    modelContext: options.modelContext,
-    parentSessionId: options.parentSessionId,
-    signal: abortController.signal,
-  });
-  const modelId = delegatedRequest.modelId;
-  const excludedCredentialIds = normalizeExcludedCredentialIds(
-    options.excludedCredentialIds,
-  );
-  const startedAt = Date.now();
-
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutSentinel = Symbol("subagent-key-acquire-timeout");
-
-  if (normalizedProviderId === "openai-codex" && !delegatedRequest.modelId) {
-    void piAgentRouterDebugLogger.warn("subagent.key_acquire_missing_model_context", {
-      message:
-        `[pi-agent-router] Refused distributed ${normalizedProviderId} credential acquisition for subagent ${sessionId.slice(0, 8)} because model context is required by provider policy.`,
-      providerId: normalizedProviderId,
-      sessionId,
-      fallbackPolicy,
-    });
-    return null;
-  }
-
-  try {
-    const existingLease = resolveApiKeyFromLease(
-      await distributor.getLeaseForSession?.(sessionId),
-      distributor,
-      sessionId,
-    );
-    if (existingLease && !excludedCredentialIds.includes(existingLease.credentialId)) {
-      void piAgentRouterDebugLogger.info("subagent.key_reused", {
-        message:
-          `[pi-agent-router] Reused distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
-        providerId: normalizedProviderId,
-        credentialId: existingLease.credentialId,
-        sessionId,
-        acquisitionLatencyMs: Date.now() - startedAt,
-      });
-      return {
-        providerId: normalizedProviderId,
-        envKey,
-        credentialId: existingLease.credentialId,
-        apiKey: existingLease.apiKey,
-      };
-    }
-
-    const shouldBypassDelegatedAcquisition = await distributor.shouldBypassDelegatedSubagentAcquisition?.(
-      normalizedProviderId,
-      {
-        modelId,
-        modelRef: delegatedRequest.modelRef,
-        api: delegatedRequest.api,
-        signal: abortController.signal,
-      },
-    );
-    if (shouldBypassDelegatedAcquisition && parentFallbackAllowed) {
-      void piAgentRouterDebugLogger.info("subagent.key_acquire_bypassed", {
-        message:
-          `[pi-agent-router] Skipped distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because only one eligible credential remains and parent environment credential fallback is allowed.`,
-        providerId: normalizedProviderId,
-        sessionId,
-        acquisitionLatencyMs: Date.now() - startedAt,
-        fallbackPolicy,
-      });
-      return null;
-    }
-
-    if (shouldBypassDelegatedAcquisition) {
-      void piAgentRouterDebugLogger.info("subagent.key_acquire_bypass_ignored", {
-        message:
-          `[pi-agent-router] Keeping distributed ${normalizedProviderId} key acquisition for subagent ${sessionId.slice(0, 8)} because parent environment credential fallback is disabled by provider policy.`,
-        providerId: normalizedProviderId,
-        sessionId,
-        acquisitionLatencyMs: Date.now() - startedAt,
-        fallbackPolicy,
-      });
-    }
-
-    const acquireLeasePromise = excludedCredentialIds.length > 0
-      ? distributor.acquireForSubagent(
-          sessionId,
-          normalizedProviderId,
-          {
-            timeoutMs: delegatedRequest.timeoutMs,
-            modelId: delegatedRequest.modelId,
-            modelRef: delegatedRequest.modelRef,
-            api: delegatedRequest.api,
-            signal: abortController.signal,
-            parentSessionId: delegatedRequest.parentSessionId,
-            excludedIds: excludedCredentialIds,
-          },
-        )
-      : distributor.acquireForSubagent(delegatedRequest);
-
-    const acquiredLease = await Promise.race<
-      KeyLease | string | null | undefined | typeof timeoutSentinel
-    >([
-      acquireLeasePromise,
-      new Promise<typeof timeoutSentinel>((resolve) => {
-        timeoutHandle = setTimeout(() => {
-          resolve(timeoutSentinel);
-        }, effectiveTimeoutMs);
-      }),
-    ]);
-
-    if (acquiredLease === timeoutSentinel) {
-      abortController.abort();
-      void piAgentRouterDebugLogger.warn("subagent.key_acquire_timeout", {
-        message: parentFallbackAllowed
-          ? `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms; parent environment credential remains allowed by provider policy.`
-          : `[pi-agent-router] Timed out acquiring ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)} after ${effectiveTimeoutMs}ms; parent environment credential fallback is disabled by provider policy.`,
-        providerId: normalizedProviderId,
-        sessionId,
-        timeoutMs: effectiveTimeoutMs,
-        acquisitionLatencyMs: Date.now() - startedAt,
-        fallbackPolicy,
-        fallbackEnvAvailable: hasParentFallbackCredential,
-        routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
-        distributorMetrics: distributor.getMetrics?.(),
-      });
-      return null;
-    }
-
-    const lease = resolveApiKeyFromLease(acquiredLease, distributor, sessionId);
-    if (!lease) {
-      void piAgentRouterDebugLogger.info("subagent.key_acquire_unavailable", {
-        message: parentFallbackAllowed
-          ? `[pi-agent-router] No distributed ${normalizedProviderId} key was available for subagent ${sessionId.slice(0, 8)}; parent environment credential remains allowed by provider policy.`
-          : `[pi-agent-router] No distributed ${normalizedProviderId} key was available for subagent ${sessionId.slice(0, 8)}; parent environment credential fallback is disabled by provider policy.`,
-        providerId: normalizedProviderId,
-        sessionId,
-        fallbackPolicy,
-        routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
-      });
-      return null;
-    }
-
-    void piAgentRouterDebugLogger.info("subagent.key_acquired", {
-      message:
-        `[pi-agent-router] Acquired distributed ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}.`,
-      providerId: normalizedProviderId,
-      credentialId: lease.credentialId,
-      sessionId,
-      acquisitionLatencyMs: Date.now() - startedAt,
-      distributorMetrics: distributor.getMetrics?.(),
-    });
-
-    return {
-      providerId: normalizedProviderId,
-      envKey,
-      credentialId: lease.credentialId,
-      apiKey: lease.apiKey,
-    };
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      return null;
-    }
-
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.key_acquire_failed", {
-      error: message,
-      message: parentFallbackAllowed
-        ? `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Parent environment credential remains allowed by provider policy.`
-        : `[pi-agent-router] Failed to acquire ${normalizedProviderId} key for subagent ${sessionId.slice(0, 8)}: ${message}. Parent environment credential fallback is disabled by provider policy.`,
-      providerId: normalizedProviderId,
-      sessionId,
-      fallbackPolicy,
-      acquisitionLatencyMs: Date.now() - startedAt,
-      routingCapabilities: await getRoutingCapabilitiesSafe(distributor, delegatedRequest),
-      distributorMetrics: distributor.getMetrics?.(),
-    });
-    return null;
-  } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-  }
-}
-
-export function releaseKeyForSubagent(sessionId: string): void {
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor) {
-    return;
-  }
-
-  try {
-    distributor.releaseFromSubagent(sessionId);
-    void piAgentRouterDebugLogger.info("subagent.key_released", {
-      message: `[pi-agent-router] Released distributed key for subagent ${sessionId.slice(0, 8)}.`,
-      sessionId,
-    });
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.key_release_failed", {
-      error: message,
-      message: `[pi-agent-router] Failed to release distributed key for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-      sessionId,
-    });
-  }
-}
-
-export function releaseKeyLeasesForParentSession(parentSessionId: string): void {
-  const normalizedParentSessionId = parentSessionId.trim();
-  if (!normalizedParentSessionId) {
-    return;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.releaseLightweightSessionLeases) {
-    return;
-  }
-
-  try {
-    distributor.releaseLightweightSessionLeases(normalizedParentSessionId);
-    void piAgentRouterDebugLogger.info("subagent.parent_session_key_leases_released", {
-      message: `[pi-agent-router] Released lightweight distributed key leases for parent session ${normalizedParentSessionId.slice(0, 8)}.`,
-      parentSessionId: normalizedParentSessionId,
-    });
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.parent_session_key_lease_release_failed", {
-      error: message,
-      message: `[pi-agent-router] Failed to release lightweight distributed key leases for parent session ${normalizedParentSessionId.slice(0, 8)}: ${message}.`,
-      parentSessionId: normalizedParentSessionId,
-    });
-  }
-}
-
-const QUOTA_RATE_LIMIT_PATTERNS: RegExp[] = [
-  /quota/i,
-  /rate[_\s-]?limit/i,
-  /rate_limit/i,
-  /\b429\b/,
-  /\b503\b/,
-  /insufficient[_\s-]?quota/i,
-  /exceeded/i,
-  /exhausted/i,
-  /resource[_\s-]?exhausted/i,
-  /overloaded/i,
-  /capacity/i,
-  /too many requests/i,
-  /model is currently loaded/i,
-  /server busy/i,
-  // Weekly quota patterns (Ollama)
-  /weekly\s+(?:usage|limit)/i,
-  /usage limit/i,
-  /you\s+have\s+reached\s+(?:(?:your|the)\s+)?(?:usage\s+)?limit/i,
-  /upgrade for higher limits/i,
-];
-
-/**
- * Patterns indicating balance exhaustion that requires manual intervention.
- * These credentials should be DISABLED (not just cooled down) because
- * the account has no credits and requires manual action to add funds.
- */
-const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
-  /\bHTTP\s+402\b/i,
-  /\b402\b[^\n]*(?:payment|required|verification|top\s*up)/i,
-  /payment[_\s-]?required/i,
-  /requires?[^\n.]*verification/i,
-  /account[^\n.]*requires?[^\n.]*verification/i,
-  /verify[^\n.]*(?:phone|phone\s+number)/i,
-  /top\s*up/i,
-  /outstanding[_\s-]?balance/i,
-  /balance[_\s-]?too[_\s-]?low/i,
-  /insufficient[_\s-]?balance/i,
-  /no[_\s-]?credits?[_\s-]?(?:remaining|left)/i,
-  /account[_\s-]?has[_\s-]?no[_\s-]?credits/i,
-  /credits?[_\s-]?depleted/i,
-  /balance[_\s-]?depleted/i,
-  /please[_\s-]?add[_\s-]?credits/i,
-  /please[_\s-]?add[_\s-]?funds/i,
-];
-
-const ORGANIZATION_DISABLED_PATTERNS: RegExp[] = [
-  /this organization has been disabled/i,
-  /organization has been disabled/i,
-  /organization[^\n.]*disabled/i,
-  /invalid_request_error[^\n.]*organization/i,
-  // Workspace/account-level deactivation surfaced by providers such as OpenAI Codex
-  // (`{"detail":{"code":"deactivated_workspace"}}`). Same recovery semantics as an
-  // administratively disabled organization: requires manual reactivation.
-  /\bdeactivated[_\s-]?workspace\b/i,
-  /\bworkspace[_\s-]?deactivated\b/i,
-  /\bworkspace[^\n.]*disabled\b/i,
-];
-
-/**
- * Patterns indicating a weekly/quota reset cycle that requires longer cooldown.
- */
-const WEEKLY_QUOTA_PATTERNS: RegExp[] = [
-  /weekly\s+(?:usage|credit|limit)/i,
-  /your\s+weekly/i,
-  /reached your weekly/i,
-  /\bweekly\b[^\n.]*\blimit\b/i,
-  /\bweekly\b[^\n.]*\bquota\b/i,
-  /7-?day\s+(?:limit|window)/i,
-  /upgrade for higher limits/i,
-];
-
-const CREDENTIAL_AUTH_PATTERNS: RegExp[] = [
-  /authentication\s+token\s+has\s+been\s+invalidated/i,
-  /auth(?:entication)?\s+token[^\n]*(?:invalid|invalidated|revoked|expired)/i,
-  /token[_\s-]?revoked/i,
-  /invalid[_\s-]?grant/i,
-  /please\s+(?:try\s+)?sign(?:ing)?\s+in\s+again/i,
-];
-
-const TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS: RegExp[] = [
-  /400\s+(?:<|&lt;)html(?:>|&gt;)[\s\S]*(?:<|&lt;)title(?:>|&gt;)400\s+Bad Request(?:<\/|&lt;\/)title(?:>|&gt;)[\s\S]*(?:<|&lt;)center(?:>|&gt;)\s*alb\s*(?:<\/|&lt;\/)center(?:>|&gt;)/i,
-];
-
-const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
-  ...TRANSIENT_BAD_REQUEST_GATEWAY_PATTERNS,
-  /\b5\d\d\b/i,
-  /\b408\b/i,
-  /internal[_\s-]?server[_\s-]?error/i,
-  /internal_server_error/i,
-  /the selected provider failed this request\s*\(HTTP\s*400\)/i,
-  /provider.?returned.?error/i,
-  /provider.?error/i,
-  /service.?unavailable/i,
-  /bad gateway/i,
-  /gateway timeout/i,
-  /upstream[^\n]*(?:timeout|error|failed|unavailable|disconnect)/i,
-  /temporar(?:y|ily) unavailable/i,
-  /high traffic/i,
-  /Multi-auth rotation failed[\s\S]*Provider:\s*kiro\b[\s\S]*Reason:\s*I am experiencing high traffic,\s*please try again shortly\.?/i,
-  /please try again(?: (?:later|shortly))?/i,
-  /retry delay/i,
-  /Kiro request timed out after \d+ms\.?/i,
-  /timeout/i,
-  /timed out/i,
-  /ECONNRESET/i,
-  /ECONNREFUSED/i,
-  /ECONNABORTED/i,
-  /ETIMEDOUT/i,
-  /EPIPE/i,
-  /ENOTFOUND/i,
-  /EAI_AGAIN/i,
-  /socket hang up/i,
-  /connection (?:reset|closed|lost|terminated|aborted)/i,
-  /server disconnected/i,
-  /network error/i,
-  /fetch failed/i,
-  /request was aborted/i,
-  /operation was aborted/i,
-  /\bAbortError\b/i,
-  /\bZlibError\b/i,
-  /incorrect header check/i,
-  /without any assistant output/i,
-  /without a final assistant output/i,
-  /without completion event/i,
-  /stream ended unexpectedly/i,
-  /stream returned an error/i,
-];
-
-const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
-  /context[_\s-]?length[_\s-]?exceeded/i,
-  /context\s+(?:window|length|limit)[^\n]*(?:exceed|overflow|too long|maximum)/i,
-  /(?:maximum|max)\s+(?:context|token)[^\n]*(?:exceed|overflow|too long|limit)/i,
-  /tokens?[^\n]*(?:exceed|overflow|too many)[^\n]*(?:context|limit|maximum|max)/i,
-  /input[^\n]*(?:too long|exceed)[^\n]*(?:context|token)/i,
-];
-
-const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
-  /unsupported model/i,
-  /model[^\n]*(?:not found|not supported)/i,
-  /unknown model/i,
-];
-
-const DEFAULT_QUOTA_COOLDOWN_MS = 60_000; // 1 minute for regular quota errors when no reset hint is available
-const RETRY_AFTER_WEEKLY_THRESHOLD_MS = 36 * 60 * 60 * 1000;
-const DEFAULT_QUOTA_CREDENTIAL_RETRY_LIMIT = 3;
-const MAX_QUOTA_CREDENTIAL_RETRY_LIMIT = 32;
-export const KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES = 1_024;
-
-/**
- * Checks whether an error message indicates a quota or rate-limit condition
- * that may be resolved by rotating to a different API credential.
- */
-function isContextOverflowError(errorText: string): boolean {
-  return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-export function isQuotaOrRateLimitError(errorText: string): boolean {
-  if (!errorText || isContextOverflowError(errorText)) {
-    return false;
-  }
-
-  return (
-    QUOTA_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorText)) ||
-    BALANCE_EXHAUSTED_PATTERNS.some((pattern) => pattern.test(errorText)) ||
-    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(errorText)) ||
-    WEEKLY_QUOTA_PATTERNS.some((pattern) => pattern.test(errorText))
-  );
-}
-
-/**
- * Checks whether an error message indicates a retryable transient transport/provider failure.
- */
-export function isRetryableCredentialAuthError(errorText: string): boolean {
-  if (!errorText || isContextOverflowError(errorText)) {
-    return false;
-  }
-
-  return CREDENTIAL_AUTH_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-export function isTransientCredentialError(errorText: string): boolean {
-  if (!errorText || isContextOverflowError(errorText)) {
-    return false;
-  }
-
-  return TRANSIENT_PROVIDER_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-/**
- * Vivgrid sometimes reports model availability mismatches as 400 errors even though
- * rotating to another credential resolves the request. Treat those as retryable
- * delegated credential failures instead of terminal invalid requests.
- */
-export function isRetryableModelAvailabilityError(
-  providerId: string | undefined,
-  errorText: string,
-): boolean {
-  if (!errorText || !providerId) {
-    return false;
-  }
-
-  if (providerId.trim().toLowerCase() !== "vivgrid") {
-    return false;
-  }
-
-  return MODEL_NOT_SUPPORTED_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-/**
- * Checks whether an error message indicates balance exhaustion.
- * Balance exhaustion requires manual intervention (add credits/funds).
- * Credentials with this error should be DISABLED until manually re-enabled.
- */
-export function isBalanceExhaustedError(errorText: string): boolean {
-  if (!errorText) {
-    return false;
-  }
-  return BALANCE_EXHAUSTED_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-export function isOrganizationDisabledError(errorText: string): boolean {
-  if (!errorText) {
-    return false;
-  }
-  return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-/**
- * Checks whether an error message indicates a weekly quota limit.
- * Weekly quotas require longer cooldown periods.
- */
-function isWeeklyQuotaError(errorText: string): boolean {
-  if (!errorText) {
-    return false;
-  }
-  return WEEKLY_QUOTA_PATTERNS.some((pattern) => pattern.test(errorText));
-}
-
-function isLongRetryAfterQuotaCooldown(cooldownMs: number | undefined): boolean {
-  return typeof cooldownMs === "number" && cooldownMs >= RETRY_AFTER_WEEKLY_THRESHOLD_MS;
-}
-
-/**
- * Weekly quota and transient provider attempt tracking for exponential backoff.
- * Bounded by credentialId to prevent unbounded long-lived process growth.
- */
-const weeklyQuotaAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
-const transientProviderAttempts = createBoundedCache<string, number>(KEY_DISTRIBUTION_ATTEMPT_CACHE_MAX_ENTRIES);
-
-export async function reportSubagentCredentialAuthError(
-  sessionId: string,
-  credentialId: string,
-  errorMessage: string,
-): Promise<void> {
-  if (!credentialId) {
-    return;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.disableCredential && !distributor?.applyCooldown) {
-    return;
-  }
-
-  weeklyQuotaAttempts.delete(credentialId);
-  transientProviderAttempts.delete(credentialId);
-  const reason = `Subagent ${sessionId.slice(0, 8)} credential authentication error: ${errorMessage.slice(0, 200)}`;
-
-  if (distributor.disableCredential) {
-    try {
-      await distributor.disableCredential(credentialId, reason, undefined);
-      void piAgentRouterDebugLogger.info("subagent.credential_auth_disabled", {
-        credentialId,
-        message:
-          `[pi-agent-router] Disabled credential for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
-        sessionId,
-      });
-      return;
-    } catch (error) {
-      const message = getErrorMessage(error);
-      void piAgentRouterDebugLogger.warn("subagent.credential_auth_disable_failed", {
-        credentialId,
-        error: message,
-        message: `[pi-agent-router] Failed to disable credential for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-        sessionId,
-      });
-    }
-  }
-
-  if (!distributor.applyCooldown) {
-    return;
-  }
-
-  const fallbackCooldownMs = 72 * 60 * 60 * 1000;
-  try {
-    await distributor.applyCooldown(
-      credentialId,
-      fallbackCooldownMs,
-      reason,
-      undefined,
-      false,
-      errorMessage.slice(0, 500),
-    );
-    void piAgentRouterDebugLogger.info("subagent.credential_auth_cooldown_applied", {
-      cooldownMs: fallbackCooldownMs,
-      credentialId,
-      message:
-        `[pi-agent-router] Applied 72h cooldown on credential for subagent ${sessionId.slice(0, 8)} due to credential authentication failure.`,
-      sessionId,
-    });
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.credential_auth_cooldown_failed", {
-      credentialId,
-      error: message,
-      message: `[pi-agent-router] Failed to apply credential authentication cooldown for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-      sessionId,
-    });
-  }
-}
-
-/**
- * Reports a quota/rate-limit error on a credential to the global KeyDistributor
- * so the failed credential receives a cooldown period and subsequent acquisitions
- * rotate to a healthy credential.
- *
- * For permanent access failures (balance, verification, organization disabled): Permanently disables the credential until manually re-enabled.
- * For weekly quota errors: Applies exponential backoff:
- * - 1st error: 12 hours
- * - 2nd consecutive: 24 hours
- * - 3rd consecutive: 48 hours
- * - 4th+: 72 hours (max)
- */
-export async function reportSubagentKeyError(
-  sessionId: string,
-  credentialId: string,
-  errorMessage: string,
-): Promise<void> {
-  if (!credentialId) {
-    return;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.applyCooldown && !distributor?.disableCredential) {
-    return;
-  }
-
-  const retryAfterCooldownMs = parseRetryAfterCooldownMs(errorMessage);
-  const isBalanceExhausted = isBalanceExhaustedError(errorMessage);
-  const isOrganizationDisabled = isOrganizationDisabledError(errorMessage);
-  const isPermanentCredentialAccessFailure = isBalanceExhausted || isOrganizationDisabled;
-  const isWeekly = isWeeklyQuotaError(errorMessage) || isLongRetryAfterQuotaCooldown(retryAfterCooldownMs);
-
-  // Permanent credential access failures require manual intervention, so disable until manually re-enabled.
-  if (isPermanentCredentialAccessFailure) {
-    weeklyQuotaAttempts.delete(credentialId);
-    const permanentReason = isOrganizationDisabled ? "organization disabled" : "balance or verification required";
-    const reason = `Subagent ${sessionId.slice(0, 8)} ${permanentReason}: ${errorMessage.slice(0, 200)}`;
-
-    if (distributor.disableCredential) {
-      try {
-        await distributor.disableCredential(credentialId, reason, undefined);
-        void piAgentRouterDebugLogger.info("subagent.credential_disabled", {
-          credentialId,
-          message:
-            `[pi-agent-router] Disabled credential for subagent ${sessionId.slice(0, 8)} due to ${permanentReason}.`,
-          sessionId,
-        });
-      } catch (error) {
-        const message = getErrorMessage(error);
-        void piAgentRouterDebugLogger.warn("subagent.credential_disable_failed", {
-          credentialId,
-          error: message,
-          message: `[pi-agent-router] Failed to disable credential for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-          sessionId,
-        });
-      }
-    } else if (distributor.applyCooldown) {
-      // Fallback: apply a very long cooldown if disableCredential is not available
-      const fallbackCooldownMs = 72 * 60 * 60 * 1000; // 72 hours
-      try {
-        await distributor.applyCooldown(
-          credentialId,
-          fallbackCooldownMs,
-          reason,
-          undefined,
-          false,
-          errorMessage.slice(0, 500),
-        );
-        void piAgentRouterDebugLogger.info("subagent.credential_balance_cooldown_applied", {
-          cooldownMs: fallbackCooldownMs,
-          credentialId,
-          message:
-            `[pi-agent-router] Applied 72h cooldown on credential for subagent ${sessionId.slice(0, 8)} (${permanentReason}).`,
-          sessionId,
-        });
-      } catch (error) {
-        const message = getErrorMessage(error);
-        void piAgentRouterDebugLogger.warn("subagent.credential_cooldown_failed", {
-          credentialId,
-          error: message,
-          message: `[pi-agent-router] Failed to apply cooldown for credential on subagent ${sessionId.slice(0, 8)}: ${message}.`,
-          sessionId,
-        });
-      }
-    }
-    return;
-  }
-
-  if (!distributor.applyCooldown) {
-    return;
-  }
-
-  let cooldownMs: number;
-  let reasonPrefix: string;
-
-  if (retryAfterCooldownMs !== undefined) {
-    if (isWeekly) {
-      const attempts = (weeklyQuotaAttempts.get(credentialId) ?? 0) + 1;
-      weeklyQuotaAttempts.set(credentialId, attempts);
-    } else {
-      weeklyQuotaAttempts.delete(credentialId);
-    }
-    cooldownMs = retryAfterCooldownMs;
-    reasonPrefix = `Subagent ${sessionId.slice(0, 8)} quota/rate-limit reset hint`;
-  } else if (isWeekly) {
-    // Exponential backoff for weekly quota
-    const attempts = (weeklyQuotaAttempts.get(credentialId) ?? 0) + 1;
-    weeklyQuotaAttempts.set(credentialId, attempts);
-    cooldownMs = getWeeklyQuotaCooldownMs(attempts);
-    reasonPrefix = `Subagent ${sessionId.slice(0, 8)} weekly quota error (attempt ${attempts})`;
-  } else {
-    // Reset weekly attempts for non-weekly errors
-    weeklyQuotaAttempts.delete(credentialId);
-    cooldownMs = DEFAULT_QUOTA_COOLDOWN_MS;
-    reasonPrefix = `Subagent ${sessionId.slice(0, 8)} quota/rate-limit error`;
-  }
-
-  try {
-    const reason = `${reasonPrefix}: ${errorMessage.slice(0, 200)}`;
-    await distributor.applyCooldown(
-      credentialId,
-      cooldownMs,
-      reason,
-      undefined,
-      isWeekly,
-      errorMessage.slice(0, 500),
-    );
-    void piAgentRouterDebugLogger.info("subagent.credential_cooldown_reported", {
-      cooldownHours: cooldownMs / (60 * 60 * 1000),
-      cooldownMs,
-      credentialId,
-      isWeekly,
-      retryAfterCooldownMs,
-      message:
-        `[pi-agent-router] Reported ${isWeekly ? "weekly " : ""}cooldown on credential for subagent ${sessionId.slice(0, 8)} (${cooldownMs / (60 * 60 * 1000)}h).`,
-      sessionId,
-    });
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.credential_error_report_failed", {
-      credentialId,
-      error: message,
-      message: `[pi-agent-router] Failed to report key error for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-      sessionId,
-    });
-  }
-}
-
-/**
- * Reports a retryable transient provider/transport error and applies a short cooldown
- * so the next delegated retry prefers a different credential when available.
- */
-export async function reportSubagentTransientKeyError(
-  sessionId: string,
-  credentialId: string,
-  errorMessage: string,
-): Promise<void> {
-  if (!credentialId) {
-    return;
-  }
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.applyCooldown) {
-    return;
-  }
-
-  weeklyQuotaAttempts.delete(credentialId);
-  const attempts = (transientProviderAttempts.get(credentialId) ?? 0) + 1;
-  transientProviderAttempts.set(credentialId, attempts);
-  const cooldownMs = computeExponentialBackoffMs(
-    TRANSIENT_COOLDOWN_BASE_MS,
-    attempts,
-    TRANSIENT_COOLDOWN_MAX_MS,
-  );
-
-  const reason = `Subagent ${sessionId.slice(0, 8)} transient provider error: ${errorMessage.slice(0, 200)}`;
-
-  try {
-    await distributor.applyCooldown(
-      credentialId,
-      cooldownMs,
-      reason,
-      undefined,
-      false,
-      errorMessage.slice(0, 500),
-    );
-    void piAgentRouterDebugLogger.info("subagent.credential_transient_cooldown_applied", {
-      attempt: attempts,
-      cooldownMs,
-      credentialId,
-      message:
-        `[pi-agent-router] Applied transient cooldown on credential for subagent ${sessionId.slice(0, 8)} (${cooldownMs}ms, attempt ${attempts}).`,
-      sessionId,
-    });
-  } catch (error) {
-    const message = getErrorMessage(error);
-    void piAgentRouterDebugLogger.warn("subagent.transient_key_error_report_failed", {
-      credentialId,
-      error: message,
-      message: `[pi-agent-router] Failed to report transient key error for subagent ${sessionId.slice(0, 8)}: ${message}.`,
-      sessionId,
-    });
-  }
-}
-
-export function clearSubagentTransientKeyError(credentialId: string): void {
-  if (!credentialId) {
-    return;
-  }
-
-  transientProviderAttempts.delete(credentialId);
-
-  const distributor = getGlobalKeyDistributor();
-  if (!distributor?.clearTransientError) {
-    return;
-  }
-
-  try {
-    void distributor.clearTransientError(credentialId);
-  } catch {
-    // ignore cleanup failures
-  }
-}
-
-/**
- * Clears the weekly quota attempt counter for a credential.
- * Should be called when a credential successfully completes a request.
- */
-export function clearWeeklyQuotaAttempts(credentialId: string): void {
-  weeklyQuotaAttempts.delete(credentialId);
+  return typeof envKey === "string" && hasUsableEnvValue(parentEnv, envKey);
 }
