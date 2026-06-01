@@ -21,8 +21,7 @@
     "build": "npm run typecheck",
     "lint": "npm run --silent typecheck && node ./scripts/extension-standards-guard.mjs",
     "typecheck": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json",
-    "test:runtime": "node -e \"const { spawnSync } = require('node:child_process'); const result = spawnSync('bun', ['--version'], { stdio: 'inherit' }); if (result.error || result.status !== 0) { console.error('pi-agent-router tests require Bun on PATH. Install Bun from https://bun.sh/docs/installation.'); process.exit(result.status || 1); }\"",
-    "test": "npm run test:runtime && bun ./src/test/run-tests.ts",
+    "test": "npx --yes tsx@4.22.3 ./src/test/run-tests.ts",
     "check": "npm run build && npm run lint && npm run test"
   },
   "keywords": [
@@ -61,10 +60,10 @@
     ]
   },
   "peerDependencies": {
-    "typebox": "^1.1.38",
-    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0",
-    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0"
+    "typebox": "^1.1.39",
+    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0",
+    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0 || ^0.77.0 || ^0.78.0"
   },
   "overrides": {
     "fast-xml-builder": "1.1.7",

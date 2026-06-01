@@ -12,9 +12,10 @@ const testEntries = [
     .sort((left, right) => left.localeCompare(right))
     .map((entry) => join(testDir, entry)),
 ];
+const runnerArgs = process.execArgv;
 
 for (const testEntry of testEntries) {
-  const result = spawnSync("bun", [testEntry], {
+  const result = spawnSync(process.execPath, [...runnerArgs, testEntry], {
     cwd: extensionRoot,
     stdio: "inherit",
     shell: false,
