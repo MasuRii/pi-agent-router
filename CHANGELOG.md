@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-16
+
+### Added
+- Added delegated task registry persistence so running/queued tasks survive extension restarts and are marked as aborted with context when the extension restarts before completion.
+- Added auth.json API key credential provider discovery for delegated subagent key distribution.
+- Added retryable delegated failure classification with session integrity checks before session reuse during auto-retry.
+
+### Changed
+- Auto-retry now inspects the retained session for pending tool calls before attempting session reuse; starts a clean session when the retained session cannot be safely resumed.
+
 ## [0.8.0] - 2026-06-01
 
 ### Added

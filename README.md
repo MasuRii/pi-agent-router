@@ -19,6 +19,9 @@ Active-agent routing and controlled subagent delegation for the [Pi coding agent
 - **Output contract warnings** that surface malformed or incomplete delegated results
 - **Credential stall detection** with automatic process termination when authentication providers stop responding
 - **Semantic completion detection** with forced finalization so delegated tasks that produce valid results are finalized automatically instead of waiting for a clean shutdown signal
+- **Task registry persistence** so running and queued delegated tasks survive extension restarts and are marked as aborted with context on restart
+- **Retryable delegated failure classification** with session integrity checks before session reuse during auto-retry
+- **Auth.json API key credential discovery** for delegated subagent key distribution
 - **Tool-use continuation** extracted to a dedicated module for clearer separation of concerns
 - **Debug logging control** through `debug`, with logs written only under the extension-local `debug/` directory when enabled
 
