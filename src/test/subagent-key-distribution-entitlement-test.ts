@@ -58,6 +58,23 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => Promis
   }
 }
 
+async function withTempAgentDir(
+  files: Record<string, unknown>,
+  fn: (agentDir: string) => Promise<void> | void,
+): Promise<void> {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-router-auth-json-"));
+  for (const [fileName, content] of Object.entries(files)) {
+    writeFileSync(join(agentDir, fileName), `${JSON.stringify(content, null, 2)}\n`, "utf-8");
+  }
+
+  try {
+    await withEnv({ PI_CODING_AGENT_DIR: agentDir, MYPROXY_API_KEY: undefined }, () => fn(agentDir));
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+    resetProviderEnvKeyCacheState();
+  }
+}
+
 const registry = getOrCreateDelegatedAuthBrokerRegistry();
 for (const broker of registry.list()) {
   registry.unregister(broker.id);
@@ -147,6 +164,195 @@ try {
       assert.deepEqual(prepared.inheritedEnvKeys, ["OPENAI_API_KEY"]);
       assert.equal(prepared.failureMessage, undefined);
     });
+  });
+
+  await runTest("standalone fallback allows existing primary auth.json API key without env or broker", async () => {
+    await withTempAgentDir(
+      {
+        "auth.json": {
+          myproxy: {
+            type: "api_key",
+            key: "auth-json-key",
+          },
+        },
+        "models.json": {
+          providers: {
+            myproxy: {
+              apiKey: "$MYPROXY_API_KEY",
+            },
+          },
+        },
+      },
+      async () => {
+        const prepared = await prepareSubagentAuthForLaunch({
+          providerId: "myproxy",
+          requestedModel: "myproxy/gpt-5.5",
+          subagentSessionId: "child-auth-json-primary",
+          parentEnv: process.env,
+        });
+
+        assert.equal(prepared.mode, "auth-json");
+        assert.deepEqual(prepared.inheritedEnvKeys, []);
+        assert.deepEqual(prepared.env, {});
+        assert.equal(prepared.failureMessage, undefined);
+      },
+    );
+  });
+
+  await runTest("standalone fallback recognizes suffixed auth.json API key credentials", async () => {
+    await withTempAgentDir(
+      {
+        "auth.json": {
+          "myproxy-1": {
+            type: "api_key",
+            key: "backup-auth-json-key",
+          },
+        },
+      },
+      async () => {
+        const prepared = await prepareSubagentAuthForLaunch({
+          providerId: "myproxy",
+          requestedModel: "myproxy/gpt-5.5",
+          subagentSessionId: "child-auth-json-suffixed",
+          parentEnv: process.env,
+        });
+
+        assert.equal(prepared.mode, "auth-json");
+        assert.deepEqual(prepared.inheritedEnvKeys, []);
+        assert.equal(prepared.failureMessage, undefined);
+      },
+    );
+  });
+
+  await runTest("delegated broker remains preferred over auth.json fallback", async () => {
+    await withTempAgentDir(
+      {
+        "auth.json": {
+          myproxy: {
+            type: "api_key",
+            key: "auth-json-key",
+          },
+        },
+      },
+      async () => {
+        const broker: DelegatedAuthBroker = {
+          id: "broker-before-auth-json",
+          capabilities: ["delegated-auth"],
+          prepareSubagentAuth: () => ({
+            mode: "lease",
+            leaseId: "lease-before-auth-json",
+            env: {
+              MYPROXY_API_KEY: "leased-key",
+            },
+          }),
+        };
+        registry.register(broker);
+        try {
+          const prepared = await prepareSubagentAuthForLaunch({
+            providerId: "myproxy",
+            requestedModel: "myproxy/gpt-5.5",
+            subagentSessionId: "child-broker-before-auth-json",
+            parentEnv: process.env,
+          });
+
+          assert.equal(prepared.mode, "lease");
+          assert.equal(prepared.brokerId, "broker-before-auth-json");
+          assert.equal(prepared.leaseId, "lease-before-auth-json");
+        } finally {
+          registry.unregister(broker.id);
+        }
+      },
+    );
+  });
+
+  await runTest("direct parent env remains preferred over auth.json fallback", async () => {
+    await withTempAgentDir(
+      {
+        "auth.json": {
+          myproxy: {
+            type: "api_key",
+            key: "auth-json-key",
+          },
+        },
+        "models.json": {
+          providers: {
+            myproxy: {
+              apiKey: "$MYPROXY_API_KEY",
+            },
+          },
+        },
+      },
+      async () => {
+        process.env.MYPROXY_API_KEY = "parent-env-key";
+        const prepared = await prepareSubagentAuthForLaunch({
+          providerId: "myproxy",
+          requestedModel: "myproxy/gpt-5.5",
+          subagentSessionId: "child-env-before-auth-json",
+          parentEnv: process.env,
+        });
+
+        assert.equal(prepared.mode, "direct-env");
+        assert.deepEqual(prepared.inheritedEnvKeys, ["MYPROXY_API_KEY"]);
+      },
+    );
+  });
+
+  await runTest("standalone fallback ignores unusable auth.json credentials", async () => {
+    await withTempAgentDir(
+      {
+        "auth.json": {
+          myproxy: {
+            type: "api_key",
+            key: "   ",
+          },
+          "myproxy-1": {
+            type: "oauth",
+            access: "oauth-access-token",
+            refresh: "oauth-refresh-token",
+            expires: Date.now() + 60_000,
+          },
+        },
+        "models.json": {
+          providers: {
+            myproxy: {
+              apiKey: "$MYPROXY_API_KEY",
+            },
+          },
+        },
+      },
+      async () => {
+        const prepared = await prepareSubagentAuthForLaunch({
+          providerId: "myproxy",
+          requestedModel: "myproxy/gpt-5.5",
+          subagentSessionId: "child-auth-json-unusable",
+          parentEnv: process.env,
+        });
+
+        assert.equal(prepared.mode, "none");
+        assert.match(prepared.failureMessage || "", /MYPROXY_API_KEY/);
+      },
+    );
+  });
+
+  await runTest("standalone fallback ignores invalid auth.json content", async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-router-invalid-auth-json-"));
+    try {
+      writeFileSync(join(agentDir, "auth.json"), "{not-json", "utf-8");
+      await withEnv({ PI_CODING_AGENT_DIR: agentDir, MYPROXY_API_KEY: undefined }, async () => {
+        const prepared = await prepareSubagentAuthForLaunch({
+          providerId: "myproxy",
+          requestedModel: "myproxy/gpt-5.5",
+          subagentSessionId: "child-invalid-auth-json",
+          parentEnv: process.env,
+        });
+
+        assert.equal(prepared.mode, "none");
+        assert.match(prepared.failureMessage || "", /No delegated auth broker is registered/);
+      });
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
+      resetProviderEnvKeyCacheState();
+    }
   });
 
   await runTest("standalone fallback returns actionable failure when no broker or direct env exists", async () => {

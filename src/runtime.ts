@@ -149,6 +149,7 @@ import {
 } from "./text-formatting";
 import { renderTaskDelegationCall } from "./task/task-call-renderer";
 import { renderSingleDelegationResult } from "./task/task-result-renderer";
+import { selectRetainedCompletionErrorText } from "./subagent/completion-error-retention";
 import {
   buildDelegatedActiveAgentIdentityExtensionSource,
   buildDelegatedCopilotInitiatorExtensionSource,
@@ -212,6 +213,7 @@ import {
   releaseSubagentAuthForParentSession,
   reportSubagentAuthAttemptResult,
 } from "./subagent/subagent-key-distribution";
+import { classifyDelegatedRetryableFailure } from "./subagent/delegated-retry-classifier";
 import { buildSubagentSpawnEnv } from "./subagent/subagent-runtime-env";
 import { inspectSessionToolCallIntegrity } from "./subagent/session-integrity";
 import {
@@ -237,6 +239,10 @@ import {
   supportsRuntimeTemperatureOption,
 } from "./agent/temperature-support";
 import { createTaskReferenceResolver } from "./task/task-reference-resolution";
+import {
+  loadPersistedTaskRegistryEntries,
+  writePersistedTaskRegistry,
+} from "./task/task-registry-persistence";
 // Re-export shared types for external consumers
 export type {
   ActiveAgentEntryData,
@@ -391,6 +397,27 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
   let activeAgent: string | null = DEFAULT_AGENT;
   const subagentSessions = new Map<string, SubagentSession>();
   const subagentTaskRegistry = new Map<string, SubagentTaskRegistryEntry>();
+  let loadedTaskRegistryNeedsSave = false;
+  for (const entry of loadPersistedTaskRegistryEntries()) {
+    if (entry.status === "running" || entry.status === "queued") {
+      entry.status = "aborted";
+      entry.updatedAt = Date.now();
+      entry.lastError = entry.lastError
+        ? `${entry.lastError}\nExtension restarted before delegated task completed.`
+        : "Extension restarted before delegated task completed.";
+      entry.lastExitCode = undefined;
+      entry.lastTimedOut = false;
+      loadedTaskRegistryNeedsSave = true;
+    }
+    subagentTaskRegistry.set(entry.taskId, entry);
+  }
+
+  const saveTaskRegistry = (): void => {
+    writePersistedTaskRegistry(subagentTaskRegistry.values());
+  };
+  if (loadedTaskRegistryNeedsSave) {
+    saveTaskRegistry();
+  }
   const isolatedAgentDirs = new Set<string>();
   let subagentOverlayRenderRequest: (() => void) | null = null;
   let subagentWidgetRenderRequest: (() => void) | null = null;
@@ -422,11 +449,6 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     subagentTaskRegistry,
   });
 
-  const isLatestTaskRegistrySession = (
-    entry: SubagentTaskRegistryEntry,
-    sessionId: string,
-  ): boolean => entry.childSessionIds[entry.childSessionIds.length - 1] === sessionId;
-
   const hydrateRecoveredTaskReferencesFromSessionHistory = (
     ctx: ExtensionContext,
     parentSessionId: string,
@@ -436,6 +458,11 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       parentSessionId,
     );
   };
+
+  const isLatestTaskRegistrySession = (
+    entry: SubagentTaskRegistryEntry,
+    sessionId: string,
+  ): boolean => entry.childSessionIds[entry.childSessionIds.length - 1] === sessionId;
 
   const resolveRetainedContextFromSource = (
     reference: string,
@@ -815,10 +842,15 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       requestSubagentUiRender();
     }
 
+    let registryChanged = false;
     for (const [taskId, tracked] of subagentTaskRegistry.entries()) {
-      tracked.childSessionIds = tracked.childSessionIds.filter((childId) =>
+      const retainedChildSessionIds = tracked.childSessionIds.filter((childId) =>
         subagentSessions.has(childId),
       );
+      if (retainedChildSessionIds.length !== tracked.childSessionIds.length) {
+        tracked.childSessionIds = retainedChildSessionIds;
+        registryChanged = true;
+      }
 
       const hasActiveChild = tracked.childSessionIds.some((childId) => {
         const child = subagentSessions.get(childId);
@@ -831,7 +863,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
 
       if (now - tracked.updatedAt > SUBAGENT_TASK_REGISTRY_TTL_MS) {
         subagentTaskRegistry.delete(taskId);
+        registryChanged = true;
       }
+    }
+
+    if (registryChanged) {
+      saveTaskRegistry();
     }
 
     return removed;
@@ -1347,7 +1384,12 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
 
     const retainedCompletedError = buildRetainedHistoryText(
-      terminalFailure ? failureSummarySource : session.stderr || run.stderr,
+      selectRetainedCompletionErrorText({
+        terminalFailure,
+        failureSummarySource,
+        sessionStderr: session.stderr,
+        runStderr: run.stderr,
+      }),
     );
     session.stderr = retainedCompletedError.excerpt || "";
 
@@ -1381,6 +1423,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       trackedTask.lastExitCode = session.exitCode;
       trackedTask.lastTimedOut = session.status === "timed_out";
       trackedTask.usage = run.usage;
+      saveTaskRegistry();
     }
 
     cleanupSessionRuntimeArtifacts(session);
@@ -1499,15 +1542,18 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     }
 
     const now = Date.now();
-    trackedTask.status = "killed";
+    if (session.status === "running" || session.status === "queued") {
+      trackedTask.status = "killed";
+      trackedTask.lastError = trackedTask.lastError
+        ? `${trackedTask.lastError}\n${reason}`
+        : reason;
+      trackedTask.lastExitCode = undefined;
+      trackedTask.lastTimedOut = false;
+    }
     trackedTask.updatedAt = now;
     trackedTask.sessionPath = session.sessionPath || trackedTask.sessionPath;
-    trackedTask.lastError = trackedTask.lastError
-      ? `${trackedTask.lastError}\n${reason}`
-      : reason;
-    trackedTask.lastExitCode = undefined;
-    trackedTask.lastTimedOut = false;
     trackedTask.lastDismissedAt = now;
+    saveTaskRegistry();
   };
 
   const dismissSubagentSession = (sessionId: string): boolean => {
@@ -1523,6 +1569,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       killSubagentSession(sessionId, "Dismissed by user.");
       return true;
     }
+
+    markTaskRegistrySessionDismissed(session, "Dismissed by user.");
 
     if (cleanupSessionArtifacts(session)) {
       subagentSessions.delete(sessionId);
@@ -1607,6 +1655,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     taskRegistryEntry.childSessionIds.push(sessionId);
     delete taskRegistryEntry.lastDismissedAt;
     subagentTaskRegistry.set(taskId, taskRegistryEntry);
+    saveTaskRegistry();
 
     const session: SubagentSession = {
       id: sessionId,
@@ -1637,6 +1686,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       taskRegistryEntry.lastError = message;
       taskRegistryEntry.lastExitCode = 1;
       taskRegistryEntry.lastTimedOut = false;
+      saveTaskRegistry();
       session.resolveCompletion?.({
         code: 1,
         stdout: "",
@@ -1661,6 +1711,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       taskRegistryEntry.lastError = session.stderr;
       taskRegistryEntry.lastExitCode = 1;
       taskRegistryEntry.lastTimedOut = false;
+      saveTaskRegistry();
       session.resolveCompletion?.({
         code: 1,
         stdout: "",
@@ -1688,6 +1739,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       taskRegistryEntry.lastError = session.stderr;
       taskRegistryEntry.lastExitCode = 1;
       taskRegistryEntry.lastTimedOut = false;
+      saveTaskRegistry();
       session.resolveCompletion?.({
         code: 1,
         stdout: "",
@@ -2396,7 +2448,44 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       return !hasMeaningfulOutput(run);
     };
 
-    const getRetryableDelegatedAuthFailure = (): undefined => undefined;
+    const getRetryableDelegatedAuthFailure = (run: SubagentRunResult) => {
+      if (run.timedOut) {
+        return undefined;
+      }
+
+      const failureText = getRunFailureText(run);
+      if (!failureText.trim()) {
+        return undefined;
+      }
+
+      const latestAssistantError = getLatestAssistantErrorMessage(run);
+      const latestStopReason = normalizeInputText(getLatestAssistantStopReason(run)).toLowerCase();
+      const silentSuccessfulFailure = getSilentSuccessfulRunMessage(run);
+      const hasAssistantErrorStop = latestStopReason === "error";
+      const hasSuccessfulCompletion = hasTerminalAssistantCompletionOutput(run);
+
+      if (
+        run.code === 0 &&
+        !latestAssistantError &&
+        !hasAssistantErrorStop &&
+        !silentSuccessfulFailure
+      ) {
+        return undefined;
+      }
+
+      if (
+        run.code !== 0 &&
+        hasSuccessfulCompletion &&
+        hasOnlyNonFatalDelegatedStderr(run.stderr)
+      ) {
+        return undefined;
+      }
+
+      return classifyDelegatedRetryableFailure(failureText, {
+        providerId: subagentProviderId,
+        modelId: delegatedModelContext?.modelId ?? delegatedModelRef,
+      });
+    };
 
     const subagentProcessLifecycle = createSubagentProcessLifecycle({
       session,
@@ -2419,7 +2508,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
     });
     const delegatedTaskPrompt = `Task: ${task}`;
 
-    let nextTransientRetrySessionPath: string | undefined;
+    let nextRetrySessionPath: string | undefined;
 
     const runSubagentProcess = async (
       stdinText: string,
@@ -2944,8 +3033,8 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       const maxOverflowCompactionContinuations = 2;
       let continuationCount = 0;
       let overflowCompactionContinuationCount = 0;
-      const retrySessionPath = nextTransientRetrySessionPath;
-      nextTransientRetrySessionPath = undefined;
+      const retrySessionPath = nextRetrySessionPath;
+      nextRetrySessionPath = undefined;
       let run = await runSubagentProcessWithRuntimeArtifactRetry(
         retrySessionPath ? "" : delegatedTaskPrompt,
         retrySessionPath,
@@ -3042,17 +3131,64 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
       isLockRetryableFailure,
       sleep,
       getLastAcquiredCredentialId: () => undefined,
+      transientRetrySettings: options.retrySettings,
+      prepareRetryAttempt: async ({ run, failure, attempt, maxAttempts }) => {
+        const retrySessionPath = run.sessionPath || session.sessionPath;
+        if (!retrySessionPath) {
+          return;
+        }
+
+        const sessionIntegrity = await inspectSessionToolCallIntegrity(retrySessionPath);
+        if (sessionIntegrity.hasPendingToolCalls || sessionIntegrity.error) {
+          const pendingIds = sessionIntegrity.pendingToolCallIds.slice(0, 4).join(", ");
+          const reason = sessionIntegrity.error
+            ? sessionIntegrity.error
+            : `retained session has pending tool calls${pendingIds ? ` (${pendingIds})` : ""}`;
+          void piAgentRouterDebugLogger.warn("subagent.retry_session_clean_start", {
+            message:
+              `[pi-agent-router] Starting clean auto-retry for delegated task ${session.id.slice(0, 8)} ` +
+              `because retained session cannot be safely resumed: ${reason}.`,
+            failureKind: failure.kind,
+            sessionId: session.id,
+            taskId: session.taskId,
+            retrySessionPath,
+            pendingToolCallIds: sessionIntegrity.pendingToolCallIds,
+            inspectionError: sessionIntegrity.error,
+          });
+          return;
+        }
+
+        nextRetrySessionPath = retrySessionPath;
+        void piAgentRouterDebugLogger.info("subagent.retry_session_resume", {
+          message:
+            `[pi-agent-router] Resuming delegated session ${session.id.slice(0, 8)} for auto-retry ` +
+            `${attempt}/${maxAttempts}.`,
+          attempt,
+          failureKind: failure.kind,
+          maxAttempts,
+          sessionId: session.id,
+          taskId: session.taskId,
+          retrySessionPath,
+        });
+      },
       clearTransientCredentialError: async () => {},
       reportQuotaCredentialError: async () => {},
       reportCredentialAuthError: async () => {},
       reportTransientCredentialError: async () => {},
       onRetry: (event) => {
-        void piAgentRouterDebugLogger.warn("subagent.lock_contention_retry", {
+        const retryLogEvent = event.kind === "lock"
+          ? "subagent.lock_contention_retry"
+          : "subagent.delegated_retry_scheduled";
+        void piAgentRouterDebugLogger.warn(retryLogEvent, {
           attempt: event.attempt,
           defaultDelayMs: event.defaultDelayMs,
           delayMs: event.delayMs,
+          kind: event.kind,
           maxAttempts: event.maxAttempts,
           message: event.message,
+          providerRetryDelayCapped: event.providerRetryDelayCapped,
+          providerRetryDelayMs: event.providerRetryDelayMs,
+          providerRetryDelaySource: event.providerRetryDelaySource,
           reason: event.reason,
           sessionId: event.sessionId,
           usedProviderRetryDelay: event.usedProviderRetryDelay,
@@ -4976,6 +5112,7 @@ export default function agentRouterExtension(pi: ExtensionAPI) {
                   } else {
                     delete trackedTask.lastStructuredResult;
                   }
+                  saveTaskRegistry();
                 }
 
                 if (normalizedDelegatedOutput.error) {

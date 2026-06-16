@@ -20,6 +20,8 @@ import { getErrorMessage } from "../error-utils";
  */
 let cachedProviderCredentialEnvKeys: Record<string, string> | null | undefined = undefined;
 let providerCredentialEnvKeysLoadPromise: Promise<Record<string, string> | null> | undefined;
+let cachedAuthJsonCredentialProviders: Set<string> | null | undefined = undefined;
+let authJsonCredentialProvidersLoadPromise: Promise<Set<string> | null> | undefined;
 let providerCredentialEnvKeysCacheRevision = 0;
 
 const DEFAULT_PROVIDER_ENV_KEYS: Readonly<Record<string, string>> = {
@@ -56,6 +58,46 @@ function getModelsJsonPath(): string {
   return join(getAgentDir(), "models.json");
 }
 
+function getAuthJsonPath(): string {
+  return join(getAgentDir(), "auth.json");
+}
+
+function extractAuthJsonApiKeyCredentialProviders(parsed: unknown): Set<string> | null {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const providers = new Set<string>();
+  for (const [credentialId, credential] of Object.entries(parsed)) {
+    const normalizedCredentialId = normalizeProviderId(credentialId);
+    if (!normalizedCredentialId) {
+      continue;
+    }
+
+    if (
+      !credential ||
+      typeof credential !== "object" ||
+      Array.isArray(credential) ||
+      !("type" in credential) ||
+      (credential as { type: unknown }).type !== "api_key" ||
+      !("key" in credential) ||
+      typeof (credential as { key: unknown }).key !== "string" ||
+      !(credential as { key: string }).key.trim()
+    ) {
+      continue;
+    }
+
+    providers.add(normalizedCredentialId);
+    const backupCredentialMatch = /^(.*)-\d+$/.exec(normalizedCredentialId);
+    const baseProviderId = normalizeProviderId(backupCredentialMatch?.[1]);
+    if (baseProviderId) {
+      providers.add(baseProviderId);
+    }
+  }
+
+  return providers.size > 0 ? providers : null;
+}
+
 function extractProviderEnvKeys(parsed: unknown): Record<string, string> | null {
   if (!parsed || typeof parsed !== "object" || !("providers" in parsed)) {
     return null;
@@ -79,7 +121,7 @@ function extractProviderEnvKeys(parsed: unknown): Record<string, string> | null 
       "apiKey" in providerConfig &&
       typeof (providerConfig as { apiKey: unknown }).apiKey === "string"
     ) {
-      const apiKeyEnv = (providerConfig as { apiKey: string }).apiKey.trim();
+      const apiKeyEnv = (providerConfig as { apiKey: string }).apiKey.trim().replace(/^\$+/, "");
       if (apiKeyEnv) {
         envKeys[providerId] = apiKeyEnv;
       }
@@ -109,6 +151,16 @@ async function loadProviderEnvKeysFromModelsJsonAsync(): Promise<Record<string, 
     const content = await readFile(getModelsJsonPath(), "utf-8");
     const parsed = JSON.parse(content) as unknown;
     return extractProviderEnvKeys(parsed);
+  } catch {
+    return null;
+  }
+}
+
+async function loadAuthJsonApiKeyCredentialProvidersAsync(): Promise<Set<string> | null> {
+  try {
+    const content = await readFile(getAuthJsonPath(), "utf-8");
+    const parsed = JSON.parse(content) as unknown;
+    return extractAuthJsonApiKeyCredentialProviders(parsed);
   } catch {
     return null;
   }
@@ -153,10 +205,35 @@ async function getProviderCredentialEnvKeysAsync(): Promise<Record<string, strin
   }
 }
 
+async function getAuthJsonApiKeyCredentialProvidersAsync(): Promise<Set<string>> {
+  if (cachedAuthJsonCredentialProviders !== undefined) {
+    return cachedAuthJsonCredentialProviders ?? new Set<string>();
+  }
+
+  if (!authJsonCredentialProvidersLoadPromise) {
+    const cacheRevision = providerCredentialEnvKeysCacheRevision;
+    authJsonCredentialProvidersLoadPromise = (async () => {
+      const providers = await loadAuthJsonApiKeyCredentialProvidersAsync();
+      if (cacheRevision === providerCredentialEnvKeysCacheRevision) {
+        cachedAuthJsonCredentialProviders = providers;
+      }
+      return providers;
+    })();
+  }
+
+  try {
+    return (await authJsonCredentialProvidersLoadPromise) ?? new Set<string>();
+  } finally {
+    authJsonCredentialProvidersLoadPromise = undefined;
+  }
+}
+
 export function resetProviderEnvKeyCacheState(): void {
   providerCredentialEnvKeysCacheRevision += 1;
   cachedProviderCredentialEnvKeys = undefined;
   providerCredentialEnvKeysLoadPromise = undefined;
+  cachedAuthJsonCredentialProviders = undefined;
+  authJsonCredentialProvidersLoadPromise = undefined;
 }
 
 const PROVIDER_ID_ALIASES: Record<string, string> = {
@@ -393,7 +470,7 @@ function normalizeBrokerResult(
 }
 
 export type PreparedSubagentAuth = {
-  mode: DelegatedAuthPrepareResult["mode"] | "direct-env";
+  mode: DelegatedAuthPrepareResult["mode"] | "direct-env" | "auth-json";
   brokerId?: string;
   extensionDirs: string[];
   env: Record<string, string>;
@@ -500,6 +577,16 @@ export async function prepareSubagentAuthForLaunch(options: {
     };
   }
 
+  const authJsonCredentialProviders = await getAuthJsonApiKeyCredentialProvidersAsync();
+  if (authJsonCredentialProviders.has(normalizedProviderId)) {
+    return {
+      mode: "auth-json",
+      extensionDirs: [],
+      env: {},
+      inheritedEnvKeys: [],
+    };
+  }
+
   return {
     mode: "none",
     extensionDirs: [],
@@ -529,7 +616,7 @@ export async function reportSubagentAuthAttemptResult(
   try {
     await broker.reportAttemptResult({
       ...result,
-      mode: preparedAuth.mode === "direct-env" ? "none" : preparedAuth.mode,
+      mode: preparedAuth.mode === "direct-env" || preparedAuth.mode === "auth-json" ? "none" : preparedAuth.mode,
       leaseId: preparedAuth.leaseId,
     });
   } catch (error) {
